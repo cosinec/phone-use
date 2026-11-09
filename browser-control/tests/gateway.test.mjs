@@ -11,11 +11,111 @@ import * as plist from 'plist';
 import WebSocket from 'ws';
 import { createGateway } from '../src/gateway.mjs';
 import { NativeController } from '../src/native-controller.mjs';
+import { createModelClient } from '../src/model-client.mjs';
+import { startServer } from '../src/server.mjs';
 import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload } from '../src/relay-protocol.mjs';
 
 const origin = 'http://localhost:5173';
 const device = { serialNumber: '00008110-001234567890001E', vendorId: 1452, productId: 4776 };
 const pairRecord = { udid: device.serialNumber, pairRecordBase64: Buffer.from(plist.build({ SystemBUID: 'browser-buid', HostID: 'fixture' })).toString('base64') };
+
+test('task HTTP API uses real gateway/native CLI with explicit fake model provider, validates auth and completes once', async t => {
+  const providerCalls = [];
+  const model = createModelClient({ baseUrl: 'https://fake-provider.test/v1', model: 'fake-vision', apiKey: 'fake-provider-key', fetchImpl: async (url, options) => {
+    providerCalls.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(providerCalls.length === 1
+      ? { type: 'action', tool: 'iphone_tap', args: { x: 2, y: 3 }, reason: 'Open Settings' } : { type: 'done', message: 'Finished' }) } }] }));
+  } });
+  const app = await start(t, { model });
+  assert.deepEqual(await (await app.api('/api/config')).json(), { aiReady: true, model: 'fake-vision' });
+  const session = await app.session(); const usb = await peer(session); t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const route = `/api/sessions/${session.id}/tasks`;
+  assert.equal((await app.api(route, 'wrong', { instruction: 'go' })).status, 401);
+  assert.equal((await app.api(route, session.token, { instruction: 'go' }, 'POST', { Origin: 'https://evil.test' })).status, 403);
+  assert.equal(providerCalls.length, 0);
+  assert.equal((await app.api(route, session.token, { instruction: '' })).status, 400);
+  assert.equal((await app.api(route, session.token, { instruction: 'go', extra: true })).status, 400);
+  const started = await app.api(route, session.token, { instruction: 'open settings' }); assert.equal(started.status, 201);
+  const task = await started.json(); assert.equal(typeof task.id, 'string');
+  let state;
+  await waitFor(async () => { state = await (await app.api(`/api/sessions/${session.id}`, session.token)).json(); return state.task?.state === 'completed'; });
+  assert.equal(state.task.steps.length, 1); assert.equal(state.task.steps[0].state, 'succeeded');
+  assert.equal(JSON.parse((await app.controllers[0].request({ op: 'daemon' })).text).taps, 1);
+  assert.match(JSON.stringify(providerCalls[0]), /fixture points/); assert.match(JSON.stringify(providerCalls[0]), /list_elements/);
+  assert.ok(!JSON.stringify(state.task).includes('fake-provider-key'));
+  assert.ok(!JSON.stringify(state.task).includes('ICTL_DATA_DIR'));
+});
+
+test('confirmation waiting releases device serialization and stale, repeated or unauthorized decisions cannot dispatch', async t => {
+  let iterations = 0;
+  const model = Object.assign(async () => ++iterations === 1 ? { type: 'action', tool: 'iphone_type_text', args: { text: 'hello', submit: true }, reason: 'Submit text' }
+    : { type: 'done', message: 'done' }, { ready: true, model: 'explicit-fake-model' });
+  const app = await start(t, { model }); const session = await app.session(); const usb = await peer(session); t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const route = `/api/sessions/${session.id}`;
+  const task = await (await app.api(route + '/tasks', session.token, { instruction: 'send' })).json();
+  await waitFor(() => app.gateway.sessions.get(session.id).taskRunner?.snapshot().confirmation);
+  assert.equal((await app.api(route + '/tasks', session.token, { instruction: 'another' })).status, 409);
+  assert.equal((await app.api(route + '/command', session.token, { requestId: 'manual-during-confirm', deviceId: device.serialNumber, tool: 'iphone_status', args: {} })).status, 200);
+  const { confirmation } = app.gateway.sessions.get(session.id).taskRunner.snapshot();
+  const confirmRoute = `${route}/tasks/${task.id}/confirm`;
+  const decision = { actionId: confirmation.actionId, approved: true };
+  assert.equal((await app.api(confirmRoute, 'wrong', decision)).status, 401);
+  assert.equal((await app.api(confirmRoute, session.token, decision, 'POST', { Origin: 'https://evil.test' })).status, 403);
+  assert.equal((await app.api(confirmRoute, session.token, { ...decision, approved: 'yes' })).status, 400);
+  assert.equal((await app.api(confirmRoute, session.token, { ...decision, actionId: 'stale' })).status, 409);
+  assert.equal((await app.api(confirmRoute, session.token, decision)).status, 200);
+  assert.equal((await app.api(confirmRoute, session.token, decision)).status, 409);
+  await waitFor(() => app.gateway.sessions.get(session.id).taskRunner.snapshot().state === 'completed');
+});
+
+test('HTTP stop prevents late model or queued native action; session disconnect cancels generation', async t => {
+  let release, modelSignal;
+  const model = Object.assign(input => { modelSignal = input.signal; return new Promise(resolve => { release = resolve; }); }, { ready: true, model: 'explicit-fake-model' });
+  const app = await start(t, { model }); const session = await app.session(); const usb = await peer(session);
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const route = `/api/sessions/${session.id}`;
+  const first = await (await app.api(route + '/tasks', session.token, { instruction: 'go' })).json();
+  await waitFor(() => release);
+  assert.equal((await app.api(`${route}/tasks/${first.id}/stop`, 'wrong', {})).status, 401);
+  assert.equal((await app.api(`${route}/tasks/${first.id}/stop`, session.token, {}, 'POST', { Origin: 'https://evil.test' })).status, 403);
+  assert.equal((await app.api(`${route}/tasks/${first.id}/stop`, session.token, {})).status, 200);
+  assert.equal(modelSignal.aborted, true); release({ type: 'action', tool: 'iphone_tap', args: { x: 1, y: 2 }, reason: 'tap' });
+  await sleep(20); assert.equal(JSON.parse((await app.controllers[0].request({ op: 'daemon' })).text).taps, 0);
+  release = null;
+  await app.api(route + '/tasks', session.token, { instruction: 'next' }); await waitFor(() => release);
+  const nativeSession = app.gateway.sessions.get(session.id);
+  const blocking = nativeSession.runCommand({ requestId: 'block-queue', deviceId: device.serialNumber, tool: 'iphone_tap', args: { x: 999, y: 1 } }).catch(() => {});
+  release({ type: 'action', tool: 'iphone_tap', args: { x: 1, y: 2 }, reason: 'tap' });
+  await waitFor(() => nativeSession.taskRunner.snapshot().state === 'executing');
+  nativeSession.taskRunner.stop(nativeSession.taskRunner.snapshot().id); await blocking;
+  await sleep(20); assert.equal(JSON.parse((await app.controllers[0].request({ op: 'daemon' })).text).taps, 1);
+  release = null;
+  await app.api(route + '/tasks', session.token, { instruction: 'disconnect' }); await waitFor(() => release);
+  usb.ws.close(); await once(usb.ws, 'close'); await waitFor(() => modelSignal.aborted);
+  release({ type: 'action', tool: 'iphone_tap', args: { x: 1, y: 2 }, reason: 'tap' });
+  assert.equal(nativeSession.taskRunner.snapshot().state, 'stopped');
+});
+
+test('unconfigured AI returns an explicit task error while manual control remains available', async t => {
+  const app = await start(t, { model: createModelClient({ env: {} }) }); const session = await app.session(); const usb = await peer(session); t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const result = await app.api(`/api/sessions/${session.id}/tasks`, session.token, { instruction: 'go' });
+  assert.equal(result.status, 503); assert.match((await result.json()).error, /AI is not configured/);
+  assert.equal((await app.api(`/api/sessions/${session.id}/command`, session.token, { requestId: 'manual-no-ai', deviceId: device.serialNumber, tool: 'iphone_status', args: {} })).status, 200);
+});
+
+test('server environment configures model readiness without exposing either server key', async t => {
+  const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-model-env-'));
+  const gateway = await startServer({ CONTROL_ACCESS_TOKEN: 'env-control-key', PORT: '0', RUNTIME_DIR: runtimeDir,
+    LLM_BASE_URL: 'https://explicit-fake-provider.test/v1', LLM_MODEL: 'env-vision', LLM_API_KEY: 'env-provider-key' },
+    { fetchImpl: async () => { assert.fail('config lookup must not call a model'); } });
+  t.after(async () => { await gateway.close(); await rm(runtimeDir, { recursive: true, force: true }); });
+  const response = await fetch(`http://127.0.0.1:${gateway.server.address().port}/api/config`);
+  const config = await response.text();
+  assert.deepEqual(JSON.parse(config), { aiReady: true, model: 'env-vision' }); assert.ok(!config.includes('key'));
+});
 
 test('raw24 USB identity normalizes across API, SDK hello, native, command and pair-record resume', async t => {
   const app = await start(t);
@@ -79,6 +179,7 @@ async function start(t, options = {}) {
   const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-test-'));
   const controllers = [];
   const gateway = createGateway({ accessToken: 'controller-secret', allowedOrigins: [origin], runtimeDir,
+    model: createModelClient({ env: {} }),
     controllerFactory(session) {
       const controller = new NativeController({ ...session, command: process.execPath, commandArgs: [new URL('./fixtures/native-cli.mjs', import.meta.url).pathname], startTimeoutMs: 3000, requestTimeoutMs: 200 });
       controllers.push(controller); return controller;
@@ -348,7 +449,8 @@ test('server entry rejects missing controller secret and serves non-secret confi
   const [code] = await once(missing, 'exit');
   assert.equal(code, 1); assert.match(stderr, /CONTROL_ACCESS_TOKEN required/);
   const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-entry-'));
-  const child = spawn(process.execPath, ['src/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, CONTROL_ACCESS_TOKEN: 'entry-secret', PORT: '0', RUNTIME_DIR: runtimeDir } });
+  const child = spawn(process.execPath, ['src/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, CONTROL_ACCESS_TOKEN: 'entry-secret', PORT: '0', RUNTIME_DIR: runtimeDir,
+    LLM_BASE_URL: '', LLM_MODEL: '', LLM_API_KEY: '' } });
   t.after(async () => { child.kill('SIGTERM'); await once(child, 'exit'); await rm(runtimeDir, { recursive: true, force: true }); });
   let output = ''; child.stdout.on('data', bytes => { output += bytes; });
   await waitFor(() => output.includes('Gateway listening'));

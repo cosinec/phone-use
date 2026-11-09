@@ -1,8 +1,9 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGateway } from './gateway.mjs';
+import { createModelClient } from './model-client.mjs';
 
-export async function startServer(env = process.env) {
+export async function startServer(env = process.env, { fetchImpl } = {}) {
   if (!env.CONTROL_ACCESS_TOKEN?.trim()) throw new Error('CONTROL_ACCESS_TOKEN required');
   const host = env.HOST || '127.0.0.1';
   const port = Number(env.PORT ?? 8787);
@@ -10,7 +11,8 @@ export async function startServer(env = process.env) {
   const allowedOrigins = env.ALLOWED_ORIGINS?.split(',').map(value => value.trim()).filter(Boolean)
     ?? [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
   const gateway = createGateway({ accessToken: env.CONTROL_ACCESS_TOKEN, allowedOrigins,
-    runtimeDir: env.RUNTIME_DIR || path.resolve(fileURLToPath(new URL('../.runtime', import.meta.url))), publicUrl: env.PUBLIC_BASE_URL });
+    runtimeDir: env.RUNTIME_DIR || path.resolve(fileURLToPath(new URL('../.runtime', import.meta.url))), publicUrl: env.PUBLIC_BASE_URL,
+    model: createModelClient({ env, fetchImpl }) });
   await gateway.listen(host, port);
   return gateway;
 }

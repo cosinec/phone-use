@@ -10,6 +10,8 @@ import { createVirtualMux, readPairRecord } from './virtual-usbmuxd.mjs';
 import { NativeController } from './native-controller.mjs';
 import { commandRequest } from './commands.mjs';
 import { canonicalUID } from './device-identity.mjs';
+import { createModelClient } from './model-client.mjs';
+import { TaskRunner } from './task-runner.mjs';
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const failure = (status, message) => Object.assign(new Error(message), { status });
@@ -46,6 +48,7 @@ function json(response, status, value) {
 
 export function createGateway(options) {
   const { accessToken, allowedOrigins, runtimeDir = path.resolve('.runtime'), controllerFactory = session => new NativeController(session) } = options;
+  const model = options.model ?? createModelClient();
   if (typeof accessToken !== 'string' || !accessToken.trim()) throw new Error('Nonempty accessToken required');
   if (!Array.isArray(allowedOrigins) || !allowedOrigins.length || allowedOrigins.some(o => typeof o !== 'string' || !/^https?:\/\//.test(o))) throw new Error('Exact allowedOrigins required');
   const origins = new Set(allowedOrigins);
@@ -109,6 +112,7 @@ export function createGateway(options) {
       session.expiry = setTimeout(() => void closeSession(session), options.sessionTimeoutMs ?? 5 * 60_000);
       session.runCommand = input => runCommand(session, input);
       session.screen = () => screen(session);
+      session.taskRunner = new TaskRunner({ model, session, limits: options.taskLimits });
       sessions.set(id, session);
       return session;
     } catch (error) { owners.delete(namespace); throw error; }
@@ -285,7 +289,7 @@ export function createGateway(options) {
         response.writeHead(204, { 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS' }); response.end(); return;
       }
       const url = new URL(request.url, 'http://gateway');
-      if (request.method === 'GET' && url.pathname === '/api/config') { json(response, 200, { aiReady: false, model: null }); return; }
+      if (request.method === 'GET' && url.pathname === '/api/config') { json(response, 200, { aiReady: typeof model === 'function' && model.ready !== false, model: model.model ?? null }); return; }
       const token = request.headers.authorization?.startsWith('Bearer ') ? request.headers.authorization.slice(7) : undefined;
       if (request.method === 'POST' && url.pathname === '/api/sessions') {
         if (!equal(token, accessToken)) throw failure(401, 'Authentication required');
@@ -308,7 +312,26 @@ export function createGateway(options) {
           try { const snapshot = await session.controller.request({ op: 'daemon' }, { timeoutMs: 3000, signal: session.abort.signal }); if (snapshot.kind === 'text') daemon = JSON.parse(snapshot.text); } catch {}
         }
         json(response, 200, { id: session.id, deviceId: session.device.serialNumber, state: session.state, ready: session.controller?.state.ready ?? false,
-          daemon, setup: session.controller?.state.setup ?? { state: 'idle', transcript: '', exitCode: null }, task: null }); return;
+          daemon, setup: session.controller?.state.setup ?? { state: 'idle', transcript: '', exitCode: null }, task: session.taskRunner.snapshot() }); return;
+      }
+      if (request.method === 'POST' && route === '/tasks') {
+        const input = await body(request);
+        if (Object.keys(input).some(key => key !== 'instruction')) throw failure(400, 'Invalid task request');
+        if (typeof model !== 'function' || model.ready === false) throw failure(503, 'AI is not configured');
+        await ready(session);
+        json(response, 201, session.taskRunner.start(input.instruction)); return;
+      }
+      const taskRoute = route.match(/^\/tasks\/([a-f0-9-]+)\/(stop|confirm)$/);
+      if (request.method === 'POST' && taskRoute) {
+        const input = await body(request);
+        if (taskRoute[2] === 'stop') {
+          if (Object.keys(input).length) throw failure(400, 'Invalid stop request');
+          json(response, 200, session.taskRunner.stop(taskRoute[1]));
+        } else {
+          if (Object.keys(input).some(key => !['actionId', 'approved'].includes(key)) || typeof input.actionId !== 'string' || typeof input.approved !== 'boolean') throw failure(400, 'Invalid confirmation request');
+          json(response, 200, session.taskRunner.confirm(taskRoute[1], input.actionId, input.approved));
+        }
+        return;
       }
       if (request.method === 'POST' && route === '/setup') { await body(request); await ready(session); await session.controller.startSetup(); json(response, 200, session.controller.state.setup); return; }
       if (request.method === 'POST' && route === '/setup/input') {
