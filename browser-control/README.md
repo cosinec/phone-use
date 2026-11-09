@@ -93,7 +93,9 @@ phone.example.com {
 
 `signing-state` 卷保留原生账号和签名材料，应按敏感数据管理访问和备份；运行目录与索引使用 owner-only 权限。关闭会话会终止其拥有的原生进程组并释放临时 socket，保留签名恢复资料。一个运行目录由一个网关进程独占；多实例共享卷前需要额外分布式租约。删除卷会丢失恢复资料，轮换控制令牌也会改变恢复索引键。
 
-本次开发宿主机没有 Docker CLI，Dockerfile 与 Compose 尚未实机构建或运行；Rust/Node 测试、类型检查与 Vite 构建需要与容器验证分别记录。原生依赖的说明和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md) 与仓库原有 [第三方声明](../THIRD_PARTY.md)。
+Dockerfile 默认使用一个 Cargo 构建任务，适配小内存 VPS，可通过 `--build-arg CARGO_BUILD_JOBS=2` 调整。许可证生成复用 cargo-about 0.9.3 官方 Linux 发布包，下载后校验官方 SHA256。`--build-arg WEB_BASE=/iphone/` 可指定静态资源前缀，默认 `/`。子路径部署时，代理需去除网页路径前缀，并将同 origin 的 `/api/` 与 `/ios/` 转发给网关，`PUBLIC_BASE_URL` 仍填写 origin。
+
+2026-11-09 已在 Linux VPS 实际构建并运行容器，入口为 [云端工作台](https://amazingly.top/iphone/)。公网 HTTPS、静态资源、REST 鉴权、WebSocket 来源校验和升级均已验证。模型通过 VPS 上的 Magpie 网关接入 `codex/gpt-6.1-sol`，独立视觉 API 测试成功。用户选择本次先完成部署，VPS 与真实手机的联调尚未执行。详细范围见 [验证记录](VERIFICATION.md)。原生依赖的说明和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md) 与仓库原有 [第三方声明](../THIRD_PARTY.md)。
 
 ## 真机验收与已知证据
 
@@ -107,4 +109,4 @@ phone.example.com {
 - [ ] 截图对应真实手机，竖屏/横屏的点按、滑动、长按位置正确；Home、Lock、音量和文字输入结果可见。
 - [ ] 刷新和重连能恢复 IndexedDB 配对记录与服务器签名状态，跨设备和并发会话保持隔离。
 - [ ] 配置真实视觉模型后任务观察、操作和完成正确；敏感操作确认、拒绝和停止都经过真机验收。
-- [ ] HTTPS 部署、容器构建、真实外部服务器链路及日志脱敏均有独立证据。
+- [x] Linux 容器构建运行、HTTPS 静态资源、外部 REST/WebSocket 鉴权与代理日志配置已核验。跨公网真机操作仍需独立验收。
