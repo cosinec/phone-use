@@ -290,6 +290,7 @@ export function createGateway(options) {
       }
       const url = new URL(request.url, 'http://gateway');
       if (request.method === 'GET' && url.pathname === '/api/config') { json(response, 200, { aiReady: typeof model === 'function' && model.ready !== false, model: model.model ?? null }); return; }
+      if (options.staticFiles && await options.staticFiles(request, response)) return;
       const token = request.headers.authorization?.startsWith('Bearer ') ? request.headers.authorization.slice(7) : undefined;
       if (request.method === 'POST' && url.pathname === '/api/sessions') {
         if (!equal(token, accessToken)) throw failure(401, 'Authentication required');

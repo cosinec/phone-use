@@ -64,6 +64,8 @@ iphone-control does it all in **one Rust binary** on Linux or macOS, built on [i
 
 ## Quick Start
 
+For the Mac Chrome WebUSB client with a server-side native engine and optional AI, see the [browser/cloud control console](browser-control/README.md). This path has separate physical-device and deployment acceptance requirements.
+
 You need an iPhone or iPad on iOS 17+ connected by a **data** cable, a free Apple ID (use a dedicated one), and a Linux host with Docker or an Apple Silicon Mac.
 
 **Linux (Docker)**

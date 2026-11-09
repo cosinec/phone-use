@@ -1,0 +1,20 @@
+services:
+  control:
+    build:
+      context: ..
+      dockerfile: browser-control/Dockerfile
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      RUNTIME_DIR: /app/.runtime
+      ICTL_BIN: /usr/local/bin/iphone-control
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - signing-state:/app/.runtime
+    stop_grace_period: 30s
+volumes:
+  signing-state:
