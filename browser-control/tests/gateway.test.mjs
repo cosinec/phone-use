@@ -117,9 +117,9 @@ test('server environment configures model readiness without exposing either serv
   assert.deepEqual(JSON.parse(config), { aiReady: true, model: 'env-vision' }); assert.ok(!config.includes('key'));
 });
 
-test('raw24 USB identity normalizes across API, SDK hello, native, command and pair-record resume', async t => {
+for (const padding of ['', '\0'.repeat(16)]) test(`raw24${padding ? ' trailing NUL padding' : ''} USB identity normalizes across API, SDK hello, native, command and pair-record resume`, async t => {
   const app = await start(t);
-  const rawDevice = { ...device, serialNumber: device.serialNumber.replace('-', '').toLowerCase() };
+  const rawDevice = { ...device, serialNumber: device.serialNumber.replace('-', '').toLowerCase() + padding };
   const session = await app.session(rawDevice, pairRecord);
   assert.equal(session.deviceId, device.serialNumber);
   const usb = await peer(session, rawDevice);
