@@ -1,11 +1,11 @@
 # Mac Chrome iPhone 控制台
 
-在自己的 Mac 上插入 iPhone，用 Chrome 授权 USB，再从网页发起手动操作或自然语言任务。浏览器负责真实 USB 数据转发，服务器运行现有 iphone-control 原生引擎、WDA 准备和可选 AI。生产环境由同一 HTTPS origin 提供网页、REST API 和 WebSocket。
+在自己的 Mac 上插入 iPhone，用 Chrome 授权 USB，再从网页发起手动操作或自然语言任务。浏览器负责真实 USB 数据转发，服务器运行 Rust 网关 `iphone-control-gateway`、现有 Rust 控制引擎 `iphone-control`、WDA 准备和可选 AI。生产环境由同一 HTTPS origin 提供网页、REST API 和 WebSocket。
 
 ```mermaid
 flowchart LR
   I[iPhone / USB] <--> B[用户的 Mac Chrome\n发布版 WebUSB SDK]
-  B <-->|HTTPS / WSS| G[服务器\nNode 网关与网页]
+  B <-->|HTTPS / WSS| G[服务器\nRust 网关与网页]
   G <--> M[每会话独立虚拟 usbmuxd]
   M <--> N[iphone-control\n配对、签名、WDA]
   G <--> A[可选视觉模型\nAPI key 仅在服务器]
@@ -15,7 +15,7 @@ flowchart LR
 
 ## 本地开发
 
-需要 Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release -p iphone-control`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
+需要 Rust 1.88+、Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。Node 用于前端构建和测试，运行中的网关为 Rust 可执行文件。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release --locked -p iphone-control -p ictl-gateway`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
 
 ```bash
 cd browser-control
@@ -23,20 +23,22 @@ npm ci
 cp .env.example .env
 # 编辑 .env：替换 CONTROL_ACCESS_TOKEN，并设置 ICTL_BIN 为原生二进制路径
 npm run build
-npm start
+GATEWAY_BIN="$(cd ../target/release && pwd)/iphone-control-gateway" npm start
 ```
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，在页面粘贴服务器访问令牌并点击「连接 iPhone」。令牌仅在本页内存中使用。首次连接需要解锁手机、信任电脑，并根据原生向导完成开发者模式、Apple 账号与 WDA 签名。
 
-前端热更新可另开终端运行 `npm run web:dev`，访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 `/api` 与 `/ios` 代理至 `127.0.0.1:8787`；页面服务器地址留空即可。`.env.example` 包含这两个开发 origin。`npm start` 和 `npm run dev` 都用 Node `--env-file-if-exists=.env` 读取当前目录的环境文件。更改前端后，生产入口需要重新 `npm run build`。
+前端热更新可另开终端运行 `npm run web:dev`，访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 `/api` 与 `/ios` 代理至 `127.0.0.1:8787`；页面服务器地址留空即可。`.env.example` 包含这两个开发 origin。`npm start` 和 `npm run dev` 通过脚本启动 Rust 网关，默认由 Cargo 构建运行，也可在 shell 中设置 `GATEWAY_BIN` 指向预编译网关。Rust 启动时读取当前目录的 `.env`，shell 环境变量优先，原生子进程继承这些配置。安装多个工具链时可指定 `RUSTUP_TOOLCHAIN=1.90.0`。更改前端后，生产入口需要重新 `npm run build`。
 
 ```bash
+cargo test --locked --manifest-path ../Cargo.toml -p ictl-gateway
 npm test
+npm run test:rust
 npm run typecheck
 npm run build
 ```
 
-测试包含真实 HTTP/WebSocket/TCP/Unix Socket 和原生 CLI fixture，也包含发布版 SDK 的 `requestUSBAccess → pairDevice` 集成：一个明确标注的假 USB peer 回应 usbmux 版本握手，用假原生控制器与真实网关验证接口回退、恢复配对、关闭和删除会话。它没有模拟物理 iPhone、Apple 登录、Lockdown 授权或 WDA 控制成功。
+Rust 入口测试通过独立服务进程验证 HTTP/WebSocket/TCP/Unix Socket 和原生 CLI fixture。`npm run test:rust` 自动构建网关，也可使用 `RUST_GATEWAY_BIN` 指定已构建的绝对路径。迁移前的 Node 实现移至 `tests/reference`，供原测试作为兼容性参照。测试也包含发布版 SDK 的 `requestUSBAccess → pairDevice` 集成：一个明确标注的假 USB peer 回应 usbmux 版本握手，用假原生控制器与真实网关验证接口回退、恢复配对、关闭和删除会话。它没有模拟物理 iPhone、Apple 登录、Lockdown 授权或 WDA 控制成功。
 
 ## 页面行为
 
@@ -56,11 +58,12 @@ AI 任务执行期间暂停手动操作。确认框显示具体操作、参数�
 |---|---|
 | `CONTROL_ACCESS_TOKEN` | 必填，创建会话的服务器访问令牌；使用长随机值 |
 | `ALLOWED_ORIGINS` | 逗号分隔的完整允许 origin，包含协议和端口；部署时只填写实际 HTTPS 网站 |
-| `HOST` | Node HTTP 监听地址，默认 `127.0.0.1`；容器内为 `0.0.0.0` |
+| `HOST` | Rust HTTP 监听地址，默认 `127.0.0.1`；容器内为 `0.0.0.0` |
 | `PORT` | HTTP 与 WebSocket 共用端口，默认 `8787` |
 | `RUNTIME_DIR` | 每会话原生数据和配对恢复索引目录，默认 `.runtime` |
 | `PUBLIC_BASE_URL` | 反向代理外部 HTTP(S) origin，决定返回的 ws/wss relay 地址 |
 | `ICTL_BIN` | 从当前源码构建的 `iphone-control` 可执行路径 |
+| `WEB_DIST_DIR` | 前端构建目录，默认 `dist`，从仓库根目录运行时自动识别 `browser-control/dist` |
 | `LLM_BASE_URL` | 可选模型兼容 API 根地址，如 `https://provider.example/v1`，不含账号、query 或 fragment |
 | `LLM_MODEL` | 可选支持截图输入的模型名称 |
 | `LLM_API_KEY` | 可选模型 key，仅配置于服务器环境 |
@@ -69,7 +72,7 @@ AI 任务执行期间暂停手动操作。确认框显示具体操作、参数�
 
 ## Linux 部署
 
-Dockerfile 复用 `ghcr.io/derrors/iphone-control:0.1.4` 的原生二进制、Appium 未签名 WDA、资源和许可证，在 Debian Trixie/glibc 兼容的 Node 22 运行时运行网关。服务端没有 USB 设备挂载，也不需要 privileged 或系统 usbmuxd；USB 在用户 Mac 浏览器中，通过 WSS 转发到各会话的虚拟 mux。服务器需要能访问 Apple、签名相关服务、设备支持资源以及模型服务商。
+Dockerfile 从当前源码构建 Rust 网关和原生引擎，包含本地已验证的原生修复，复用 `ghcr.io/derrors/iphone-control:0.1.4` 的 Appium 未签名 WDA、资源和许可证，并为网关新增依赖生成许可证清单。Node 构建阶段生成 React 网页，运行阶段为 Debian 与两个 Rust 可执行文件。服务端没有 USB 设备挂载，也不需要 privileged 或系统 usbmuxd；USB 在用户 Mac 浏览器中，通过 WSS 转发到各会话的虚拟 mux。服务器需要能访问 Apple、签名相关服务、设备支持资源以及模型服务商。
 
 在 `browser-control/.env` 中填写部署值，例如网站 origin `https://phone.example.com`；将 `ALLOWED_ORIGINS` 与 `PUBLIC_BASE_URL` 都设置成这个 origin。不要把真实凭证写入 Dockerfile 或镜像。然后：
 
@@ -90,7 +93,7 @@ phone.example.com {
 
 `signing-state` 卷保留原生账号和签名材料，应按敏感数据管理访问和备份；运行目录与索引使用 owner-only 权限。关闭会话会终止其拥有的原生进程组并释放临时 socket，保留签名恢复资料。一个运行目录由一个网关进程独占；多实例共享卷前需要额外分布式租约。删除卷会丢失恢复资料，轮换控制令牌也会改变恢复索引键。
 
-本次开发宿主机没有 Docker CLI，Dockerfile 与 Compose 尚未实机构建或运行；Node 测试、类型检查与 Vite 构建不等同于容器验证。原生依赖的说明和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md) 与仓库原有 [第三方声明](../THIRD_PARTY.md)。
+本次开发宿主机没有 Docker CLI，Dockerfile 与 Compose 尚未实机构建或运行；Rust/Node 测试、类型检查与 Vite 构建需要与容器验证分别记录。原生依赖的说明和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md) 与仓库原有 [第三方声明](../THIRD_PARTY.md)。
 
 ## 真机验收与已知证据
 

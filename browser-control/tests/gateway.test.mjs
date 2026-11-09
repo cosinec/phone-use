@@ -9,10 +9,10 @@ import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import * as plist from 'plist';
 import WebSocket from 'ws';
-import { createGateway } from '../src/gateway.mjs';
-import { NativeController } from '../src/native-controller.mjs';
-import { createModelClient } from '../src/model-client.mjs';
-import { startServer } from '../src/server.mjs';
+import { createGateway } from './reference/gateway.mjs';
+import { NativeController } from './reference/native-controller.mjs';
+import { createModelClient } from './reference/model-client.mjs';
+import { startServer } from './reference/server.mjs';
 import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload } from '../src/relay-protocol.mjs';
 
 const origin = 'http://localhost:5173';
@@ -475,12 +475,12 @@ test('SDK pump late bytes for a closed stream do not terminate another active st
 });
 
 test('server entry rejects missing controller secret and serves non-secret config when configured', async t => {
-  const missing = spawn(process.execPath, ['src/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, CONTROL_ACCESS_TOKEN: '' } });
+  const missing = spawn(process.execPath, ['tests/reference/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, CONTROL_ACCESS_TOKEN: '' } });
   let stderr = ''; missing.stderr.on('data', bytes => { stderr += bytes; });
   const [code] = await once(missing, 'exit');
   assert.equal(code, 1); assert.match(stderr, /CONTROL_ACCESS_TOKEN required/);
   const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-entry-'));
-  const child = spawn(process.execPath, ['src/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, CONTROL_ACCESS_TOKEN: 'entry-secret', PORT: '0', RUNTIME_DIR: runtimeDir,
+  const child = spawn(process.execPath, ['tests/reference/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, CONTROL_ACCESS_TOKEN: 'entry-secret', PORT: '0', RUNTIME_DIR: runtimeDir,
     LLM_BASE_URL: '', LLM_MODEL: '', LLM_API_KEY: '' } });
   t.after(async () => { child.kill('SIGTERM'); await once(child, 'exit'); await rm(runtimeDir, { recursive: true, force: true }); });
   let output = ''; child.stdout.on('data', bytes => { output += bytes; });

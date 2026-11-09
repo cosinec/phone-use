@@ -4,7 +4,7 @@ import net from 'node:net';
 import { PassThrough } from 'node:stream';
 import { once } from 'node:events';
 import * as plist from 'plist';
-import { createVirtualMux } from '../src/virtual-usbmuxd.mjs';
+import { createVirtualMux } from './reference/virtual-usbmuxd.mjs';
 
 const device = { serialNumber: '00008110-001234567890001E', vendorId: 1452, productId: 4776 };
 function packet(value, tag = 1) {

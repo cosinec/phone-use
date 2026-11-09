@@ -36,7 +36,7 @@ if (process.argv[2] === 'descendant') {
       const response = request.op === 'screenshot'
         ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }
         : { kind: 'text', text: JSON.stringify({ request, taps, env: {
-          IPHONE_UDID: process.env.IPHONE_UDID, ICTL_SOCKET: process.env.ICTL_SOCKET,
+          ICTL_ANISETTE_URL: process.env.ICTL_ANISETTE_URL, IPHONE_UDID: process.env.IPHONE_UDID, ICTL_SOCKET: process.env.ICTL_SOCKET,
           ICTL_DATA_DIR: process.env.ICTL_DATA_DIR, ICTL_MANAGE_USBMUXD: process.env.ICTL_MANAGE_USBMUXD,
           USBMUXD_SOCKET_ADDRESS: process.env.USBMUXD_SOCKET_ADDRESS,
         } }) };

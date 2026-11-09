@@ -12,8 +12,8 @@ export async function startServer(env = process.env, { fetchImpl } = {}) {
   const allowedOrigins = env.ALLOWED_ORIGINS?.split(',').map(value => value.trim()).filter(Boolean)
     ?? [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
   const gateway = createGateway({ accessToken: env.CONTROL_ACCESS_TOKEN, allowedOrigins,
-    runtimeDir: env.RUNTIME_DIR || path.resolve(fileURLToPath(new URL('../.runtime', import.meta.url))), publicUrl: env.PUBLIC_BASE_URL,
-    staticFiles: createStaticFiles(fileURLToPath(new URL('../dist', import.meta.url))),
+    runtimeDir: env.RUNTIME_DIR || path.resolve(fileURLToPath(new URL('../../.runtime', import.meta.url))), publicUrl: env.PUBLIC_BASE_URL,
+    staticFiles: createStaticFiles(fileURLToPath(new URL('../../dist', import.meta.url))),
     model: createModelClient({ env, fetchImpl }) });
   await gateway.listen(host, port);
   return gateway;

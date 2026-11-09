@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { commandRequest } from './commands.mjs';
-import { canonicalUID } from './device-identity.mjs';
+import { canonicalUID } from '../../src/device-identity.mjs';
 import { validateModelReply } from './model-client.mjs';
 
 const defaults = { maxSteps: 20, maxRuntimeMs: 6 * 60_000, maxInstructionChars: 4000, maxHistoryEntries: 8 };

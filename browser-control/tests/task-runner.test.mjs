@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { TaskRunner } from '../src/task-runner.mjs';
+import { TaskRunner } from './reference/task-runner.mjs';
 
 const action = (tool = 'iphone_press_button', args = { button: 'home' }, reason = 'Go home') => ({ type: 'action', tool, args, reason });
 function setup(model, limits) {

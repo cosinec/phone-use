@@ -5,11 +5,11 @@ import path from 'node:path';
 import os from 'node:os';
 import { Duplex } from 'node:stream';
 import { WebSocketServer, WebSocket } from 'ws';
-import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload, MAX_FRAME_PAYLOAD } from './relay-protocol.mjs';
+import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload, MAX_FRAME_PAYLOAD } from '../../src/relay-protocol.mjs';
 import { createVirtualMux, readPairRecord } from './virtual-usbmuxd.mjs';
 import { NativeController } from './native-controller.mjs';
 import { commandRequest } from './commands.mjs';
-import { canonicalUID } from './device-identity.mjs';
+import { canonicalUID } from '../../src/device-identity.mjs';
 import { createModelClient } from './model-client.mjs';
 import { TaskRunner } from './task-runner.mjs';
 

@@ -1,14 +1,14 @@
 # Browser/cloud third-party components
 
-Project additions are covered by the repository [MIT license](../LICENSE). Existing native components, MPL-2.0 source obligations, Appium BSD-3-Clause WDA and native notices remain described in the original [THIRD_PARTY.md](../THIRD_PARTY.md) and [licensing guide](../docs/licensing.md). The Docker image copies the unchanged native image's `/usr/share/licenses` and `/usr/share/doc/iphone-control`, including `THIRD_PARTY_LICENSES.html`, plus its unsigned WDA resource.
+Project additions are covered by the repository [MIT license](../LICENSE). Existing native components, MPL-2.0 source obligations, Appium BSD-3-Clause WDA and native notices remain described in the original [THIRD_PARTY.md](../THIRD_PARTY.md) and [licensing guide](../docs/licensing.md). The Docker image builds both Rust executables from this source and copies the upstream image's `/usr/share/licenses` and `/usr/share/doc/iphone-control`, including `THIRD_PARTY_LICENSES.html`, plus its unsigned WDA resource. Gateway dependency license texts are generated from the locked Rust manifest as `GATEWAY_LICENSES.html`.
 
 | Component | Pinned version/source | License/reuse |
 |---|---|---|
 | [@limrun/device-install](https://www.npmjs.com/package/@limrun/device-install/v/0.1.0) | 0.1.0; installed package metadata | MIT as declared by this published package; imported public USB chooser, pairing, relay close and IndexedDB store APIs. No USB protocol code copied or changed. |
 | [iphone-control PR #34](https://github.com/Derrors/iphone-control/pull/34) | commit [ff78e757](https://github.com/Derrors/iphone-control/commit/ff78e757) | MIT; `web/interaction.mjs` adapts object-fit screenshot coordinate conversion and pointer tap/swipe/long-press behavior. Copyright (c) 2026 iphone-control contributors. |
-| React / React DOM | 19.2.6 | MIT, Copyright (c) Meta Platforms, Inc. and affiliates; license files are retained in production node_modules. |
-| ws | 8.22.2 | MIT; its own license is retained in production node_modules. |
-| plist | 5.1.0 | MIT; its own and transitive dependency notices remain in production node_modules. |
+| React / React DOM | 19.2.6 | MIT, Copyright (c) Meta Platforms, Inc. and affiliates; license files remain in the frontend build dependencies. |
+| ws | 8.22.2 | MIT; test-only dependency, with its license retained in node_modules. |
+| plist | 5.1.0 | MIT; test-only dependency, with its own and transitive notices retained in node_modules. |
 | Vite / TypeScript / React plugin / type declarations | package-lock.json | Build-only dependencies retain their package licenses; omitted from runtime image. |
 
 The published device-install package declares MIT and omits a LICENSE file in its npm tarball. The current [typescript-sdk repository root license](https://github.com/limrun-inc/typescript-sdk/blob/main/LICENSE) is Apache-2.0 (Copyright 2026 Limrun). This report distinguishes published artifact metadata from the repository's license; it does not describe the entire upstream repository as MIT. Upstream licensing clarification should accompany redistribution beyond this source implementation.

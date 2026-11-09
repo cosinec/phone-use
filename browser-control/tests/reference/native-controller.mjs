@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { mkdir, chmod } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { canonicalUID } from './device-identity.mjs';
+import { canonicalUID } from '../../src/device-identity.mjs';
 
 const MAX_RESPONSE = 12 * 1024 * 1024;
 const MAX_TRANSCRIPT = 32 * 1024;

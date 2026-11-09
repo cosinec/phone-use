@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createModelClient } from '../src/model-client.mjs';
+import { createModelClient } from './reference/model-client.mjs';
 
 function client(options = {}) {
   return createModelClient({ baseUrl: 'https://provider.test/v1', model: 'vision-model', apiKey: 'server-only-key', ...options });

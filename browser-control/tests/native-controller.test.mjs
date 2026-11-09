@@ -4,8 +4,8 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { NativeController } from '../src/native-controller.mjs';
-import { commandRequest } from '../src/commands.mjs';
+import { NativeController } from './reference/native-controller.mjs';
+import { commandRequest } from './reference/commands.mjs';
 
 const udid = '00008110-001234567890001E';
 async function fixture(t) {

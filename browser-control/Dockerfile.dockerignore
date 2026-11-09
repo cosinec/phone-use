@@ -1,5 +1,16 @@
 **
+!Cargo.toml
+!Cargo.lock
 !LICENSE
+!docker/
+!docker/about.toml
+!docker/about.hbs
+!crates/
+!crates/**
+!apps/
+!apps/**
+!vendor/
+!vendor/**
 !browser-control/
 !browser-control/**
 browser-control/node_modules/

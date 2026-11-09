@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, mkdir, symlink, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createGateway } from "../src/gateway.mjs";
-const mod = await import("../src/static-files.mjs").catch(() => ({}));
+import { createGateway } from "./reference/gateway.mjs";
+const mod = await import("./reference/static-files.mjs").catch(() => ({}));
 test("GET/HEAD SPA through same handler; auth preserved; traversal and missing assets rejected", async (t) => {
   assert.equal(
     typeof mod.createStaticFiles,

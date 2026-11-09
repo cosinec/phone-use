@@ -1,7 +1,7 @@
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import * as plist from 'plist';
-import { canonicalUID } from './device-identity.mjs';
+import { canonicalUID } from '../../src/device-identity.mjs';
 
 const MAX_PACKET = 1024 * 1024;
 function packet(value, tag) {

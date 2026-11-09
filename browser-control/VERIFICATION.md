@@ -38,7 +38,7 @@
 
 发布 SDK 会把一次 USB transferIn 当作完整 usbmux 包。新增真实发布 SDK 集成回归将版本回复拆成多次读取，修复前出现 DataView 越界。浏览器接收适配器按长度头组装完整包，处理拆包、合包、DataView 偏移和空传输，限制包长与缓冲区，保留 SDK 的设备配置、配对和协议处理。该集成回归与接收适配单测通过，网页测试合计 96 项通过。
 
-容器 Dockerfile 当前复用上游 0.1.4 发布二进制，尚未包含两处原生源码补丁。本机验证使用当前源码构建的原生程序，idevice 编译时关闭调试断言，行为与 release 构建一致。
+Rust 网关迁移后，容器 Dockerfile 已改为从当前源码编译两个 Rust 可执行文件，复用上游 WDA 资源。容器构建仍待验证。本机验证使用当前源码构建的原生程序，idevice 编译时关闭调试断言，行为与 release 构建一致。
 
 ## 尚未完成的验证
 
@@ -47,3 +47,15 @@
 - 窄窗口实际视觉断点。浏览器 viewport API 未改变所观察 Chrome 页面的1642×943尺寸，因此未将该项记为通过；布局代码与相关组件测试保留。
 
 原始手机标识、配对凭据、账号、密码和模型密钥不进入此记录或源码包。运行目录、环境文件和截图数据均在 Git 忽略规则内。后续真实操作应在网页向导完成授权后继续验收。
+
+## Rust 网关迁移
+
+服务端入口迁移到 `crates/ictl-gateway`，启动命令和 Docker 运行阶段切换到 Rust。原 Node 实现移至 `tests/reference`，作为迁移前协议的测试参照。保留 React/TypeScript 工作台、发布版 WebUSB SDK 和原 Rust 控制引擎。
+
+自动化测试使用独立 Rust 服务进程、Node 原生 CLI fixture、HTTP 模型 fixture 和发布版 SDK，覆盖配对恢复互斥、命令去重及缓存淘汰、USB MTU、准备输入、任务确认与停止、静态文件、配置传递和 HTTP 读取期限。
+
+本机缺少 Docker，Linux 容器镜像与公网 VPS 链路尚待独立验证。
+
+本次已在 `http://127.0.0.1:8787/` 用 Rust 网关替换原 Node 服务，Mac Chrome 重新选择真实 iPhone 后恢复原配对记录和签名目录。页面显示“可以控制”并返回真实截图，点击主屏幕后操作和截图流程结束，控件恢复可用且页面无操作错误。模型仍未配置。该证据覆盖本机 Rust 网关和真实 USB 链路，未覆盖公网时延、Linux 容器和真实模型任务。
+
+迁移完成检查通过。Rust 网关 `cargo test -p ictl-gateway --locked` 为 12/12，通过指定实际网关二进制执行 `npm test` 为 104/104，包含 8 项 Rust 服务跨语言集成测试，0 失败、0 跳过。TypeScript、Vite 构建、Rust fmt 和 Clippy `-D warnings` 通过。独立审查已复核配置继承和 HTTP 读取期限两处修正。
