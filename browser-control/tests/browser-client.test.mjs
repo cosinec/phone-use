@@ -299,6 +299,7 @@ test("disconnect publishes offline and closes USB before held DELETE; old cleanu
   assert.equal(client.snapshot().phase, "offline");
   assert.equal(client.snapshot().session, null);
   assert.ok(calls.some((c) => c[0] === "usb.close"));
+  await new Promise((r) => setImmediate(r)); // USB custody settles separately from held DELETE.
   await client.connect({ apiBase: "http://cloud", accessToken: "token" });
   assert.equal(client.snapshot().phase, "connected");
   deletion.resolve({ ok: true, json: async () => ({}) });
@@ -404,5 +405,119 @@ test("late creation cleanup never closes an already-released USB target again", 
   });
   await previous;
   assert.equal(releases.filter((target) => target === released).length, 1);
+  await client.disconnect();
+});
+test("fetch uses Window-compatible receiver for default and injected browser-branded functions", async (t) => {
+  const original = globalThis.fetch;
+  function brandedFetch() {
+    assert.equal(
+      this,
+      globalThis,
+      "native Window.fetch receiver must be globalThis",
+    );
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({ aiReady: false, model: null }),
+    });
+  }
+  globalThis.fetch = brandedFetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  assert.deepEqual(await new mod.BrowserClient().config(), {
+    aiReady: false,
+    model: null,
+  });
+  assert.deepEqual(
+    await new mod.BrowserClient({ fetchImpl: brandedFetch }).config(),
+    { aiReady: false, model: null },
+  );
+});
+test("cancelled SDK pair keeps same-device custody until late pairing and final actual SDK close settle", async () => {
+  const { closeDeviceRelayTarget } = await import("@limrun/device-install");
+  const oldPair = deferred();
+  let pairs = 0,
+    choices = 0,
+    closes = 0;
+  const device = {
+    opened: false,
+    close: async () => {
+      closes++;
+      device.opened = false;
+    },
+  };
+  const targets = [];
+  const { client } = fixture({
+    sdk: {
+      requestUSBAccess: async () => {
+        choices++;
+        const next = { ...target(), device };
+        targets.push(next);
+        return next;
+      },
+      pairDevice: async (options) => {
+        device.opened = true;
+        if (++pairs === 1) return oldPair.promise;
+        return {
+          relay: { close() {} },
+          pairRecord: { udid: UID, pairRecordBase64: "xml" },
+          target: options.target,
+        };
+      },
+      closeDeviceRelayTarget,
+    },
+  });
+  const previous = client.connect({
+    apiBase: "http://cloud",
+    accessToken: "token",
+  });
+  await new Promise((r) => setImmediate(r));
+  await client.disconnect();
+  assert.equal(client.snapshot().phase, "offline");
+  assert.equal(client.snapshot().session, null);
+  await assert.rejects(
+    client.connect({ apiBase: "http://cloud", accessToken: "token" }),
+    /等待|释放|处理中/,
+  );
+  assert.equal(choices, 1, "unsafe reconnect must not even open chooser");
+  assert.equal(client.snapshot().cleanupPending, true);
+  device.opened = true;
+  oldPair.resolve({
+    relay: { close() {} },
+    pairRecord: { udid: UID, pairRecordBase64: "xml" },
+    target: targets[0],
+  });
+  await previous;
+  assert.equal(device.opened, false);
+  assert.equal(client.snapshot().cleanupPending, false);
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  const afterNew = closes;
+  await new Promise((r) => setImmediate(r));
+  assert.equal(device.opened, true);
+  assert.equal(
+    closes,
+    afterNew,
+    "old cleanup cannot close new shared USBDevice",
+  );
+  await client.disconnect();
+});
+test("USB custody outlives bounded DELETE wait when SDK close is still pending", async () => {
+  const usbClose = deferred();
+  const { client } = fixture({
+    cleanupTimeoutMs: 20,
+    sdk: { closeDeviceRelayTarget: () => usbClose.promise },
+  });
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  await client.disconnect();
+  assert.equal(client.snapshot().phase, "offline");
+  assert.equal(client.snapshot().cleanupPending, true);
+  await assert.rejects(
+    client.connect({ apiBase: "http://cloud", accessToken: "token" }),
+    /等待|释放|处理中/,
+  );
+  usbClose.resolve();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(client.snapshot().cleanupPending, false);
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
   await client.disconnect();
 });

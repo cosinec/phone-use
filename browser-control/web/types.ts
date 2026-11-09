@@ -50,6 +50,7 @@ export interface Session {
 export interface ClientState {
   phase: string;
   transportStatus?: string;
+  cleanupPending?: boolean;
   device: { productName?: string; serialNumber?: string } | null;
   session: Session | null;
   error: string | null;

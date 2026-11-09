@@ -157,3 +157,76 @@ test("Stop stays enabled during unrelated busy confirmation/status requests", as
   assert.ok(stop);
   assert.ok(!stop.includes("disabled"), "Stop must bypass unrelated busy flag");
 });
+test("screenshot img has stable React identity across frame changes, preserving the pointer capture target", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const ts = await import("typescript");
+  const source = ts.createSourceFile(
+    "PhonePreview.tsx",
+    await readFile(
+      new URL("../web/components/PhonePreview.tsx", import.meta.url),
+      "utf8",
+    ),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const images = [];
+  function visit(node) {
+    if (
+      ts.isJsxSelfClosingElement(node) &&
+      node.tagName.getText(source) === "img"
+    )
+      images.push(node);
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  assert.equal(images.length, 1);
+  const key = images[0].attributes.properties.find(
+    (attr) => attr.name?.getText(source) === "key",
+  );
+  assert.ok(
+    !key || ts.isStringLiteral(key.initializer),
+    "polling must not change the captured img React key",
+  );
+  const start = { point: { x: 10, y: 20 }, x: 10, y: 20, time: 0 };
+  const nextPoint = mod.toPhonePoint(
+    40,
+    50,
+    { left: 0, top: 0, width: 100, height: 200 },
+    100,
+    200,
+  );
+  assert.equal(
+    mod.pointerCommand(start, { point: nextPoint, x: 40, y: 50, time: 700 })
+      .tool,
+    "iphone_swipe",
+  );
+});
+test("offline custody wait is explicit in the connection panel", async (t) => {
+  const server = await createServer({
+    optimizeDeps: { noDiscovery: true },
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { ConnectionPanel } = await server.ssrLoadModule(
+    "/web/components/ConnectionPanel.tsx",
+  );
+  const html = renderToStaticMarkup(
+    createElement(ConnectionPanel, {
+      state: {
+        phase: "offline",
+        session: null,
+        cleanupPending: true,
+        warning: "请等待 USB 配对结束，必要时刷新页面。",
+      },
+      supported: true,
+      apiBase: "",
+      onBase: () => {},
+      onConnect: () => {},
+      onDisconnect: () => {},
+    }),
+  );
+  assert.match(html, /等待 USB 释放/);
+  assert.match(html, /请等待 USB 配对结束/);
+});

@@ -69,14 +69,20 @@ export function ConnectionPanel({
       ) : (
         <button
           className="button primary full"
-          disabled={!supported || !token.trim()}
+          disabled={!supported || !!state.cleanupPending || !token.trim()}
           onClick={() => {
             onConnect(token);
             setToken("");
           }}
         >
-          <span>＋</span> 连接 iPhone
+          <span>＋</span>{" "}
+          {state.cleanupPending ? "等待 USB 释放" : "连接 iPhone"}
         </button>
+      )}
+      {state.warning && (
+        <p className="field-hint" role="status">
+          {state.warning}
+        </p>
       )}
       {!supported && (
         <p className="inline-error">

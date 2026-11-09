@@ -26,6 +26,7 @@ export class BrowserClient {
     this.listeners = new Set();
     this.attempt = null;
     this.refreshSequence = 0;
+    this.custody = new Set();
     this.view = {
       phase: "offline",
       device: null,
@@ -33,6 +34,7 @@ export class BrowserClient {
       error: null,
       warning: null,
       transportStatus: "",
+      cleanupPending: false,
     };
   }
   snapshot = () => this.view;
@@ -44,6 +46,22 @@ export class BrowserClient {
     this.view = { ...this.view, ...patch };
     for (const listener of this.listeners) listener();
   }
+  publishCustody() {
+    const cleanupPending = this.custody.size > 0 && !this.attempt;
+    this.update({
+      cleanupPending,
+      warning: cleanupPending
+        ? "上次 USB 配对或释放仍在处理中。请等待；长时间未结束时，可刷新页面后重试。"
+        : null,
+    });
+  }
+  holdCustody(owner) {
+    this.custody.add(owner);
+    this.publishCustody();
+  }
+  releaseCustody(owner) {
+    if (this.custody.delete(owner)) this.publishCustody();
+  }
   safeError(error, attempt = this.attempt) {
     let message = error instanceof Error ? error.message : "请求失败";
     for (const value of [attempt?.accessToken, attempt?.session?.token])
@@ -51,7 +69,7 @@ export class BrowserClient {
     return message.slice(0, 1600);
   }
   async request(base, route, token, method = "GET", data, signal) {
-    const response = await this.fetchImpl(`${base}${route}`, {
+    const response = await this.fetchImpl.call(globalThis, `${base}${route}`, {
       method,
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -77,6 +95,10 @@ export class BrowserClient {
   connect({ apiBase = "", accessToken }) {
     if (this.attempt)
       return Promise.reject(new Error("连接仍在处理中，请先断开"));
+    if (this.custody.size)
+      return Promise.reject(
+        new Error("上次 USB 配对或释放仍在处理中，请等待结束后再连接"),
+      );
     let base = apiBase.trim().replace(/\/$/, "");
     if (base) {
       let url;
@@ -180,6 +202,7 @@ export class BrowserClient {
         },
       });
       const target = attempt.target;
+      this.holdCustody(attempt);
       let result;
       try {
         result = await this.sdk.pairDevice({
@@ -215,6 +238,7 @@ export class BrowserClient {
         await this.cleanup(attempt);
         if (this.attempt === attempt) this.attempt = null;
       }
+      this.releaseCustody(attempt);
     }
   }
   async cleanup(attempt) {
@@ -236,11 +260,18 @@ export class BrowserClient {
       }, this.cleanupTimeoutMs);
     });
     // Close USB immediately; an unavailable server must not hold the USB device.
-    const usb = (async () => {
-      try {
-        await this.sdk.closeDeviceRelayTarget(target);
-      } catch {}
-    })();
+    const usb = target
+      ? (async () => {
+          const owner = Symbol("USB cleanup");
+          this.holdCustody(owner);
+          try {
+            await this.sdk.closeDeviceRelayTarget(target);
+          } catch {
+          } finally {
+            this.releaseCustody(owner);
+          }
+        })()
+      : Promise.resolve();
     const deletion = session
       ? this.request(
           attempt.base,
@@ -269,7 +300,9 @@ export class BrowserClient {
       error: null,
       warning: null,
       transportStatus: "",
+      cleanupPending: this.custody.size > 0,
     });
+    this.publishCustody();
     return attempt ? this.cleanup(attempt) : Promise.resolve();
   }
   async connectionLost(attempt) {
@@ -282,6 +315,7 @@ export class BrowserClient {
       session: null,
       error: "设备连接已断开。请重新连接；已经发出的操作可能已执行。",
     });
+    this.publishCustody();
     await this.cleanup(attempt);
   }
   async sessionRequest(route = "", method = "GET", data) {

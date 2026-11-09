@@ -52,7 +52,6 @@ export function PhonePreview({
         <div className={`phone-frame ${screen ? "has-screen" : ""}`}>
           {screen ? (
             <img
-              key={screen.imageBase64.slice(-40)}
               className="phone-screen"
               src={`data:image/jpeg;base64,${screen.imageBase64}`}
               alt="iPhone 当前屏幕"
