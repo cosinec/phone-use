@@ -11,3 +11,9 @@
 # tests/device/run.py 的虚拟环境和真机截图（截图里可能有个人信息）
 .venv/
 shots/
+# Browser/cloud control development and per-session secrets
+browser-control/node_modules/
+browser-control/dist/
+browser-control/.runtime/
+browser-control/.env
+.superpowers/

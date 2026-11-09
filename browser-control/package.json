@@ -1,0 +1,29 @@
+{
+  "name": "iphone-control-browser-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "dev": "node src/server.mjs",
+    "start": "node src/server.mjs",
+    "web:dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@limrun/device-install": "0.1.0",
+    "plist": "5.1.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "ws": "8.22.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "typescript": "5.9.3",
+    "vite": "8.0.13"
+  }
+}
