@@ -39,6 +39,7 @@ test("pointer math uses JPEG native point dimensions with object-fit letterboxin
 });
 test("UI renders honest empty phone, manual-disabled state and AI unconfigured", async (t) => {
   const server = await createServer({
+    optimizeDeps: { noDiscovery: true },
     server: { middlewareMode: true },
     appType: "custom",
   });
@@ -78,6 +79,7 @@ test("UI renders honest empty phone, manual-disabled state and AI unconfigured",
 });
 test("native transport ready alone cannot enable manual control; active AI disables manual controls and keeps stop/confirmation visible", async (t) => {
   const server = await createServer({
+    optimizeDeps: { noDiscovery: true },
     server: { middlewareMode: true },
     appType: "custom",
   });
@@ -123,4 +125,35 @@ test("native transport ready alone cannot enable manual control; active AI disab
   assert.match(html, /拒绝并停止/);
   assert.match(html, /确认这一步/);
   assert.match(html, /手动操作已暂停/);
+});
+test("Stop stays enabled during unrelated busy confirmation/status requests", async (t) => {
+  const server = await createServer({
+    optimizeDeps: { noDiscovery: true },
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { TaskPanel } = await server.ssrLoadModule(
+    "/web/components/TaskPanel.tsx",
+  );
+  const html = renderToStaticMarkup(
+    createElement(TaskPanel, {
+      ai: { aiReady: true, model: "fixture" },
+      task: {
+        id: "task",
+        instruction: "fixture",
+        state: "executing",
+        steps: [],
+        confirmation: null,
+      },
+      canRun: false,
+      busy: true,
+      onStart: () => {},
+      onConfirm: () => {},
+      onStop: () => {},
+    }),
+  );
+  const stop = html.match(/<button[^>]*>停止任务<\/button>/)?.[0];
+  assert.ok(stop);
+  assert.ok(!stop.includes("disabled"), "Stop must bypass unrelated busy flag");
 });

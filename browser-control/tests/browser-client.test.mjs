@@ -60,7 +60,12 @@ function fixture(overrides = {}) {
       };
     });
   return {
-    client: new mod.BrowserClient({ sdk, fetchImpl, uuid: () => "request-1" }),
+    client: new mod.BrowserClient({
+      sdk,
+      fetchImpl,
+      uuid: () => "request-1",
+      cleanupTimeoutMs: overrides.cleanupTimeoutMs ?? 5000,
+    }),
     calls,
     relay,
   };
@@ -278,5 +283,126 @@ test("older status response cannot overwrite a newer active task", async () => {
   await p1;
   assert.equal(client.snapshot().session.task?.id, "active");
   client.fetchImpl = async () => ({ ok: true, json: async () => ({}) });
+  await client.disconnect();
+});
+test("disconnect publishes offline and closes USB before held DELETE; old cleanup cannot clear new session", async () => {
+  const deletion = deferred();
+  const { client, calls } = fixture();
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  await client.refresh();
+  const originalFetch = client.fetchImpl;
+  client.fetchImpl = async (url, options) =>
+    options.method === "DELETE"
+      ? deletion.promise
+      : originalFetch(url, options);
+  const closing = client.disconnect();
+  assert.equal(client.snapshot().phase, "offline");
+  assert.equal(client.snapshot().session, null);
+  assert.ok(calls.some((c) => c[0] === "usb.close"));
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  assert.equal(client.snapshot().phase, "connected");
+  deletion.resolve({ ok: true, json: async () => ({}) });
+  await closing;
+  assert.equal(client.snapshot().phase, "connected");
+  assert.ok(client.snapshot().session);
+  await client.disconnect();
+});
+test("cancelled late creation is deleted while a newer connection remains owned", async () => {
+  const creation = deferred(),
+    lateDeletion = deferred();
+  let post = 0;
+  const { client } = fixture({
+    fetchImpl: async (url, options) => {
+      if (options.method === "POST" && url.endsWith("/sessions"))
+        return ++post === 1
+          ? creation.promise
+          : {
+              ok: true,
+              json: async () => ({
+                id: "new",
+                deviceId: UID,
+                token: "NEW_SECRET",
+              }),
+            };
+      if (options.method === "DELETE" && url.endsWith("/late"))
+        return lateDeletion.promise;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const previous = client.connect({
+    apiBase: "http://cloud",
+    accessToken: "token",
+  });
+  await new Promise((r) => setImmediate(r));
+  await client.disconnect();
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  creation.resolve({
+    ok: true,
+    json: async () => ({ id: "late", deviceId: UID, token: "OLD_SECRET" }),
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(client.snapshot().session.id, "new");
+  lateDeletion.resolve({ ok: true, json: async () => ({}) });
+  await previous;
+  assert.equal(client.snapshot().phase, "connected");
+  assert.equal(client.snapshot().session.id, "new");
+  await client.disconnect();
+});
+test("DELETE cleanup is bounded and attempted once even when fetch ignores abort", async () => {
+  const deletion = deferred();
+  let deletes = 0;
+  const { client } = fixture({ cleanupTimeoutMs: 20 });
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  client.fetchImpl = async () => {
+    deletes++;
+    return deletion.promise;
+  };
+  const closing = client.disconnect();
+  try {
+    assert.equal(
+      await Promise.race([
+        closing.then(() => true),
+        new Promise((r) => setTimeout(() => r(false), 80)),
+      ]),
+      true,
+      "cleanup must finish within its configured bound",
+    );
+    assert.equal(deletes, 1);
+  } finally {
+    deletion.resolve({ ok: true, json: async () => ({}) });
+    await closing;
+  }
+});
+test("late creation cleanup never closes an already-released USB target again", async () => {
+  const creation = deferred();
+  let n = 0;
+  const releases = [];
+  const { client } = fixture({
+    sdk: {
+      closeDeviceRelayTarget: async (target) => {
+        if (target) releases.push(target);
+      },
+    },
+    fetchImpl: async (url, options) =>
+      options.method === "POST" && ++n === 1
+        ? creation.promise
+        : {
+            ok: true,
+            json: async () => ({ id: "new", deviceId: UID, token: "NEW" }),
+          },
+  });
+  const previous = client.connect({
+    apiBase: "http://cloud",
+    accessToken: "token",
+  });
+  await new Promise((r) => setImmediate(r));
+  await client.disconnect();
+  const released = releases[0];
+  creation.resolve({
+    ok: true,
+    json: async () => ({ id: "old", deviceId: UID, token: "OLD" }),
+  });
+  await previous;
+  assert.equal(releases.filter((target) => target === released).length, 1);
   await client.disconnect();
 });

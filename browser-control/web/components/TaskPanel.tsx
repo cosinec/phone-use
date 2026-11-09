@@ -6,6 +6,7 @@ interface Props {
   task: Task | null;
   canRun: boolean;
   busy: boolean;
+  stopBusy?: boolean;
   onStart: (instruction: string) => void;
   onConfirm: (approved: boolean) => void;
   onStop: () => void;
@@ -27,6 +28,7 @@ export function TaskPanel({
   task,
   canRun,
   busy,
+  stopBusy = false,
   onStart,
   onConfirm,
   onStop,
@@ -111,7 +113,7 @@ export function TaskPanel({
           {running && (
             <button
               className="button danger small"
-              disabled={busy}
+              disabled={stopBusy}
               onClick={onStop}
             >
               停止任务

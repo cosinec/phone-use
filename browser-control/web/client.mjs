@@ -17,10 +17,12 @@ export class BrowserClient {
     sdk = publishedSDK,
     fetchImpl = globalThis.fetch,
     uuid = () => crypto.randomUUID(),
+    cleanupTimeoutMs = 5000,
   } = {}) {
     this.sdk = sdk;
     this.fetchImpl = fetchImpl;
     this.uuid = uuid;
+    this.cleanupTimeoutMs = cleanupTimeoutMs;
     this.listeners = new Set();
     this.attempt = null;
     this.refreshSequence = 0;
@@ -48,7 +50,7 @@ export class BrowserClient {
       if (value) message = message.split(value).join("[已隐藏]");
     return message.slice(0, 1600);
   }
-  async request(base, route, token, method = "GET", data) {
+  async request(base, route, token, method = "GET", data, signal) {
     const response = await this.fetchImpl(`${base}${route}`, {
       method,
       headers: {
@@ -58,6 +60,7 @@ export class BrowserClient {
       ...(data !== undefined ? { body: JSON.stringify(data) } : {}),
       cache: "no-store",
       redirect: "error",
+      ...(signal ? { signal } : {}),
     });
     const result = await response.json();
     if (!response.ok)
@@ -176,12 +179,20 @@ export class BrowserClient {
           task: null,
         },
       });
-      const result = await this.sdk.pairDevice({
-        registryApiUrl: attempt.base || globalThis.location.origin,
-        token: attempt.session.token,
-        target: attempt.target,
-        log: attempt.log,
-      });
+      const target = attempt.target;
+      let result;
+      try {
+        result = await this.sdk.pairDevice({
+          registryApiUrl: attempt.base || globalThis.location.origin,
+          token: attempt.session.token,
+          target,
+          log: attempt.log,
+        });
+      } finally {
+        // The SDK can finish opening resources after cancellation. Its target
+        // stays captured until this in-flight pair settles for final cleanup.
+        if (!attempt.target) attempt.target = target;
+      }
       attempt.relay = result.relay;
       if (attempt.cancelled) return;
       await this.sdk.putPairRecord(
@@ -207,47 +218,71 @@ export class BrowserClient {
     }
   }
   async cleanup(attempt) {
-    attempt.relay?.close();
-    if (attempt.session) {
-      const session = attempt.session;
-      attempt.session = null;
+    const relay = attempt.relay,
+      session = attempt.session,
+      target = attempt.target;
+    attempt.relay = null;
+    attempt.session = null;
+    attempt.target = null;
+    try {
+      relay?.close();
+    } catch {}
+    const abort = new AbortController();
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        abort.abort();
+        resolve();
+      }, this.cleanupTimeoutMs);
+    });
+    // Close USB immediately; an unavailable server must not hold the USB device.
+    const usb = (async () => {
       try {
-        await this.request(
+        await this.sdk.closeDeviceRelayTarget(target);
+      } catch {}
+    })();
+    const deletion = session
+      ? this.request(
           attempt.base,
           `/api/sessions/${session.id}`,
           session.token,
           "DELETE",
-        );
-      } catch {}
-    }
+          undefined,
+          abort.signal,
+        )
+      : Promise.resolve();
     try {
-      await this.sdk.closeDeviceRelayTarget(attempt.target);
-    } catch {}
-  }
-  async disconnect() {
-    const attempt = this.attempt;
-    if (attempt) {
-      attempt.cancelled = true;
-      await this.cleanup(attempt);
-      if (attempt.relay && this.attempt === attempt) this.attempt = null;
+      await Promise.race([Promise.allSettled([usb, deletion]), timeout]);
+    } finally {
+      clearTimeout(timer);
     }
+  }
+  disconnect() {
+    const attempt = this.attempt;
+    if (attempt) attempt.cancelled = true;
+    this.attempt = null;
+    ++this.refreshSequence;
     this.update({
       phase: "offline",
       session: null,
       device: null,
       error: null,
       warning: null,
+      transportStatus: "",
     });
+    return attempt ? this.cleanup(attempt) : Promise.resolve();
   }
   async connectionLost(attempt) {
+    if (this.attempt !== attempt) return;
     attempt.cancelled = true;
+    this.attempt = null;
+    ++this.refreshSequence;
     this.update({
       phase: "error",
       session: null,
       error: "设备连接已断开。请重新连接；已经发出的操作可能已执行。",
     });
     await this.cleanup(attempt);
-    if (this.attempt === attempt) this.attempt = null;
   }
   async sessionRequest(route = "", method = "GET", data) {
     const attempt = this.attempt,
@@ -273,6 +308,7 @@ export class BrowserClient {
     try {
       const result = await this.sessionRequest();
       if (
+        attempt &&
         this.attempt === attempt &&
         !attempt.cancelled &&
         sequence === this.refreshSequence
@@ -281,6 +317,7 @@ export class BrowserClient {
       return result;
     } catch (error) {
       if (
+        attempt &&
         this.attempt === attempt &&
         !attempt.cancelled &&
         sequence === this.refreshSequence
@@ -326,11 +363,22 @@ export class BrowserClient {
       { actionId, approved },
     );
   }
-  stopTask(id) {
-    return this.sessionRequest(
+  async stopTask(id) {
+    const attempt = this.attempt;
+    ++this.refreshSequence;
+    const result = await this.sessionRequest(
       `/tasks/${encodeURIComponent(id)}/stop`,
       "POST",
       {},
     );
+    if (
+      this.attempt === attempt &&
+      !attempt.cancelled &&
+      this.view.session?.task?.id === id
+    ) {
+      ++this.refreshSequence;
+      this.update({ session: { ...this.view.session, task: result } });
+    }
+    return result;
   }
 }

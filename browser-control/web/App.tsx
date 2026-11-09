@@ -1,10 +1,11 @@
 import {
-  useCallback,
+  useMemo,
   useEffect,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
+import { createTaskActions } from "./task-actions.mjs";
 import { BrowserClient } from "./client.mjs";
 import { ConnectionPanel } from "./components/ConnectionPanel";
 import { PhonePreview } from "./components/PhonePreview";
@@ -27,7 +28,16 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
   const [screen, setScreen] = useState<Screen | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const actionInFlight = useRef(false);
+  const [stoppingTask, setStoppingTask] = useState<string | null>(null);
+  const actions = useMemo(
+    () =>
+      createTaskActions(client, {
+        onBusy: setBusy,
+        onError: setError,
+        onStopBusy: setStoppingTask,
+      }),
+    [client],
+  );
   const session = state.session;
   const task = session?.task || null;
   const wdaReady = !!session?.ready && session.daemon?.state?.state === "ready";
@@ -112,24 +122,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
       void client.disconnect();
     };
   }, [client]);
-  const run = useCallback(
-    async (operation: () => Promise<unknown>) => {
-      if (actionInFlight.current) return;
-      actionInFlight.current = true;
-      setBusy(true);
-      setError("");
-      try {
-        await operation();
-        if (client.snapshot().session) await client.refresh();
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "操作失败");
-      } finally {
-        actionInFlight.current = false;
-        setBusy(false);
-      }
-    },
-    [client],
-  );
+  const run = actions.run;
   const manual = (tool: string, args: Args) => {
     const current = client.snapshot();
     if (
@@ -256,6 +249,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
                 task={task}
                 canRun={canControl && !!ai?.aiReady}
                 busy={busy}
+                stopBusy={stoppingTask === `${session?.id}/${task?.id}`}
                 onStart={(instruction) =>
                   void run(() => client.startTask(instruction))
                 }
@@ -270,7 +264,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
                     );
                 }}
                 onStop={() => {
-                  if (task) void run(() => client.stopTask(task.id));
+                  if (session && task) void actions.stop(session.id, task.id);
                 }}
               />
               {session && (!wdaReady || session.setup.transcript) && (
