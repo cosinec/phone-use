@@ -89,7 +89,12 @@ function fakeUSB(allFail = false) {
       });
     },
   };
-  return { device, claims, writes };
+  return {
+    device,
+    claims,
+    writes,
+    failRead: () => rejectRead?.(new Error("fake physical unplug")),
+  };
 }
 for (const allFail of [false, true])
   test(`published SDK ${allFail ? "all claim failures close USB and delete session" : "falls back current cfg6→cfg3 and pairs through real gateway"} (explicit fake USB/native)`, async (t) => {
@@ -184,3 +189,124 @@ for (const allFail of [false, true])
       assert.equal(usb.device.opened, false);
     }
   });
+test("selected USB disconnect revokes live published SDK WS and closes real NativeController fixture process", async (t) => {
+  const { NativeController } = await import("../src/native-controller.mjs");
+  const root = await mkdtemp(path.join(os.tmpdir(), "sdk-unplug-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const usb = fakeUSB();
+  class USBEvents extends EventTarget {
+    listeners = new Set();
+    addEventListener(type, handler, ...args) {
+      if (type === "disconnect") this.listeners.add(handler);
+      super.addEventListener(type, handler, ...args);
+    }
+    removeEventListener(type, handler, ...args) {
+      this.listeners.delete(handler);
+      super.removeEventListener(type, handler, ...args);
+    }
+    disconnect(device) {
+      const event = new Event("disconnect");
+      Object.defineProperty(event, "device", { value: device });
+      this.dispatchEvent(event);
+    }
+  }
+  const events = new USBEvents();
+  events.requestDevice = async () => usb.device;
+  const originalNavigator = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "navigator",
+    ),
+    originalWS = globalThis.WebSocket;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { usb: events },
+  });
+  globalThis.WebSocket = class extends WebSocket {
+    constructor(url) {
+      super(url, { origin: "http://localhost" });
+    }
+  };
+  t.after(() => {
+    if (originalNavigator)
+      Object.defineProperty(globalThis, "navigator", originalNavigator);
+    else delete globalThis.navigator;
+    globalThis.WebSocket = originalWS;
+  });
+  let controller;
+  const gateway = createGateway({
+    accessToken: "fixture-controller-token",
+    allowedOrigins: ["http://localhost"],
+    runtimeDir: root,
+    controllerFactory: (session) =>
+      (controller = new NativeController({
+        ...session,
+        command: process.execPath,
+        commandArgs: [
+          new URL("./fixtures/native-cli.mjs", import.meta.url).pathname,
+        ],
+        startTimeoutMs: 3000,
+      })),
+  });
+  await gateway.listen("127.0.0.1", 0);
+  t.after(() => gateway.close());
+  const base = `http://127.0.0.1:${gateway.server.address().port}`;
+  const record = {
+    udid: "00008140-001234567890ABCD",
+    pairRecordBase64: Buffer.from(
+      plist.build({ SystemBUID: "fake-buid", HostID: "fake" }),
+    ).toString("base64"),
+  };
+  const client = new BrowserClient({
+    sdk: {
+      ...sdk,
+      getPairRecord: async () => record,
+      putPairRecord: async () => {},
+    },
+  });
+  t.after(() => client.disconnect());
+  await client.connect({
+    apiBase: base,
+    accessToken: "fixture-controller-token",
+  });
+  const waitFor = async (condition) => {
+    const until = Date.now() + 3000;
+    while (!condition()) {
+      if (Date.now() > until) throw new Error("fixture wait timeout");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+  await waitFor(() => controller?.state.ready);
+  const session = [...gateway.sessions.values()][0],
+    id = session.id,
+    token = session.token,
+    pid = [...controller.children][0].pid;
+  events.disconnect({ serialNumber: "00008140001234567890FFFF" });
+  assert.equal(client.snapshot().phase, "connected");
+  assert.equal(gateway.sessions.size, 1);
+  usb.failRead();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(
+    client.snapshot().phase,
+    "connected",
+    "SDK mux read failure alone does not revoke the WS",
+  );
+  events.disconnect(usb.device);
+  assert.equal(client.snapshot().phase, "offline");
+  assert.equal(client.snapshot().session, null);
+  await waitFor(
+    () =>
+      gateway.sessions.size === 0 &&
+      controller.closed &&
+      controller.children.size === 0,
+  );
+  assert.equal(events.listeners.size, 0);
+  assert.equal(
+    (
+      await fetch(`${base}/api/sessions/${id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    ).status,
+    404,
+  );
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+});

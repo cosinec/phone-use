@@ -230,3 +230,24 @@ test("offline custody wait is explicit in the connection panel", async (t) => {
   assert.match(html, /等待 USB 释放/);
   assert.match(html, /请等待 USB 配对结束/);
 });
+test("native setup complete state renders the localized finished label", async (t) => {
+  const server = await createServer({
+    optimizeDeps: { noDiscovery: true },
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { SetupPanel } = await server.ssrLoadModule(
+    "/web/components/SetupPanel.tsx",
+  );
+  const html = renderToStaticMarkup(
+    createElement(SetupPanel, {
+      setup: { state: "complete", transcript: "", exitCode: 0 },
+      busy: false,
+      onStart: () => {},
+      onInput: () => {},
+    }),
+  );
+  assert.match(html, /向导已结束/);
+  assert.ok(!html.includes(">complete<"));
+});

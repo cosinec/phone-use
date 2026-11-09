@@ -7,7 +7,14 @@ import type {
   Task,
 } from "./types";
 export class BrowserClient {
-  constructor(options?: object);
+  constructor(
+    options?: object & {
+      usbEvents?: Pick<
+        EventTarget,
+        "addEventListener" | "removeEventListener"
+      > | null;
+    },
+  );
   snapshot(): ClientState;
   subscribe(listener: () => void): () => void;
   connect(options: { apiBase: string; accessToken: string }): Promise<void>;

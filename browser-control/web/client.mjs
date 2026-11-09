@@ -18,8 +18,10 @@ export class BrowserClient {
     fetchImpl = globalThis.fetch,
     uuid = () => crypto.randomUUID(),
     cleanupTimeoutMs = 5000,
+    usbEvents = globalThis.navigator?.usb,
   } = {}) {
     this.sdk = sdk;
+    this.usbEvents = usbEvents;
     this.fetchImpl = fetchImpl;
     this.uuid = uuid;
     this.cleanupTimeoutMs = cleanupTimeoutMs;
@@ -45,6 +47,30 @@ export class BrowserClient {
   update(patch) {
     this.view = { ...this.view, ...patch };
     for (const listener of this.listeners) listener();
+  }
+  watchUSBDisconnect(attempt, uid) {
+    const events = this.usbEvents,
+      selectedDevice = attempt.target.device;
+    if (!events?.addEventListener || !events?.removeEventListener) return;
+    const disconnect = (event) => {
+      if (this.attempt !== attempt || attempt.cancelled || !event.device)
+        return;
+      let matches = event.device === selectedDevice;
+      if (!matches) {
+        try {
+          matches = canonicalUID(event.device.serialNumber) === uid;
+        } catch {}
+      }
+      if (matches)
+        void this.connectionLost(attempt, {
+          phase: "offline",
+          message:
+            "iPhone 已断开 USB 连接。请重新连接设备；已经发出的操作可能已执行。",
+        });
+    };
+    events.addEventListener("disconnect", disconnect);
+    attempt.detachUSB = () =>
+      events.removeEventListener("disconnect", disconnect);
   }
   publishCustody() {
     const cleanupPending = this.custody.size > 0 && !this.attempt;
@@ -159,6 +185,7 @@ export class BrowserClient {
       if (attempt.cancelled) return;
       const hello = attempt.target.hello;
       const uid = canonicalUID(hello.serialNumber);
+      this.watchUSBDisconnect(attempt, uid);
       this.update({
         phase: "pairing",
         device: { ...hello, serialNumber: uid },
@@ -242,6 +269,8 @@ export class BrowserClient {
     }
   }
   async cleanup(attempt) {
+    attempt.detachUSB?.();
+    attempt.detachUSB = null;
     const relay = attempt.relay,
       session = attempt.session,
       target = attempt.target;
@@ -305,15 +334,22 @@ export class BrowserClient {
     this.publishCustody();
     return attempt ? this.cleanup(attempt) : Promise.resolve();
   }
-  async connectionLost(attempt) {
+  async connectionLost(
+    attempt,
+    {
+      phase = "error",
+      message = "设备连接已断开。请重新连接；已经发出的操作可能已执行。",
+    } = {},
+  ) {
     if (this.attempt !== attempt) return;
     attempt.cancelled = true;
     this.attempt = null;
     ++this.refreshSequence;
     this.update({
-      phase: "error",
+      phase,
       session: null,
-      error: "设备连接已断开。请重新连接；已经发出的操作可能已执行。",
+      device: null,
+      error: message,
     });
     this.publishCustody();
     await this.cleanup(attempt);

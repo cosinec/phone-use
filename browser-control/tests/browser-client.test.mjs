@@ -65,6 +65,7 @@ function fixture(overrides = {}) {
       fetchImpl,
       uuid: () => "request-1",
       cleanupTimeoutMs: overrides.cleanupTimeoutMs ?? 5000,
+      usbEvents: overrides.usbEvents ?? null,
     }),
     calls,
     relay,
@@ -520,4 +521,80 @@ test("USB custody outlives bounded DELETE wait when SDK close is still pending",
   assert.equal(client.snapshot().cleanupPending, false);
   await client.connect({ apiBase: "http://cloud", accessToken: "token" });
   await client.disconnect();
+});
+function usbEventsFixture() {
+  const listeners = new Set();
+  return {
+    listeners,
+    addEventListener: (type, handler) => {
+      if (type === "disconnect") listeners.add(handler);
+    },
+    removeEventListener: (type, handler) => listeners.delete(handler),
+    disconnect: (device) => {
+      for (const handler of [...listeners]) handler({ device });
+    },
+  };
+}
+test("USB listeners belong to selected attempts, ignore unrelated and stale events, and remove on cancel", async () => {
+  const usbEvents = usbEventsFixture();
+  const { client } = fixture({ usbEvents });
+  assert.equal(
+    usbEvents.listeners.size,
+    0,
+    "constructing a client must not install listeners",
+  );
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  assert.equal(usbEvents.listeners.size, 1);
+  usbEvents.disconnect({ serialNumber: "00008140001234567890EEEE" });
+  assert.equal(client.snapshot().phase, "connected");
+  const stale = [...usbEvents.listeners][0];
+  await client.disconnect();
+  assert.equal(usbEvents.listeners.size, 0);
+  await client.connect({ apiBase: "http://cloud", accessToken: "token" });
+  stale({ device: { serialNumber: UID } });
+  assert.equal(
+    client.snapshot().phase,
+    "connected",
+    "stale callback cannot close a newer attempt",
+  );
+  usbEvents.disconnect({ serialNumber: "00008140001234567890abcd\0\0" });
+  assert.equal(client.snapshot().phase, "offline");
+  assert.equal(client.snapshot().session, null);
+  assert.equal(usbEvents.listeners.size, 0);
+  await new Promise((r) => setImmediate(r));
+  await client.disconnect();
+});
+test("USB listener is removed after pairing failure and during pending cancellation", async () => {
+  const events = usbEventsFixture();
+  const failing = fixture({
+    usbEvents: events,
+    sdk: {
+      pairDevice: async () => {
+        throw new Error("fixture pair error");
+      },
+    },
+  }).client;
+  await assert.rejects(
+    failing.connect({ apiBase: "http://cloud", accessToken: "token" }),
+  );
+  assert.equal(events.listeners.size, 0);
+  const pair = deferred();
+  const client = fixture({
+    usbEvents: events,
+    sdk: { pairDevice: () => pair.promise },
+  }).client;
+  const pending = client.connect({
+    apiBase: "http://cloud",
+    accessToken: "token",
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(events.listeners.size, 1);
+  await client.disconnect();
+  assert.equal(events.listeners.size, 0);
+  pair.resolve({
+    relay: { close() {} },
+    pairRecord: { udid: UID, pairRecordBase64: "xml" },
+  });
+  await pending;
+  assert.equal(events.listeners.size, 0);
 });

@@ -27,7 +27,7 @@ export function SetupPanel({ setup, busy, onStart, onInput }: Props) {
               idle: "尚未开始",
               running: "正在准备",
               stopping: "正在停止",
-              completed: "向导已结束",
+              complete: "向导已结束",
               failed: "准备失败",
             } as Record<string, string>
           )[setup.state] || setup.state}
