@@ -45,14 +45,16 @@
 
 **Files:** `browser-control/src/{model-client,task-runner}.mjs`, gateway integration, `browser-control/tests/{model-client,task-runner}.test.mjs`.
 
-**Consumes:** `NativeController.command(request)`, `.screen()` and gateway session lifecycle. Configure compatible model endpoint/key/model through server environment.
+**Consumes:** `session.screen()`, `session.runCommand({requestId,deviceId,tool,args,signal?})`, `session.device.serialNumber`, `session.abort.signal` and gateway session lifecycle. Configure compatible model endpoint/key/model through server environment.
 **Produces:** `TaskRunner` with `start(instruction)`, `stop(taskId)`, `confirm(taskId,actionId,approved)`, `snapshot()`; model action schema `{type:'action',tool,args,reason,requiresConfirmation}` or `{type:'done',message}`.
 
 - [ ] Write an async test that holds a model promise, stops the task, resolves an action, and asserts zero subsequent commands:
   ```js
   let release; const model=()=>new Promise(r=>release=r); const calls=[];
-  const runner=new TaskRunner({model,controller:{screen:async()=>({elements:'Home'}),command:async x=>calls.push(x)}});
-  const task=runner.start('open settings'); runner.stop(task.id);
+  const session={device:{serialNumber:'00008130-0000000000000001'},abort:new AbortController(),screen:async()=>({elementsText:'Home'}),runCommand:async x=>calls.push(x)};
+  const runner=new TaskRunner({model,session});
+  const task=runner.start('open settings'); await new Promise(r=>setImmediate(r));
+  assert.equal(typeof release,'function'); runner.stop(task.id);
   release({type:'action',tool:'iphone_press_button',args:{button:'home'},reason:'home'});
   await new Promise(r=>setTimeout(r,20)); assert.equal(calls.length,0);
   ```
@@ -63,7 +65,7 @@
 
 ### Task 3: Browser UI, real SDK integration and distribution
 
-**Files:** `browser-control/web/{main.tsx,App.tsx,styles.css,client.mjs,types.ts}`, `browser-control/index.html`, `browser-control/vite.config.mjs`, `browser-control/tests/browser-client.test.mjs`, `browser-control/{README.md,THIRD_PARTY.md,Dockerfile,compose.yaml,.env.example}`, scripts and root readme link.
+**Files:** `browser-control/web/{main.tsx,App.tsx,styles.css,client.mjs,types.ts}`, optional focused `web/components/{ConnectionPanel,PhonePreview,TaskPanel,SetupPanel}.tsx`, `browser-control/index.html`, `browser-control/vite.config.mjs`, `browser-control/tests/browser-client.test.mjs`, `browser-control/{README.md,THIRD_PARTY.md,Dockerfile,compose.yaml,.env.example}`, scripts and root readme link.
 
 **Consumes:** REST/wire contracts from Tasks 1/2; SDK `requestUSBAccess`, `pairDevice`, `closeDeviceRelayTarget`, browser pair store.
 **Produces:** Browser web app showing live session readiness, connect/pair/setup wizard, setup inputs, screenshots/point clicks, Home/Lock/text controls, natural-language task, progress, confirmation and stop. Package imports the published SDK, not reimplemented USB.
