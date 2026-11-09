@@ -9,6 +9,7 @@ import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload, MA
 import { createVirtualMux, readPairRecord } from './virtual-usbmuxd.mjs';
 import { NativeController } from './native-controller.mjs';
 import { commandRequest } from './commands.mjs';
+import { canonicalUID } from './device-identity.mjs';
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const failure = (status, message) => Object.assign(new Error(message), { status });
@@ -16,11 +17,12 @@ const equal = (left, right) => typeof left === 'string' && typeof right === 'str
 
 function validateDevice(device) {
   if (!device || device.vendorId !== 1452 || !Number.isInteger(device.productId) || device.productId < 1 || device.productId > 65535
-      || typeof device.serialNumber !== 'string' || !/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{8}-[a-fA-F0-9]{16})$/.test(device.serialNumber)
       || (device.productName !== undefined && (typeof device.productName !== 'string' || device.productName.length > 256))) {
     throw failure(400, 'Invalid Apple device identity');
   }
-  return { serialNumber: device.serialNumber, productId: device.productId, vendorId: device.vendorId, ...(device.productName ? { productName: device.productName } : {}) };
+  let serialNumber;
+  try { serialNumber = canonicalUID(device.serialNumber); } catch { throw failure(400, 'Invalid Apple device identity'); }
+  return { serialNumber, productId: device.productId, vendorId: device.vendorId, ...(device.productName ? { productName: device.productName } : {}) };
 }
 async function body(request) {
   let size = 0;
@@ -49,6 +51,8 @@ export function createGateway(options) {
   const origins = new Set(allowedOrigins);
   const publicBase = options.publicUrl ? new URL(options.publicUrl) : null;
   if (publicBase && !['http:', 'https:'].includes(publicBase.protocol)) throw new Error('HTTP(S) publicUrl required');
+  const maxCommandIds = options.maxCommandIds ?? 10_000;
+  if (!Number.isInteger(maxCommandIds) || maxCommandIds < 1 || maxCommandIds > 10_000) throw new Error('maxCommandIds must be 1..10000');
   const sessions = new Map();
   const owners = new Map();
   const wsServer = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_PAYLOAD + 16 });
@@ -83,6 +87,7 @@ export function createGateway(options) {
     let namespace = randomUUID();
     if (pairRecord) {
       try { readPairRecord(pairRecord, device.serialNumber); } catch { throw failure(400, 'Invalid pair record'); }
+      pairRecord = { ...pairRecord, udid: canonicalUID(pairRecord.udid) };
       try {
         const saved = JSON.parse(await readFile(path.join(runtimeDir, 'record-map', recordKey(pairRecord) + '.json'), 'utf8'));
         if (!UUID.test(saved.namespace)) throw new Error('Invalid namespace');
@@ -100,7 +105,7 @@ export function createGateway(options) {
       const session = { id, namespace, token: randomBytes(32).toString('hex'), device, pairRecord,
         dataDir: path.join(runtimeDir, 'data', namespace), socketPath: path.join(socketDir, 'ctl.sock'), socketDir,
         state: 'waiting_for_relay', controller: null, mux: null, ws: null, streams: new Map(), nextId: 1,
-        commands: new Map(), actionChain: Promise.resolve(), abort: new AbortController() };
+        commands: new Map(), usedCommandIds: new Set(), actionChain: Promise.resolve(), abort: new AbortController() };
       session.expiry = setTimeout(() => void closeSession(session), options.sessionTimeoutMs ?? 5 * 60_000);
       session.runCommand = input => runCommand(session, input);
       session.screen = () => screen(session);
@@ -118,7 +123,7 @@ export function createGateway(options) {
       await Promise.allSettled([session.controller?.close(), session.mux?.close()]);
       await rm(session.socketDir, { recursive: true, force: true });
       owners.delete(session.namespace); sessions.delete(session.id);
-      session.commands.clear(); session.pairRecord = undefined; session.token = undefined;
+      session.commands.clear(); session.usedCommandIds.clear(); session.pairRecord = undefined; session.token = undefined;
     })();
     return session.closing;
   }
@@ -185,21 +190,26 @@ export function createGateway(options) {
     switch (frame.type) {
       case F.DeviceHello: throw new Error('Duplicate DeviceHello');
       case F.OpenResult: {
-        const entry = session.streams.get(frame.streamId);
-        if (!entry || entry.opened || entry.requestId !== frame.requestId) throw new Error('Unexpected OpenResult');
         const result = parsePayload(frame.payload);
+        if (typeof result?.ok !== 'boolean' || frame.requestId !== frame.streamId) throw new Error('Invalid OpenResult');
+        const entry = session.streams.get(frame.streamId);
+        if (!entry && frame.streamId > 0 && frame.streamId < session.nextId) break;
+        if (!entry || entry.opened || entry.requestId !== frame.requestId) throw new Error('Unexpected OpenResult');
         clearTimeout(entry.timer);
         if (result.ok !== true) { entry.remoteClose = true; entry.duplex.destroy(new Error('Device refused stream')); }
         else { entry.opened = true; entry.reject = null; entry.resolve(entry.duplex); }
         break;
       }
       case F.StreamData: {
+        if (frame.requestId !== 0) throw new Error('Invalid StreamData');
         const entry = session.streams.get(frame.streamId);
+        if (!entry && frame.streamId > 0 && frame.streamId < session.nextId) break;
         if (!entry?.opened) throw new Error('Unknown or unopened stream');
         if (entry.duplex.readableLength + frame.payload.length > MAX_FRAME_PAYLOAD) throw new Error('Stream receive buffer exceeded');
         entry.duplex.push(frame.payload); break;
       }
       case F.StreamClose: {
+        if (frame.requestId !== 0 || frame.streamId === 0 || frame.streamId >= session.nextId) throw new Error('Unknown StreamClose');
         const entry = session.streams.get(frame.streamId);
         if (entry) { entry.remoteClose = true; entry.duplex.destroy(); }
         break;
@@ -225,7 +235,7 @@ export function createGateway(options) {
   }
   function runCommand(session, input) {
     const { requestId, deviceId, tool, args = {}, signal } = input;
-    if (deviceId !== session.device.serialNumber) throw failure(409, 'Device identity mismatch');
+    try { if (canonicalUID(deviceId) !== session.device.serialNumber) throw new Error(); } catch { throw failure(409, 'Device identity mismatch'); }
     if (typeof requestId !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestId)) throw failure(400, 'Invalid requestId');
     let request;
     try { request = commandRequest(tool, args); } catch (error) { throw failure(400, error.message); }
@@ -235,12 +245,15 @@ export function createGateway(options) {
       if (existing.fingerprint !== fingerprint) throw failure(409, 'requestId already used for another command');
       return existing.promise;
     }
+    if (session.usedCommandIds.has(requestId)) throw failure(409, 'requestId result expired; command cannot be replayed');
+    if (session.usedCommandIds.size >= maxCommandIds) throw failure(429, 'Session command-ID limit reached');
     if (session.commands.size >= 256) {
       const oldest = [...session.commands.entries()].find(([, value]) => value.settled);
       if (!oldest) throw failure(429, 'Command queue full');
       session.commands.delete(oldest[0]);
     }
     const entry = { fingerprint, settled: false };
+    session.usedCommandIds.add(requestId);
     entry.promise = serial(session, async () => {
       await ready(session);
       const cancellation = signal ? AbortSignal.any([signal, session.abort.signal]) : session.abort.signal;
@@ -280,7 +293,7 @@ export function createGateway(options) {
         const session = await allocate(() => newSession(validateDevice(input.device), input.pairRecord));
         const relay = new URL('/ios/device/ws', publicBase ?? `${request.socket.encrypted ? 'https' : 'http'}://${request.headers.host}`);
         relay.protocol = relay.protocol === 'https:' ? 'wss:' : 'ws:'; relay.searchParams.set('token', session.token);
-        json(response, 201, { id: session.id, token: session.token, relayUrl: relay.toString(), state: session.state }); return;
+        json(response, 201, { id: session.id, deviceId: session.device.serialNumber, token: session.token, relayUrl: relay.toString(), state: session.state }); return;
       }
       const match = url.pathname.match(/^\/api\/sessions\/([a-f0-9-]+)(\/.*)?$/);
       if (!match) throw failure(404, 'Route not found');

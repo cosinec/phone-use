@@ -71,6 +71,38 @@ test('setup runtime kills an unresponsive owned child and bounds output transcri
   assert.equal((await controller.request({ op: 'status' })).kind, 'text');
 });
 
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+}
+async function descendantFixture(t, controller) {
+  controller.options.env = { FIXTURE_DESCENDANT: 'setup' };
+  await controller.startSetup();
+  await waitFor(() => /descendantPID:\d+/.test(controller.state.setup.transcript));
+  const pid = Number(controller.state.setup.transcript.match(/descendantPID:(\d+)/)[1]);
+  // Narrow fallback cleanup makes the RED proof safe: only this fixture's observed descendant PID.
+  t.after(() => { if (alive(pid)) process.kill(pid, 'SIGKILL'); });
+  return pid;
+}
+
+test('close cleans owned descendants after their group leader exits and leaves another session alive', { skip: process.platform === 'win32' }, async t => {
+  const first = await fixture(t); const second = await fixture(t);
+  await Promise.all([first.start(), second.start()]);
+  const pid = await descendantFixture(t, first);
+  assert.equal(alive(pid), true);
+  await first.close();
+  assert.equal(alive(pid), false, 'owned descendant survived leader exit');
+  assert.equal((await second.request({ op: 'status' })).kind, 'text');
+});
+
+test('setup timeout retains group escalation after leader exits and waits for descendant cleanup', { skip: process.platform === 'win32' }, async t => {
+  const controller = await fixture(t); await controller.start();
+  controller.options.setupTimeoutMs = 300;
+  const pid = await descendantFixture(t, controller);
+  await waitFor(() => controller.state.setup.state === 'failed');
+  await waitFor(() => !alive(pid));
+  assert.equal((await controller.request({ op: 'status' })).kind, 'text');
+});
+
 test('command adapter matches native serde operations and validates every parameter boundary', () => {
   assert.deepEqual(commandRequest('iphone_swipe', { from_x: 1, from_y: 2, to_x: 3, to_y: 4 }), { op: 'swipe', from: [1, 2], to: [3, 4], seconds: 0.3 });
   assert.deepEqual(commandRequest('iphone_screenshot', {}), { op: 'screenshot', region: null });

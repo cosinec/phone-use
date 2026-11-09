@@ -1,6 +1,7 @@
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import * as plist from 'plist';
+import { canonicalUID } from './device-identity.mjs';
 
 const MAX_PACKET = 1024 * 1024;
 function packet(value, tag) {
@@ -11,7 +12,7 @@ function packet(value, tag) {
 }
 
 export function readPairRecord(record, udid) {
-  if (!record || record.udid !== udid || typeof record.pairRecordBase64 !== 'string'
+  if (!record || canonicalUID(record.udid) !== canonicalUID(udid) || typeof record.pairRecordBase64 !== 'string'
       || record.pairRecordBase64.length > MAX_PACKET || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(record.pairRecordBase64)) {
     throw new Error('Invalid pair record');
   }
@@ -26,6 +27,7 @@ export function readPairRecord(record, udid) {
 
 // openStream(port) resolves a Duplex whose readable side is device -> native.
 export async function createVirtualMux({ device, openStream, onPairRecord = () => {}, pairRecord, timeoutMs = 30_000 }) {
+  device = { ...device, serialNumber: canonicalUID(device.serialNumber) };
   let stored = pairRecord ? readPairRecord(pairRecord, device.serialNumber) : undefined;
   let buid = stored?.buid ?? randomUUID();
   const sockets = new Set();
@@ -45,17 +47,18 @@ export async function createVirtualMux({ device, openStream, onPairRecord = () =
     socket.on('close', () => { sockets.delete(socket); relay?.destroy(); });
     const send = (value, tag) => socket.write(packet(value, tag));
     const result = (number, tag) => send({ MessageType: 'Result', Number: number }, tag);
+    const recordMatches = value => { try { return canonicalUID(value) === device.serialNumber; } catch { return false; } };
     async function handle(value, tag) {
       switch (value.MessageType) {
         case 'ListDevices': send({ DeviceList: [attached] }, tag); break;
         case 'Listen': result(0, tag); send(attached, tag); break;
         case 'ReadBUID': send({ BUID: buid }, tag); break;
         case 'ReadPairRecord':
-          if (value.PairRecordID !== device.serialNumber || !stored) result(2, tag);
+          if (!recordMatches(value.PairRecordID) || !stored) result(2, tag);
           else send({ PairRecordData: stored.bytes }, tag);
           break;
         case 'SavePairRecord': {
-          if (value.PairRecordID !== device.serialNumber || !(value.PairRecordData instanceof Uint8Array)) { result(2, tag); break; }
+          if (!recordMatches(value.PairRecordID) || !(value.PairRecordData instanceof Uint8Array)) { result(2, tag); break; }
           const record = { udid: device.serialNumber, pairRecordBase64: Buffer.from(value.PairRecordData).toString('base64') };
           try { stored = readPairRecord(record, device.serialNumber); } catch { result(1, tag); break; }
           buid = stored.buid;

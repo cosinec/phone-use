@@ -2,8 +2,18 @@
 import net from 'node:net';
 import readline from 'node:readline';
 import { chmodSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-if (process.argv[2] === 'setup') {
+if (process.argv[2] === 'descendant') {
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1000);
+  process.stdout.write(`descendantPID:${process.pid}\n`);
+} else if (process.argv[2] === 'setup') {
+  if (process.env.FIXTURE_DESCENDANT === 'setup') {
+    const descendant = spawn(process.execPath, [fileURLToPath(import.meta.url), 'descendant'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    descendant.stdout.pipe(process.stdout);
+  }
   if (process.env.FIXTURE_IGNORE_TERM) process.on('SIGTERM', () => {});
   if (process.env.FIXTURE_SETUP_BURST) process.stdout.write('test output '.repeat(8000));
   process.stdout.write('Apple account input: ');

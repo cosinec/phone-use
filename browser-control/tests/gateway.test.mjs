@@ -17,6 +17,64 @@ const origin = 'http://localhost:5173';
 const device = { serialNumber: '00008110-001234567890001E', vendorId: 1452, productId: 4776 };
 const pairRecord = { udid: device.serialNumber, pairRecordBase64: Buffer.from(plist.build({ SystemBUID: 'browser-buid', HostID: 'fixture' })).toString('base64') };
 
+test('raw24 USB identity normalizes across API, SDK hello, native, command and pair-record resume', async t => {
+  const app = await start(t);
+  const rawDevice = { ...device, serialNumber: device.serialNumber.replace('-', '').toLowerCase() };
+  const session = await app.session(rawDevice, pairRecord);
+  assert.equal(session.deviceId, device.serialNumber);
+  const usb = await peer(session, rawDevice);
+  t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  assert.equal(app.controllers[0].options.device.serialNumber, device.serialNumber);
+  const command = await app.api(`/api/sessions/${session.id}/command`, session.token, {
+    requestId: 'raw-device', deviceId: rawDevice.serialNumber, tool: 'iphone_status', args: {},
+  });
+  assert.equal(command.status, 200);
+  assert.equal(JSON.parse((await command.json()).text).request.expect_udid, device.serialNumber);
+  usb.send(F.StartPairing);
+  assert.deepEqual(parsePayload((await usb.next()).payload), pairRecord);
+  usb.ws.close(); await once(usb.ws, 'close');
+  await waitFor(() => !app.gateway.sessions.has(session.id));
+  const rawRecord = { ...pairRecord, udid: rawDevice.serialNumber };
+  const resumed = await app.session(device, rawRecord);
+  const second = await peer(resumed);
+  t.after(() => second.ws.terminate());
+  await waitFor(() => app.controllers[1]?.state.ready);
+  assert.equal(app.controllers[1].options.dataDir, app.controllers[0].options.dataDir);
+  second.send(F.StartPairing);
+  assert.deepEqual(parsePayload((await second.next()).payload), pairRecord);
+});
+
+test('evicted success and sent-timeout command IDs remain consumed and cannot replay mutations', async t => {
+  const app = await start(t);
+  const session = await app.session(); const usb = await peer(session);
+  t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const route = `/api/sessions/${session.id}/command`;
+  const send = (requestId, tool, args) => app.api(route, session.token, { requestId, deviceId: device.serialNumber, tool, args });
+  assert.equal((await send('first-tap', 'iphone_tap', { x: 1, y: 1 })).status, 200);
+  assert.equal((await send('sent-timeout', 'iphone_tap', { x: 999, y: 1 })).status, 503);
+  for (let n = 0; n < 256; n++) assert.equal((await send(`filler-${n}`, 'iphone_status', {})).status, 200);
+  const before = JSON.parse((await app.controllers[0].request({ op: 'daemon' })).text).taps;
+  assert.equal(before, 2);
+  const replayedSuccess = await send('first-tap', 'iphone_tap', { x: 1, y: 1 });
+  const replayedTimeout = await send('sent-timeout', 'iphone_tap', { x: 999, y: 1 });
+  assert.equal(JSON.parse((await app.controllers[0].request({ op: 'daemon' })).text).taps, before);
+  assert.equal(replayedSuccess.status, 409); assert.equal(replayedTimeout.status, 409);
+});
+
+test('session command-ID cap rejects fresh commands without evicting replay protection', async t => {
+  const app = await start(t, { maxCommandIds: 2 });
+  const session = await app.session(); const usb = await peer(session);
+  t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const send = id => app.api(`/api/sessions/${session.id}/command`, session.token, { requestId: id, deviceId: device.serialNumber, tool: 'iphone_tap', args: { x: 1, y: 1 } });
+  assert.equal((await send('one')).status, 200); assert.equal((await send('two')).status, 200);
+  assert.equal((await send('three')).status, 429);
+  assert.equal(JSON.parse((await app.controllers[0].request({ op: 'daemon' })).text).taps, 2);
+  assert.equal((await send('one')).status, 200);
+});
+
 async function start(t, options = {}) {
   const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-test-'));
   const controllers = [];
@@ -231,7 +289,7 @@ test('relay URL uses configured HTTPS public URL behind a reverse proxy', async 
   assert.equal(new URL(session.relayUrl).origin, 'wss://control.example.test');
 });
 
-test('failed OpenResult and stream open timeout unblock native Connect; unknown closed-stream data invalidates relay', async t => {
+test('failed OpenResult and stream open timeout unblock native Connect; never-allocated data invalidates relay', async t => {
   const app = await start(t, { streamOpenTimeoutMs: 100 });
   const session = await app.session(); const usb = await peer(session);
   t.after(() => usb.ws.terminate());
@@ -250,9 +308,38 @@ test('failed OpenResult and stream open timeout unblock native Connect; unknown 
   assert.equal(unanswered.type, F.OpenStream);
   assert.equal(plist.parse((await once(second, 'data'))[0].subarray(16).toString()).Number, 3);
   assert.equal((await usb.next()).type, F.StreamClose);
-  usb.send(F.StreamData, Buffer.from('late'), 0, request.streamId);
+  usb.send(F.StreamData, Buffer.from('unknown'), 0, unanswered.streamId + 1);
   await once(usb.ws, 'close');
   await waitFor(() => app.controllers[0].closed);
+});
+
+test('SDK pump late bytes for a closed stream do not terminate another active stream or the session', async t => {
+  const app = await start(t);
+  const session = await app.session(); const usb = await peer(session);
+  t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  async function connectStream() {
+    const native = await muxSocket(app.controllers[0]); t.after(() => native.destroy());
+    native.write(muxPacket({ MessageType: 'Connect', DeviceID: 1, PortNumber: 32498 }));
+    const open = await usb.next();
+    const result = once(native, 'data');
+    usb.send(F.OpenResult, { ok: true }, open.requestId, open.streamId);
+    assert.equal(plist.parse((await result)[0].subarray(16).toString()).Number, 0);
+    return { native, open };
+  }
+  const first = await connectStream(); const second = await connectStream();
+  first.native.destroy();
+  const closed = await usb.next(); assert.equal(closed.type, F.StreamClose);
+  assert.equal(closed.streamId, first.open.streamId);
+  const received = once(second.native, 'data');
+  usb.send(F.StreamData, Buffer.from('raced final bytes'), 0, first.open.streamId);
+  usb.send(F.StreamClose, {}, 0, first.open.streamId);
+  usb.send(F.StreamData, Buffer.from('still active'), 0, second.open.streamId);
+  const surviving = await Promise.race([received, once(usb.ws, 'close').then(() => assert.fail('late bytes closed the relay'))]);
+  assert.deepEqual(surviving[0], Buffer.from('still active'));
+  usb.send(F.Ping, Buffer.alloc(0), 123);
+  assert.equal((await usb.next()).type, F.Pong);
+  assert.equal(app.controllers[0].closed, false);
 });
 
 test('server entry rejects missing controller secret and serves non-secret config when configured', async t => {

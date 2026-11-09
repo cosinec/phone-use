@@ -2,15 +2,17 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { mkdir, chmod } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { canonicalUID } from './device-identity.mjs';
 
 const MAX_RESPONSE = 12 * 1024 * 1024;
 const MAX_TRANSCRIPT = 32 * 1024;
 
 export class NativeController {
   constructor(options) {
-    this.options = options;
+    this.options = { ...options, device: { ...options.device, serialNumber: canonicalUID(options.device.serialNumber) } };
     this.closed = false;
     this.children = new Set();
+    this.groups = new Map();
     this.sockets = new Set();
     this.state = { ready: false, daemon: 'idle', setup: { state: 'idle', transcript: '', exitCode: null } };
   }
@@ -23,9 +25,10 @@ export class NativeController {
         ICTL_SOCKET: socketPath, ICTL_MANAGE_USBMUXD: '0', USBMUXD_SOCKET_ADDRESS: muxAddress },
     });
     this.children.add(child);
+    if (child.pid) this.groups.set(child, { cleanup: null });
     child.stdin.on('error', () => {});
-    child.once('exit', () => this.children.delete(child));
-    child.once('error', () => this.children.delete(child));
+    child.once('exit', () => { this.children.delete(child); void this.stopGroup(child).catch(() => {}); });
+    child.once('error', () => { this.children.delete(child); if (!child.pid) this.groups.delete(child); });
     return child;
   }
 
@@ -101,14 +104,13 @@ export class NativeController {
     this.setupChild = child;
     const append = chunk => { setup.transcript = (setup.transcript + chunk.toString('utf8')).slice(-MAX_TRANSCRIPT); };
     child.stdout.on('data', append); child.stderr.on('data', append);
-    let killTimer;
     const timer = setTimeout(() => {
-      setup.state = 'failed'; setup.error = 'Setup timeout'; this.kill(child, 'SIGTERM');
-      killTimer = setTimeout(() => this.kill(child, 'SIGKILL'), 1500);
+      setup.state = 'stopping'; setup.error = 'Setup timeout';
+      void this.stopGroup(child).then(() => { setup.state = 'failed'; }, () => { setup.state = 'failed'; setup.error = 'Setup cleanup failed'; });
     }, this.options.setupTimeoutMs ?? 15 * 60_000);
-    child.once('error', () => { clearTimeout(timer); clearTimeout(killTimer); setup.state = 'failed'; setup.error = 'Could not start native setup'; });
+    child.once('error', () => { clearTimeout(timer); setup.state = 'failed'; setup.error = 'Could not start native setup'; });
     child.once('exit', code => {
-      clearTimeout(timer); clearTimeout(killTimer); setup.exitCode = code;
+      clearTimeout(timer); setup.exitCode = code;
       if (setup.state === 'running') setup.state = this.closed ? 'stopped' : code === 0 ? 'complete' : 'failed';
       if (this.setupChild === child) this.setupChild = undefined;
     });
@@ -123,8 +125,30 @@ export class NativeController {
   }
 
   kill(child, signal) {
-    if (child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+    if (!this.groups.has(child) || !child.pid) return;
     try { if (process.platform === 'win32') child.kill(signal); else process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  }
+
+  groupAlive(child) {
+    if (!this.groups.has(child) || !child.pid) return false;
+    if (process.platform === 'win32') return child.exitCode === null && child.signalCode === null;
+    try { process.kill(-child.pid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  }
+
+  stopGroup(child) {
+    const group = this.groups.get(child);
+    if (!group) return Promise.resolve();
+    group.cleanup ??= (async () => {
+      this.kill(child, 'SIGTERM');
+      const deadline = Date.now() + 1500;
+      let escalated = false;
+      while (this.groupAlive(child)) {
+        if (!escalated && Date.now() >= deadline) { this.kill(child, 'SIGKILL'); escalated = true; }
+        await sleep(25);
+      }
+      this.groups.delete(child);
+    })();
+    return group.cleanup;
   }
 
   async close() {
@@ -132,12 +156,7 @@ export class NativeController {
     this.closed = true; this.state.ready = false; this.state.daemon = 'closed';
     if (this.state.setup.state === 'running') this.state.setup.state = 'stopped';
     for (const socket of this.sockets) socket.destroy();
-    this.closing = Promise.all([...this.children].map(child => new Promise(resolve => {
-      const timer = setTimeout(() => this.kill(child, 'SIGKILL'), 1500);
-      child.once('exit', () => { clearTimeout(timer); resolve(); });
-      child.once('error', () => { clearTimeout(timer); resolve(); });
-      this.kill(child, 'SIGTERM');
-    })));
+    this.closing = Promise.all([...this.groups.keys()].map(child => this.stopGroup(child)));
     await this.closing;
   }
 }
