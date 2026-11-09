@@ -18,3 +18,7 @@ tracing.workspace = true
 plist.workspace = true
 uuid.workspace = true
 zip.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+rustls.workspace = true

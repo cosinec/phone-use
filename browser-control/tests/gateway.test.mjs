@@ -316,6 +316,37 @@ test('SDK pairing publishes SavePairRecord, bridges real streams, handles Ping a
   const error = await usb.next(); assert.equal(error.type, F.Error); assert.match(parsePayload(error.payload).error, /native setup/i);
 });
 
+test('large native uploads stay within the published SDK usbmux packet limit and preserve byte order', { timeout: 10_000 }, async t => {
+  const app = await start(t);
+  const session = await app.session();
+  const usb = await peer(session);
+  t.after(() => usb.ws.terminate());
+  await waitFor(() => app.controllers[0]?.state.ready);
+  const native = await muxSocket(app.controllers[0]);
+  t.after(() => native.destroy());
+  native.write(muxPacket({ MessageType: 'Connect', DeviceID: 1, PortNumber: 32498 }));
+  const open = await usb.next();
+  const result = once(native, 'data');
+  usb.send(F.OpenResult, { ok: true }, open.requestId, open.streamId);
+  assert.equal(plist.parse((await result)[0].subarray(16).toString()).Number, 0);
+
+  const payload = Buffer.alloc(1024 * 1024 + 17);
+  for (let offset = 0; offset < payload.length; offset++) payload[offset] = offset % 251;
+  native.write(payload);
+  const chunks = [];
+  let received = 0;
+  while (received < payload.length) {
+    const frame = await usb.next();
+    assert.equal(frame.type, F.StreamData);
+    assert.equal(frame.streamId, open.streamId);
+    // SDK 0.1.0 wraps each StreamData in one 16-byte mux + 20-byte TCP packet.
+    assert.ok(frame.payload.length + 36 <= 3 * 16384, `oversized USB packet: ${frame.payload.length + 36}`);
+    chunks.push(frame.payload);
+    received += frame.payload.length;
+  }
+  assert.deepEqual(Buffer.concat(chunks), payload);
+});
+
 test('stored records resume persistent native namespace without signing again and reject concurrent owners', async t => {
   const app = await start(t);
   const first = await app.session(device, pairRecord);

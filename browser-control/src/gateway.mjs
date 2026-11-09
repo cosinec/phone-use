@@ -14,6 +14,9 @@ import { createModelClient } from './model-client.mjs';
 import { TaskRunner } from './task-runner.mjs';
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+// SDK 0.1.0 wraps each StreamData in one mux/TCP packet. usbmuxd's USB_MTU
+// is 3 * 16384 bytes, including its 16-byte mux and 20-byte TCP headers.
+const MAX_USB_STREAM_DATA = 3 * 16384 - 16 - 20;
 const failure = (status, message) => Object.assign(new Error(message), { status });
 const equal = (left, right) => typeof left === 'string' && typeof right === 'string' && Buffer.byteLength(left) === Buffer.byteLength(right) && timingSafeEqual(Buffer.from(left), Buffer.from(right));
 
@@ -146,8 +149,19 @@ export function createGateway(options) {
     return new Promise((resolve, reject) => {
       const duplex = new Duplex({
         read() {},
-        write(chunk, encoding, done) {
-          try { send(session, F.StreamData, chunk, 0, id, done); } catch (error) { done(error); }
+        async write(chunk, encoding, done) {
+          try {
+            for (let offset = 0; offset < chunk.length; offset += MAX_USB_STREAM_DATA) {
+              const payload = chunk.subarray(offset, offset + MAX_USB_STREAM_DATA);
+              await new Promise((resolve, reject) => {
+                send(session, F.StreamData, payload, 0, id, error => {
+                  if (error) reject(error);
+                  else resolve();
+                });
+              });
+            }
+            done();
+          } catch (error) { done(error); }
         },
         destroy(error, done) {
           const entry = session.streams.get(id);

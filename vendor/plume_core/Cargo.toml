@@ -1,4 +1,4 @@
-# vendored from Impactor v2.7.2 (b13d995)；本仓库只把 workspace 继承改成了显式版本，源码未改
+# vendored from Impactor v2.7.2 (b13d995)，本地改动见 THIRD_PARTY.md
 [package]
 name = "plume_core"
 description = "Core library for Impactor tools."

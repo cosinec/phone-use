@@ -10,11 +10,18 @@ import { BrowserClient } from "../web/client.mjs";
 import { createGateway } from "../src/gateway.mjs";
 // Fake physical peer: only USB claim, usbmux version handshake and resume pairing.
 // It deliberately does NOT simulate a real iPhone, Lockdown/signing or WDA.
-function fakeUSB(allFail = false) {
+function fakeUSB(allFail = false, fragmentVersion = false) {
   const claims = [],
     writes = [];
   let rejectRead;
   let readCount = 0;
+  const versionReply = new Uint8Array(20);
+  const versionView = new DataView(versionReply.buffer);
+  versionView.setUint32(4, 20);
+  versionView.setUint32(8, 2);
+  const versionReads = fragmentVersion
+    ? [versionReply.slice(0, 3), versionReply.slice(3, 11), versionReply.slice(11)]
+    : [versionReply];
   const configurations = [6, 3].map((configurationValue) => ({
     configurationValue,
     interfaces: [
@@ -77,12 +84,9 @@ function fakeUSB(allFail = false) {
       return { status: "ok", bytesWritten: data.byteLength };
     },
     transferIn: async () => {
-      if (readCount++ === 0) {
-        const bytes = new Uint8Array(20),
-          view = new DataView(bytes.buffer);
-        view.setUint32(4, 20);
-        view.setUint32(8, 2);
-        return { status: "ok", data: view };
+      if (readCount < versionReads.length) {
+        const bytes = versionReads[readCount++];
+        return { status: "ok", data: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength) };
       }
       return new Promise((resolve, reject) => {
         rejectRead = reject;
@@ -96,11 +100,11 @@ function fakeUSB(allFail = false) {
     failRead: () => rejectRead?.(new Error("fake physical unplug")),
   };
 }
-for (const allFail of [false, true])
-  test(`published SDK ${allFail ? "all claim failures close USB and delete session" : "falls back current cfg6→cfg3 and pairs through real gateway"} (explicit fake USB/native)`, async (t) => {
+for (const [allFail, fragmentVersion] of [[false, false], [true, false], [false, true]])
+  test(`published SDK ${allFail ? "all claim failures close USB and delete session" : fragmentVersion ? "pairs when a usbmux reply spans multiple USB reads" : "falls back current cfg6→cfg3 and pairs through real gateway"} (explicit fake USB/native)`, async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sdk-webusb-"));
     t.after(() => rm(root, { recursive: true, force: true }));
-    const usb = fakeUSB(allFail);
+    const usb = fakeUSB(allFail, fragmentVersion);
     const originalNavigator = Object.getOwnPropertyDescriptor(
       globalThis,
       "navigator",

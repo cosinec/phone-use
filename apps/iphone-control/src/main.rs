@@ -397,6 +397,9 @@ fn read_line(prompt: &str) -> anyhow::Result<String> {
 
 /// 不回显地读一行（用 stty 关回显，不引入额外依赖）
 fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return read_line(prompt);
+    }
     let stty = |arg: &str| {
         std::process::Command::new("stty")
             .arg(arg)

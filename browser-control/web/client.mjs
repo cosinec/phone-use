@@ -1,5 +1,6 @@
 import * as publishedSDK from "@limrun/device-install";
 import { canonicalUID } from "../src/device-identity.mjs";
+import { completeUsbPacketReads } from "./usb-packets.mjs";
 const progressLabels = {
   "Selecting USB device": "等待 USB 授权",
   "Selected USB device": "已选择设备",
@@ -186,6 +187,8 @@ export class BrowserClient {
       const hello = attempt.target.hello;
       const uid = canonicalUID(hello.serialNumber);
       this.watchUSBDisconnect(attempt, uid);
+      if (typeof attempt.target.device?.transferIn === "function")
+        attempt.target.device = completeUsbPacketReads(attempt.target.device);
       this.update({
         phase: "pairing",
         device: { ...hello, serialNumber: uid },

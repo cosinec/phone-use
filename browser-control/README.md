@@ -7,7 +7,7 @@ flowchart LR
   I[iPhone / USB] <--> B[用户的 Mac Chrome\n发布版 WebUSB SDK]
   B <-->|HTTPS / WSS| G[服务器\nNode 网关与网页]
   G <--> M[每会话独立虚拟 usbmuxd]
-  M <--> N[原版 iphone-control\n配对、签名、WDA]
+  M <--> N[iphone-control\n配对、签名、WDA]
   G <--> A[可选视觉模型\nAPI key 仅在服务器]
 ```
 
@@ -15,7 +15,7 @@ flowchart LR
 
 ## 本地开发
 
-需要 Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control@0.1.4`。从仓库根目录执行：
+需要 Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release -p iphone-control`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
 
 ```bash
 cd browser-control
@@ -40,7 +40,7 @@ npm run build
 
 ## 页面行为
 
-空白设备框表示尚无真实截图。Chrome 点击事件会立即调用 SDK 的 USB chooser，再读取 IndexedDB 配对记录、创建服务端会话并配对。原始现代 USB serial 统一转成 8-16 UDID；命令使用创建接口返回的 `deviceId`。发布版 SDK 已会遍历当前配置优先的 usbmux 接口候选并重试，没有本项目额外的接口选择或 USB 字节协议。
+空白设备框表示尚无真实截图。Chrome 点击事件会立即调用 SDK 的 USB chooser，再读取 IndexedDB 配对记录、创建服务端会话并配对。原始现代 USB serial 统一转成 8-16 UDID，命令使用创建接口返回的 `deviceId`。发布版 SDK 负责候选配置遍历、接口申请、usbmux 通信和配对。接入层增加两处传输适配，服务器按 USB 单包发送上限拆分 StreamData，浏览器按长度头组装完整接收包并保留后续包。原生 WebUSB getter 和方法绑定回真实 USBDevice，USB 断开监听保留原始设备引用。
 
 `GET /api/sessions/:id` 的 `ready` 只表示原生 JSON 控制通道就绪。页面检查 `daemon.state.state === 'ready'` 后才启用 WDA 手动控制和 AI 任务。AI 未配置时仍可手动控制。手机截图的 JPEG 像素已由原生引擎换算为点击点，页面按图片实际尺寸与留白换算点按、滑动和长按，最长 10 秒。
 
@@ -60,7 +60,7 @@ AI 任务执行期间暂停手动操作。确认框显示具体操作、参数�
 | `PORT` | HTTP 与 WebSocket 共用端口，默认 `8787` |
 | `RUNTIME_DIR` | 每会话原生数据和配对恢复索引目录，默认 `.runtime` |
 | `PUBLIC_BASE_URL` | 反向代理外部 HTTP(S) origin，决定返回的 ws/wss relay 地址 |
-| `ICTL_BIN` | 原版 `iphone-control` 可执行路径 |
+| `ICTL_BIN` | 从当前源码构建的 `iphone-control` 可执行路径 |
 | `LLM_BASE_URL` | 可选模型兼容 API 根地址，如 `https://provider.example/v1`，不含账号、query 或 fragment |
 | `LLM_MODEL` | 可选支持截图输入的模型名称 |
 | `LLM_API_KEY` | 可选模型 key，仅配置于服务器环境 |

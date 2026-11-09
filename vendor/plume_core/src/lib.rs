@@ -86,6 +86,9 @@ pub fn client() -> Result<reqwest::Client, Error> {
         // uncomment when debugging w/ charles proxy
         // .danger_accept_invalid_certs(true)
         .http1_title_case_headers()
+        // Local patch: Apple GSA can reset reused HTTP/1.1 connections between
+        // SRP and 2FA requests. Open a fresh connection instead of replaying login.
+        .pool_max_idle_per_host(0)
         .connection_verbose(true)
         .build()?;
 
