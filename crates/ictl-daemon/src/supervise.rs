@@ -353,7 +353,7 @@ impl Daemon {
                 }
                 g.ddi_failures = 0;
                 g.runner = Some(runner);
-                g.wda = Some(client);
+                g.wda = Some(client.with_low_latency(self.cfg.low_latency));
                 // 状态在下面 online() 的健康检查里变成 Ready
             }
             StartOutcome::NeedsUnlock => {

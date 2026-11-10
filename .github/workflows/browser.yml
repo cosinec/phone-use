@@ -1,0 +1,50 @@
+name: Browser Rust WASM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: browser-control/package-lock.json
+      - name: Install matching WASM bindings tool
+        shell: bash
+        run: |
+          tool=wasm-bindgen-0.2.130-x86_64-unknown-linux-musl
+          curl -fsSL --retry 3 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/${tool}.tar.gz" -o "/tmp/${tool}.tar.gz"
+          curl -fsSL --retry 3 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/${tool}.tar.gz.sha256sum" -o "/tmp/${tool}.tar.gz.sha256sum"
+          (cd /tmp && awk -v file="${tool}.tar.gz" '{print $1 "  " file}' "${tool}.tar.gz.sha256sum" | sha256sum -c -)
+          tar -xzf "/tmp/${tool}.tar.gz" -C /tmp
+          sudo install -m 755 "/tmp/${tool}/wasm-bindgen" /usr/local/bin/wasm-bindgen
+      - run: cargo test --locked -p ictl-web -p ictl-gateway
+      - run: cargo clippy --locked -p ictl-web --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo fmt -p ictl-web -- --check
+      - run: cargo build --locked -p ictl-gateway --bin iphone-control-gateway
+      - run: npm ci
+        working-directory: browser-control
+      - run: npx playwright install --with-deps chromium
+        working-directory: browser-control
+      - name: Runtime, gateway and Chrome UI regression
+        run: npm test
+        working-directory: browser-control
+        env:
+          RUST_GATEWAY_BIN: ${{ github.workspace }}/target/debug/iphone-control-gateway
+      - name: Optimized production build
+        run: npm run build -- --base=/iphone/
+        working-directory: browser-control

@@ -75,6 +75,10 @@ for (const [allFail, fragmentVersion] of [[false, false], [true, false], [false,
         /Unable to claim interface/,
       );
       assert.equal(client.snapshot().phase, "error");
+      // USB close can revoke the token before DELETE is authenticated. The
+      // WebSocket close path still owns asynchronous socket-directory cleanup.
+      for (let i = 0; gateway.sessions.size && i < 100; i++)
+        await new Promise(resolve => setTimeout(resolve, 20));
       assert.equal(gateway.sessions.size, 0);
       assert.equal(usb.device.opened, false);
       assert.deepEqual(usb.claims, [
@@ -98,6 +102,10 @@ for (const [allFail, fragmentVersion] of [[false, false], [true, false], [false,
       assert.equal(usb.writes.length, 2);
       assert.equal(new DataView(usb.writes[0].buffer).getUint32(8), 2);
       await client.disconnect();
+      // USB close can revoke the token before DELETE is authenticated. The
+      // WebSocket close path still owns asynchronous socket-directory cleanup.
+      for (let i = 0; gateway.sessions.size && i < 100; i++)
+        await new Promise(resolve => setTimeout(resolve, 20));
       assert.equal(gateway.sessions.size, 0);
       assert.equal(usb.device.opened, false);
     }
