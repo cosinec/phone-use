@@ -1,7 +1,11 @@
+pub mod android;
+pub mod attachments;
 pub mod commands;
+pub mod controller;
 pub mod error;
 pub mod gateway;
 pub mod identity;
+pub mod mjpeg;
 pub mod model;
 pub mod mux;
 pub mod native;

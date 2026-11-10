@@ -536,8 +536,23 @@ impl Daemon {
                 self.publish(g);
                 return resp;
             }
-            Request::ListElements { filter, limit, max_age_ms } => {
-                self.list_elements(g, &filter, limit, Duration::from_millis(max_age_ms)).await
+            Request::Observe { limit, snapshot_timeout_ms } => {
+                let response = self
+                    .observe(g, limit, Duration::from_millis(snapshot_timeout_ms))
+                    .await
+                    .unwrap_or_else(Response::error);
+                self.publish(g);
+                return response;
+            }
+            Request::ListElements { filter, limit, max_age_ms, snapshot_timeout_ms } => {
+                self.list_elements(
+                    g,
+                    &filter,
+                    limit,
+                    Duration::from_millis(max_age_ms),
+                    Duration::from_millis(snapshot_timeout_ms),
+                )
+                .await
             }
             Request::Tap { x, y } => self.tap(g, x, y).await,
             Request::TapElement { text, index, max_age_ms } => {
@@ -597,6 +612,12 @@ impl Daemon {
 /// 参数检查（与设备无关，不必拿锁）
 fn check_request(req: &Request) -> Result<(), String> {
     match req {
+        Request::Observe { limit, snapshot_timeout_ms } if *limit > 1000 || *snapshot_timeout_ms > 5000 => {
+            return Err("Observation limit or snapshot budget exceeded".into());
+        }
+        Request::ListElements { snapshot_timeout_ms, .. } if *snapshot_timeout_ms > MAX_WAIT_MS => {
+            return Err(format!("snapshot_timeout_ms can't exceed {MAX_WAIT_MS}"));
+        }
         Request::Settle { max_ms } if *max_ms > MAX_WAIT_MS => {
             return Err(ictl_l10n::trf!("max_ms 不能超过 {MAX_WAIT_MS}", "max_ms can't exceed {MAX_WAIT_MS}"));
         }

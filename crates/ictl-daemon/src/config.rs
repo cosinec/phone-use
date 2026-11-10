@@ -7,6 +7,7 @@ use ictl_device::ScreenSize;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub low_latency: bool,
     pub data_dir: PathBuf,
     pub socket: PathBuf,
     /// 固定要控制的手机（`IPHONE_UDID`）；None 时可以在运行中选（见 [`crate::core::Persisted::selected_udid`]）。
@@ -67,6 +68,7 @@ impl Config {
                 _ => None,
             };
         Self {
+            low_latency: env("ICTL_LOW_LATENCY").is_some_and(|v| v == "1" || v == "true"),
             data_dir: data_dir.to_owned(),
             // 实际值由命令行给（--socket / ICTL_SOCKET，见 apps/iphone-control）
             socket: crate::protocol::default_socket(),
