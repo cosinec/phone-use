@@ -59,9 +59,21 @@ pub(crate) fn recoverable_wda_error(message: &str) -> bool {
         )
 }
 
+pub(crate) fn recoverable_observation_error(message: &str) -> bool {
+    recoverable_wda_error(message) || matches!(message, "Observation unavailable" | "Screenshot unavailable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_observations_are_retryable_without_loosening_action_errors() {
+        assert!(recoverable_observation_error("Observation unavailable"));
+        assert!(recoverable_observation_error("Screenshot unavailable"));
+        assert!(!recoverable_wda_error("Observation unavailable"));
+        assert!(!recoverable_observation_error("Invalid native observation identity or image"));
+    }
 
     #[test]
     fn recovery_only_accepts_known_device_transport_errors() {

@@ -1,6 +1,6 @@
 use crate::{
     commands::command_request,
-    error::{ApiError, Result, recoverable_wda_error},
+    error::{ApiError, Result, recoverable_observation_error, recoverable_wda_error},
     gateway::Session,
     model::{Model, validate_reply},
 };
@@ -216,7 +216,7 @@ async fn recover_observation(s: &Session, id: &str, episode: u32, cancel: Cancel
             if ready {
                 match s.screen(attempt).await {
                     Ok(observation) => return Ok(observation),
-                    Err(error) if recoverable_wda_error(&error.message) => {}
+                    Err(error) if recoverable_observation_error(&error.message) => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -276,7 +276,8 @@ async fn run(
             match s.screen(cancel.clone()).await {
                 Ok(observation) => observation,
                 Err(error)
-                    if s.device.platform == crate::identity::Platform::Ios && recoverable_wda_error(&error.message) =>
+                    if s.device.platform == crate::identity::Platform::Ios
+                        && recoverable_observation_error(&error.message) =>
                 {
                     recoveries += 1;
                     recover_observation(&s, id, recoveries, cancel.clone()).await?

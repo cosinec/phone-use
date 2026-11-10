@@ -203,6 +203,23 @@ contract('WDA recovery handles an unavailable initial observation before calling
   assert.equal(fixture.requests.length, 1);
 });
 
+contract('WDA recovery retries an unavailable observation after a successful navigation', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1
+    ? { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Return to fixture album list' }
+    : { type: 'done', message: 'Fresh album screen verified' })), {
+    FIXTURE_TAP_WDA_FAILURES: '0', FIXTURE_RECOVERY_OBSERVATION_FAILURES: '1',
+    FIXTURE_TAP_ERROR: 'Fixture screenshot unavailable after navigation',
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(state.task.steps[0].state, 'succeeded');
+  assert.equal(state.task.recovery.attempt, 1);
+  const context = JSON.parse(fixture.requests[1].messages[1].content[0].text);
+  assert.equal(JSON.parse(context.observation.elementsText).taps, 1);
+});
+
 contract('WDA recovery requires checking uncertain text input before continuing', async t => {
   const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
     type: 'action', tool: 'iphone_type_text', args: { text: 'fixture text' }, reason: 'Fill fixture input',
