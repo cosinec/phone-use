@@ -11,7 +11,7 @@ pub struct Rect {
     pub width: f64,
     pub height: f64,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 pub struct Pointer {
     pub point: Option<Point>,
     pub x: f64,

@@ -33,9 +33,23 @@ Chrome Network 中 5 次空闲设置页面 `/preview` 请求为 494、501、470�
 
 随后在同一平板桌面发现系统 PNG 原图约 4.9 MB，采图约 2920 ms。改用 H.264 后，5 次真实 `/screen` 请求的 `timings.screenshotMs` 为 112、119、120、134、110 ms，中位数 119 ms，较这次 PNG 基线缩短约 96%。截图已验证为实际桌面，坐标点击能打开设置。该比较是单次 PNG 基线与 5 次视频采图样本，不能视为跨设备统计。`/screen` 总耗时仍约 1 秒，因为元素树查询达到 1 秒预算；这些数字均不含模型推理，`sourceBytes` 在视频模式下表示两次采图间接收的编码字节数。
 
+## Rust/WASM 浏览器客户端
+
+浏览器页面由 `crates/ictl-web/src/ui` 的 Leptos CSR 组件生成。会话、HTTP、轮询、手势、Android 命令和视频帧管理位于同一个 Rust crate。`web/main.mjs` 加载 WASM 并挂载页面，`web/android` 和 `web/client.mjs` 保留第三方 SDK 的构造和互操作桥。
+
+本地构建需要 Rust 1.90.0、`wasm32-unknown-unknown` 编译目标、与锁定依赖匹配的 wasm-bindgen CLI 0.2.130，以及 Node 22.13+。
+
+```bash
+rustup toolchain install 1.90.0
+rustup target add --toolchain 1.90.0 wasm32-unknown-unknown
+cargo +1.90.0 install wasm-bindgen-cli --version 0.2.130 --locked
+```
+
+也可用 `WASM_BINDGEN_BIN` 指定已校验的 CLI 路径。`npm run build` 编译优化后的 release WASM，再生成 Vite 资产；`npm test` 编译调试 WASM 和根路径页面后运行测试。生成的 `pkg/`、`pkg-node/` 和 `dist/` 已加入 Git 忽略规则。`npm run typecheck` 检查 Rust/WASM 编译，`npm run test:browser` 用 Playwright 启动 Chrome/Chromium 验证页面。Mac 默认使用已安装的 Google Chrome，其他平台先执行 `npx playwright install chromium`，也可通过 `CHROME_BIN` 指定浏览器。
+
 ## 本地开发
 
-需要 Rust 1.88+、Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。Node 用于前端构建和测试，运行中的网关为 Rust 可执行文件。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release --locked -p iphone-control -p ictl-gateway`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
+需要 Rust 1.90.0、Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。Node 用于 SDK 打包和浏览器测试，运行中的网关为 Rust 可执行文件。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release --locked -p iphone-control -p ictl-gateway`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
 
 ```bash
 cd browser-control
@@ -109,7 +123,7 @@ WDA HTTP 连接按完整响应边界复用。超时、取消、不完整响应�
 
 ## Linux 部署
 
-Dockerfile 从当前源码构建 Rust 网关和原生引擎，包含本地已验证的原生修复，复用 `ghcr.io/derrors/iphone-control:0.1.4` 的 Appium 未签名 WDA、资源和许可证，并为网关新增依赖生成许可证清单。Node 构建阶段生成 React 网页，运行阶段为 Debian 与两个 Rust 可执行文件。服务端没有 USB 设备挂载，也不需要 privileged 或系统 usbmuxd；USB 在用户 Mac 浏览器中，通过 WSS 转发到各会话的虚拟 mux。服务器需要能访问 Apple、签名相关服务、设备支持资源以及模型服务商。
+Dockerfile 从当前源码构建 Rust 网关和原生引擎，包含本地已验证的原生修复，复用 `ghcr.io/derrors/iphone-control:0.1.4` 的 Appium 未签名 WDA、资源和许可证，并为网关新增依赖生成许可证清单。Rust/WASM 阶段编译 Leptos 页面与浏览器控制逻辑，Node 阶段打包 SDK、WASM、CSS 和静态资源。运行阶段为 Debian 与两个 Rust 可执行文件。服务端没有 USB 设备挂载，也不需要 privileged 或系统 usbmuxd；USB 在用户 Mac 浏览器中，通过 WSS 转发到各会话的虚拟 mux。服务器需要能访问 Apple、签名相关服务、设备支持资源以及模型服务商。
 
 在 `browser-control/.env` 中填写部署值，例如网站 origin `https://phone.example.com`；将 `ALLOWED_ORIGINS` 与 `PUBLIC_BASE_URL` 都设置成这个 origin。不要把真实凭证写入 Dockerfile 或镜像。然后：
 

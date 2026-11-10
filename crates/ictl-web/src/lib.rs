@@ -24,3 +24,8 @@ pub fn canonical_uid_js(value: JsValue) -> Result<String, JsValue> {
 pub use android::*;
 #[cfg(target_arch = "wasm32")]
 pub use client::BrowserClient;
+
+#[cfg(target_arch = "wasm32")]
+mod ui;
+#[cfg(target_arch = "wasm32")]
+pub use ui::mount;

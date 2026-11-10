@@ -15,7 +15,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp target/release/iphone-control target/release/iphone-control-gateway /usr/local/bin/
 
 FROM rust-build AS gateway-notices
-COPY docker/about.toml docker/about.hbs /notices/
+COPY docker/about.toml docker/about.hbs docker/web-about.toml /notices/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     tool="cargo-about-0.9.3-$(uname -m)-unknown-linux-musl" \
@@ -24,7 +24,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && (cd /tmp && sha256sum -c "${tool}.tar.gz.sha256") \
     && tar -xzf "/tmp/${tool}.tar.gz" -C /tmp \
     && install -m 755 "/tmp/${tool}/cargo-about" /usr/local/bin/cargo-about \
-    && cargo about generate --locked -m crates/ictl-gateway/Cargo.toml -c /notices/about.toml /notices/about.hbs -o /GATEWAY_LICENSES.html
+    && cargo about generate --locked -m crates/ictl-gateway/Cargo.toml -c /notices/about.toml /notices/about.hbs -o /GATEWAY_LICENSES.html \
+    && cargo about generate --locked -m crates/ictl-web/Cargo.toml -c /notices/web-about.toml /notices/about.hbs -o /WEB_LICENSES.html
+
+FROM rust-build AS wasm-build
+RUN rustup target add wasm32-unknown-unknown
+RUN tool="wasm-bindgen-0.2.130-$(uname -m)-unknown-linux-musl" \
+    && curl -fsSL --retry 3 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/${tool}.tar.gz" -o "/tmp/${tool}.tar.gz" \
+    && curl -fsSL --retry 3 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/${tool}.tar.gz.sha256sum" -o "/tmp/${tool}.tar.gz.sha256sum" \
+    && (cd /tmp && sha256sum -c "${tool}.tar.gz.sha256sum") \
+    && tar -xzf "/tmp/${tool}.tar.gz" -C /tmp \
+    && install -m 755 "/tmp/${tool}/wasm-bindgen" /usr/local/bin/wasm-bindgen
+COPY browser-control/scripts/build-wasm.sh browser-control/scripts/build-wasm.sh
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target \
+    WASM_BUILD_PROFILE=release sh browser-control/scripts/build-wasm.sh
 
 FROM node:22-trixie-slim AS web-build
 ARG WEB_BASE=/
@@ -32,7 +47,8 @@ WORKDIR /web
 COPY browser-control/package.json browser-control/package-lock.json ./
 RUN npm ci
 COPY browser-control/ ./
-RUN npm run typecheck && npm run build -- --base="${WEB_BASE}"
+COPY --from=wasm-build /src/browser-control/pkg/ ./pkg/
+RUN npm run build:assets -- --base="${WEB_BASE}"
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 libstdc++6 libssl3t64 zlib1g \
@@ -45,6 +61,7 @@ COPY --from=assets /usr/share/licenses/ /usr/share/licenses/
 COPY --from=assets /usr/share/doc/iphone-control/ /usr/share/doc/iphone-control/
 COPY --from=gateway-notices /GATEWAY_LICENSES.html /usr/share/doc/iphone-control/GATEWAY_LICENSES.html
 COPY --from=web-build /web/dist/ ./dist/
+COPY --from=gateway-notices /WEB_LICENSES.html ./dist/licenses/rust-wasm.html
 COPY LICENSE ./LICENSE
 COPY browser-control/THIRD_PARTY.md ./THIRD_PARTY.md
 RUN mkdir -p /app/.runtime && chown -R control:control /app

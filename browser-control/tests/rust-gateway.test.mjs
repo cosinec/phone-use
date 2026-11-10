@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -597,4 +597,22 @@ contract('Android AI tasks observe the Android device and require confirmation b
   assert.deepEqual(typed,['你好，安卓 👋']);assert.deepEqual(keys,['input keyevent 66']);assert.equal(captures,2);
   assert.equal(bodies.length,2);assert.match(JSON.parse(bodies[0].messages[1].content[0].text).observation.caption,/Android/);
   assert.equal(state.deviceId,'android:AI_TEST');assert.equal(state.setup.state,'complete');
+});
+
+contract('Rust serves WASM GET and HEAD with streaming MIME and rejects missing modules', async t => {
+  const app = await harness(t);
+  const files = await readdir(fileURLToPath(new URL('../dist/assets', import.meta.url)));
+  const wasm = files.find(name => name.endsWith('.wasm'));
+  assert.ok(wasm, 'production build must contain a real WASM module');
+  const route = '/assets/' + wasm;
+  const response = await fetch(app.base + route);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'application/wasm');
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  assert.deepEqual([...bytes.slice(0, 4)], [0, 97, 115, 109]);
+  const head = await fetch(app.base + route, { method: 'HEAD' });
+  assert.equal(head.headers.get('content-type'), 'application/wasm');
+  assert.equal(Number(head.headers.get('content-length')), bytes.length);
+  assert.equal(await head.text(), '');
+  assert.equal((await fetch(app.base + '/assets/missing.wasm')).status, 404);
 });
