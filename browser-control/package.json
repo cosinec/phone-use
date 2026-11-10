@@ -13,7 +13,10 @@
     "web:dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test:rust": "sh scripts/test-rust.sh"
+    "test:rust": "sh scripts/test-rust.sh",
+    "wasm:build": "sh scripts/build-wasm.sh",
+    "pretest": "npm run wasm:build",
+    "prebuild": "npm run wasm:build"
   },
   "dependencies": {
     "@limrun/device-install": "0.1.0",

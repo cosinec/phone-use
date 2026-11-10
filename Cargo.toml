@@ -11,6 +11,7 @@ members = [
     "crates/ictl-mcp",
     "apps/iphone-control",
     "crates/ictl-gateway",
+    "crates/ictl-web",
 ]
 # vendor/ 下是 Impactor 的组件（MPL-2.0 / MIT），作为路径依赖使用，但不算本 workspace 成员：
 # 不对它们跑 clippy/test，也不把它们的 lint 当成本项目的问题。
