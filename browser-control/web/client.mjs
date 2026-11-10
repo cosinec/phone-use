@@ -98,6 +98,8 @@ export class BrowserClient {
   }
   safeError(error, attempt = this.attempt) {
     let message = error instanceof Error ? error.message : "请求失败";
+    if (message === "Native signing state has an active owner")
+      message = "设备已被另一个会话占用。请回到原工作台点击“断开连接”，或关闭重复页面，等待释放后重连。";
     for (const value of [attempt?.accessToken, attempt?.session?.token])
       if (value) message = message.split(value).join("[已隐藏]");
     return message.slice(0, 1600);

@@ -223,6 +223,71 @@ contract('native action failure exposes its bounded cause and never retries typi
   assert.equal(fixture.requests.length, 1);
 });
 
+const missingKeyboard = 'No keyboard on screen (no text field has focus), nothing typed; tap a text field first and check with a screenshot that the keyboard is up';
+const typeDraft = { type: 'action', tool: 'iphone_type_text', args: { text: 'fixture draft', submit: false }, reason: 'Enter the draft' };
+const focusField = { type: 'action', tool: 'iphone_tap', args: { x: 20, y: 50 }, reason: 'Focus the draft field' };
+async function nativeCounts(fixture) {
+  const response = await fixture.app.api(fixture.route + '/command', fixture.session.token, {
+    requestId: 'typing-counts', deviceId: fixture.session.deviceId, tool: 'iphone_status',
+  });
+  return JSON.parse((await response.json()).text);
+}
+contract('typing focus recovers only after a fresh observation and a focus tap', async t => {
+  for (const reason of [missingKeyboard, '屏幕上没有键盘(没有输入框获得焦点),什么都没输;先点一下输入框,截图确认键盘出来了再输入']) {
+    await t.test(reason.startsWith('No') ? 'English' : 'Chinese', async t => {
+      const actions = [typeDraft, focusField, typeDraft, { type: 'done', message: 'Draft entered' }];
+      const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(actions[n - 1])), {
+        FIXTURE_TYPE_TEXT_NEEDS_FOCUS: reason,
+      });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed'; });
+      assert.deepEqual(state.task.steps.map(step => step.state), ['failed', 'succeeded', 'succeeded']);
+      const input = JSON.parse(fixture.requests[1].messages[1].content[0].text);
+      assert.equal(input.recentHistory[0].result.message, reason);
+      assert.ok(fixture.requests[1].messages[1].content.some(part => part.type === 'image_url'));
+      const counts = await nativeCounts(fixture);
+      assert.equal(counts.typeRequests, 2);
+      assert.equal(counts.taps, 1);
+      assert.equal(counts.counts.screenshot, 4);
+    });
+  }
+});
+contract('typing focus rejects a blind second typing action before dispatch', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify(typeDraft)), {
+    FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(state.task.steps.length, 1);
+  assert.equal((await nativeCounts(fixture)).typeRequests, 1);
+  assert.match(state.task.error, /focus/i);
+});
+contract('typing focus stops after one unsuccessful focus recovery', async t => {
+  const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(n === 2 ? focusField : typeDraft)), {
+    FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed' && state.task.steps.length === 3; });
+  assert.equal(fixture.requests.length, 3);
+  assert.equal(state.task.error, missingKeyboard);
+  assert.equal((await nativeCounts(fixture)).typeRequests, 2);
+});
+contract('typing focus cannot report completion while the failed input is unresolved', async t => {
+  for (const tapped of [false, true]) {
+    await t.test(tapped ? 'after focus tap' : 'before focus tap', async t => {
+      const actions = [typeDraft, ...(tapped ? [focusField] : []), { type: 'done', message: 'Draft entered' }];
+      const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(actions[n - 1])), {
+        FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
+      });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+      assert.equal(fixture.requests.length, actions.length);
+      assert.equal((await nativeCounts(fixture)).typeRequests, 1);
+    });
+  }
+});
+
 contract('provider model catalog is cached and each task keeps its own validated model selection', async t => {
   let catalogCalls = 0; const generated = [];
   const provider = http.createServer(async (req, res) => {

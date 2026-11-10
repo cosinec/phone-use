@@ -176,6 +176,9 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
     // Keep bounded tool content private to the inference loop, out of polled UI snapshots.
     let mut history: Vec<Value> = Vec::new();
     let mut next_observation: Option<Value> = None;
+    let mut focus_recoveries = 0;
+    let mut typing_blocked = false;
+    let mut input_pending = false;
     loop {
         let snapshot = s.tasks.update(id, |t| t.snapshot["state"] = json!("observing")).await?;
         let observing = Instant::now();
@@ -224,6 +227,9 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             return Err(ApiError::new(409, "Task cancelled"));
         }
         if action["type"] == "done" {
+            if input_pending {
+                return Err(ApiError::unavailable("Text input is still pending; task halted"));
+            }
             return Ok(action["message"].as_str().unwrap().to_owned());
         }
         if steps.len() >= 20 {
@@ -235,6 +241,9 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             continue;
         }
         let request = command_request(action["tool"].as_str().unwrap(), &action["args"])?;
+        if typing_blocked && request["op"] == "type_text" {
+            return Err(ApiError::unavailable("Focus an editable field before typing again; task halted"));
+        }
         let step_id = uuid::Uuid::new_v4().to_string();
         let step = json!({
             "id": step_id, "tool": action["tool"], "args": action["args"], "reason": action["reason"],
@@ -315,6 +324,24 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             })
             .await?;
         if failed {
+            // These exact native preflight errors guarantee that no text was sent.
+            // Re-observe and re-plan once, requiring a successful tap before typing.
+            let no_input_sent = s.device.platform == crate::identity::Platform::Ios
+                && request["op"] == "type_text"
+                && matches!(
+                    result["message"].as_str(),
+                    Some(
+                        "No keyboard on screen (no text field has focus), nothing typed; tap a text field first and check with a screenshot that the keyboard is up"
+                            | "屏幕上没有键盘(没有输入框获得焦点),什么都没输;先点一下输入框,截图确认键盘出来了再输入"
+                    )
+                );
+            if no_input_sent && focus_recoveries == 0 {
+                focus_recoveries += 1;
+                typing_blocked = true;
+                input_pending = true;
+                next_observation = None;
+                continue;
+            }
             let cause = result["message"]
                 .as_str()
                 .filter(|message| !message.trim().is_empty())
@@ -324,6 +351,12 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
         }
         if missed {
             return Err(ApiError::new(409, "Element tap missed; task halted"));
+        }
+        if matches!(request["op"].as_str(), Some("tap" | "tap_element")) {
+            typing_blocked = false;
+        }
+        if request["op"] == "type_text" {
+            input_pending = false;
         }
     }
 }
@@ -354,7 +387,7 @@ fn direct_command(instruction: &str) -> Option<Value> {
 }
 fn inference_result(result: &Value) -> Value {
     let mut summary = json!({"kind":result["kind"]});
-    for key in ["text", "caption"] {
+    for key in ["text", "caption", "message"] {
         if let Some(text) = result[key].as_str() {
             let bounded: String = text.chars().take(6000).collect();
             summary[key] = json!(bounded);
