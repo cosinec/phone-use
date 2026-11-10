@@ -184,8 +184,8 @@ impl<T: Transport> WdaClient<T> {
             .to_owned();
         self.session = Some(id.clone());
         if self.low_latency {
-            let settings =
-                json!({"settings":{"screenshotQuality":1,"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.0}});
+            let settings = json!({"settings":{"screenshotQuality":1,"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.0,
+                    "mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40}});
             match self.call("POST", &format!("/session/{id}/appium/settings"), Some(settings), DEFAULT_TIMEOUT).await {
                 Ok(value)
                     if value["value"]["screenshotQuality"].as_f64() == Some(1.0)
@@ -797,6 +797,9 @@ mod tests {
         );
         let profile: Value = serde_json::from_str(seen[1].2.as_deref().unwrap()).unwrap();
         assert_eq!(profile["settings"]["screenshotQuality"], 1);
+        assert_eq!(profile["settings"]["mjpegServerFramerate"], 3);
+        assert_eq!(profile["settings"]["mjpegScalingFactor"], 50);
+        assert_eq!(profile["settings"]["mjpegServerScreenshotQuality"], 40);
     }
 
     #[tokio::test]

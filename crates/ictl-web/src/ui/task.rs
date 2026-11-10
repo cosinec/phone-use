@@ -45,6 +45,7 @@ fn step_label(state: &str) -> String {
 #[component]
 pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
     let instruction = RwSignal::new(String::new());
+    let images = super::attachments::TaskImages::new(ui);
     let model = RwSignal::new(String::new());
     let models = move || {
         let ai = ui.ai.get();
@@ -65,6 +66,7 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
             || ui.ai.get()["aiReady"] != true
             || ui.busy.get()
             || ui.running()
+            || images.uploading.get()
             || instruction.get().trim().is_empty()
     };
     view! {
@@ -79,7 +81,18 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
             <p class="card-description">
                 "描述目标，AI 会查看真实屏幕并逐步操作。需要确认时，会先停下来。"
             </p>
-            <form on:submit=move |e| {
+            <form
+            on:dragover=move |e| { e.prevent_default(); }
+            on:drop=move |e| {
+                e.prevent_default();
+                if let Some(files) = e.data_transfer().and_then(|d| d.files()) { images.add(ui, files); }
+            }
+            on:paste=move |e| {
+                if let Some(files) = e.clipboard_data().and_then(|d| d.files()).filter(|f| f.length() > 0) {
+                    e.prevent_default(); images.add(ui, files);
+                }
+            }
+            on:submit=move |e| {
                 e.prevent_default();
                 if cannot_start() {
                     return;
@@ -87,7 +100,7 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                 let text = instruction.get_untracked();
                 let model = selected();
                 ui.run(move |client| {
-                    client.start_task(text, if model.is_empty() { None } else { Some(model) })
+                    client.start_task(text, if model.is_empty() { None } else { Some(model) }, images.ids())
                 });
             }>
                 <div class="model-picker">
@@ -157,6 +170,7 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                     placeholder="例如：打开设置，查看当前的系统版本"
                     rows="4"
                 />
+                <super::attachments::ImageInputs ui=ui images=images />
                 <div class="task-input-footer">
                     <span>
                         {move || format!("{}/4000", instruction.get().encode_utf16().count())}
@@ -264,7 +278,7 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         {move || state_label(&string(&ui.task(), "state"))}
                         <span class="step-count">
                             {move || {
-                                format!("{} 步", ui.task()["steps"].as_array().map_or(0, Vec::len))
+                                format!("{} / {} 步", ui.task()["steps"].as_array().map_or(0, Vec::len), ui.task()["maxSteps"].as_u64().unwrap_or(100))
                             }}
                         </span>
                     </div>

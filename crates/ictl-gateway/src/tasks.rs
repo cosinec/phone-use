@@ -41,7 +41,13 @@ impl TaskManager {
     pub async fn active(&self) -> bool {
         self.task.lock().await.as_ref().is_some_and(|t| !terminal(&t.snapshot["state"]))
     }
-    pub async fn start(&self, session: Arc<Session>, instruction: &str, model: Model) -> Result<Value> {
+    pub async fn start(
+        &self,
+        session: Arc<Session>,
+        instruction: &str,
+        model: Model,
+        images: Vec<crate::attachments::ReferenceImage>,
+    ) -> Result<Value> {
         if instruction.trim().is_empty() || instruction.chars().count() > 4000 || instruction.contains('\0') {
             return Err(ApiError::new(400, "Invalid task instruction"));
         }
@@ -56,7 +62,8 @@ impl TaskManager {
         let cancel = session.cancel.child_token();
         let snapshot = json!({
             "id": id, "instruction": instruction.trim(), "model": model.name, "state": "observing", "steps": [],
-            "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {}
+            "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
+            "attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100
         });
         *guard = Some(Task { snapshot: snapshot.clone(), cancel: cancel.clone(), confirmation: None });
         drop(guard);
@@ -64,8 +71,8 @@ impl TaskManager {
             tokio::select! {biased;
                 _=session.cancel.cancelled()=>session.tasks.finish(&id,"stopped",Some("Session disconnected. Already sent actions cannot be undone.".into()),None).await,
                 _=cancel.cancelled()=>{},
-                _=tokio::time::sleep(Duration::from_secs(360))=>session.tasks.finish(&id,"failed",None,Some("Task time limit reached".into())).await,
-                result=run(session.clone(),&id,model,cancel.clone())=>match result{
+                _=tokio::time::sleep(Duration::from_secs(1800))=>session.tasks.finish(&id,"failed",None,Some("任务已达到 30 分钟时限".into())).await,
+                result=run(session.clone(),&id,model,images,cancel.clone())=>match result{
                     Ok(message)=>session.tasks.finish(&id,"completed",Some(message),None).await,
                     Err(error)=>session.tasks.finish(&id,"failed",None,Some(error.message)).await,
                 }
@@ -172,7 +179,13 @@ fn confirmation_required(action: &Value, request: &Value) -> bool {
                 action["args"]["text"].as_str().unwrap_or("")
             )))
 }
-async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken) -> Result<String> {
+async fn run(
+    s: Arc<Session>,
+    id: &str,
+    model: Model,
+    images: Vec<crate::attachments::ReferenceImage>,
+    cancel: CancellationToken,
+) -> Result<String> {
     // Keep bounded tool content private to the inference loop, out of polled UI snapshots.
     let mut history: Vec<Value> = Vec::new();
     let mut next_observation: Option<Value> = None;
@@ -182,11 +195,12 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
     loop {
         let snapshot = s.tasks.update(id, |t| t.snapshot["state"] = json!("observing")).await?;
         let observing = Instant::now();
-        let direct = if history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
-            direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
-        } else {
-            None
-        };
+        let direct =
+            if images.is_empty() && history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
+                direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
+            } else {
+                None
+            };
         let observation = if direct.is_some() {
             json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"})
         } else if let Some(observation) = next_observation.take() {
@@ -217,7 +231,13 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
         } else {
             validate_reply(
                 model
-                    .generate(snapshot["instruction"].as_str().unwrap(), observation, history.clone(), cancel.clone())
+                    .generate(
+                        snapshot["instruction"].as_str().unwrap(),
+                        observation,
+                        history.clone(),
+                        &images,
+                        cancel.clone(),
+                    )
                     .await?,
             )?
         };
@@ -232,8 +252,8 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             }
             return Ok(action["message"].as_str().unwrap().to_owned());
         }
-        if steps.len() >= 20 {
-            return Err(ApiError::new(409, "Task step limit reached"));
+        if steps.len() >= 100 {
+            return Err(ApiError::new(409, "任务已达到 100 步上限"));
         }
         // A text-only query result is sufficient for app lookup/completion, but
         // never authorizes invented screen coordinates. Re-observe and re-plan first.

@@ -44,6 +44,11 @@ fn later(state: Rc<RefCell<Polling>>, preview: bool) {
 fn tick(state: Rc<RefCell<Polling>>, preview: bool) {
     let client = state.borrow().client.clone();
     let request = if preview {
+        let active = get(&state.borrow().options, "previewActive");
+        if active.is_function() && apply(&active, &JsValue::UNDEFINED, &[]).is_ok_and(|v| truth(&v)) {
+            later(state, preview);
+            return;
+        }
         if state.borrow().ready() {
             call(&client, "screen", &[])
         } else {

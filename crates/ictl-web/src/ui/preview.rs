@@ -1,16 +1,23 @@
 use super::*;
 use crate::interaction::{Pointer, Rect, pointer_command, to_phone_point};
 use web_sys::{HtmlImageElement, PointerEvent};
-fn pointer(event: &PointerEvent) -> Option<Pointer> {
+fn pointer(event: &PointerEvent, ui: Ui) -> Option<Pointer> {
     let image = event.current_target()?.dyn_into::<HtmlImageElement>().ok()?;
     let rect = image.get_bounding_client_rect();
+    let (mut width, mut height) = (image.natural_width() as f64, image.natural_height() as f64);
+    if !ui.preview_url.get_untracked().is_empty() {
+        let session = ui.session();
+        let screen = &session["daemon"]["persisted"]["screen"];
+        let (w, h) = (screen["width"].as_f64()?, screen["height"].as_f64()?);
+        (width, height) = if width > height { (h.max(w), h.min(w)) } else { (h.min(w), h.max(w)) };
+    }
     Some(Pointer {
         point: to_phone_point(
             event.client_x() as f64,
             event.client_y() as f64,
             Rect { left: rect.left(), top: rect.top(), width: rect.width(), height: rect.height() },
-            image.natural_width() as f64,
-            image.natural_height() as f64,
+            width,
+            height,
         ),
         x: event.client_x() as f64,
         y: event.client_y() as f64,
@@ -24,7 +31,26 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     let position = RwSignal::new(String::new());
     let loaded = RwSignal::new(false);
     let landscape = RwSignal::new(false);
-    let disabled = move || !ui.can_control() || ui.busy.get();
+    let image_ref = NodeRef::<leptos::html::Img>::new();
+    // Chrome only emits load for the initial MJPEG image. Poll intrinsic dimensions
+    // with session status so rotation of later frames also updates the phone layout.
+    Effect::new(move |_| {
+        let _ = ui.state.get();
+        if !ui.preview_url.get().is_empty() {
+            if let Some(image) = image_ref.get() {
+                if image.natural_width() > 0 && image.natural_height() > 0 {
+                    loaded.set(true);
+                    landscape.set(image.natural_width() > image.natural_height());
+                }
+            }
+        }
+    });
+    let disabled = move || {
+        !ui.can_control()
+            || ui.busy.get()
+            || (!ui.preview_url.get().is_empty()
+                && ui.session()["preview"]["ageMs"].as_u64().is_none_or(|age| age > 5000))
+    };
     view! {
         <section class="phone-card card">
             <div class="card-header">
@@ -46,12 +72,12 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                 <div class=move || {
                     format!(
                         "phone-frame {} {}",
-                        if ui.screen.get().is_null() { "" } else { "has-screen" },
-                        if !ui.screen.get().is_null() && landscape.get() { "wide" } else { "" },
+                        if ui.screen.get().is_null() && ui.preview_url.get().is_empty() { "" } else { "has-screen" },
+                        if landscape.get() { "wide" } else { "" },
                     )
                 }>
                     <Show
-                        when=move || !ui.screen.get().is_null()
+                        when=move || !ui.screen.get().is_null() || !ui.preview_url.get().is_empty()
                         fallback=move || {
                             view! {
                                 <div class="empty-phone">
@@ -66,8 +92,11 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         }
                     >
                         <img
+                            node_ref=image_ref
                             class="phone-screen"
                             src=move || {
+                                let stream = ui.preview_url.get();
+                                if !stream.is_empty() { return stream; }
                                 format!(
                                     "data:image/jpeg;base64,{}",
                                     string(&ui.screen.get(), "imageBase64"),
@@ -85,6 +114,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                 }
                             }
                             on:error=move |_| {
+                                ui.preview_url.set(String::new());
                                 loaded.set(false);
                                 landscape.set(false);
                             }
@@ -98,12 +128,12 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                 {
                                     let _ = image.set_pointer_capture(e.pointer_id());
                                 }
-                                down.set_value(pointer(&e));
+                                down.set_value(pointer(&e, ui));
                             }
                             on:pointermove=move |e| {
                                 position
                                     .set(
-                                        pointer(&e)
+                                        pointer(&e, ui)
                                             .and_then(|p| p.point)
                                             .map(|p| format!("{}, {}", p.x, p.y))
                                             .unwrap_or_default(),
@@ -116,7 +146,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                     return;
                                 }
                                 if let Some(command) = start
-                                    .zip(pointer(&e))
+                                    .zip(pointer(&e, ui))
                                     .and_then(|(s, e)| pointer_command(s, e))
                                 {
                                     ui.manual(string(&command, "tool"), command["args"].clone());
@@ -133,6 +163,10 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         format!("tiny-dot {}", if ui.screen.get().is_null() { "" } else { "live" })
                     } />
                     {move || {
+                        if !ui.preview_url.get().is_empty() {
+                            let age = ui.session()["preview"]["ageMs"].as_u64();
+                            return match age { Some(age) if age <= 5000 => "MJPEG 连续画面", _ => "画面重连中" };
+                        }
                         if ui.screen.get().is_null() {
                             "等待设备画面"
                         } else {
@@ -140,6 +174,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         }
                     }}
                     {move || {
+                        if !ui.preview_url.get().is_empty() { return None; }
                         ui.screen
                             .get()["timings"]["screenshotMs"]
                             .as_f64()

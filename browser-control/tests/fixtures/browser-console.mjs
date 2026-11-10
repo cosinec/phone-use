@@ -84,6 +84,12 @@ const fetchImpl = async (url, options = {}) => {
       token: "explicit-fixture-token",
     });
   }
+  if (url.endsWith("/preview/stream") && fixture.enableStream) {
+    return reply({ url: `/api/sessions/${fixture.state.id}/preview/mjpeg/browser-fixture` });
+  }
+  if (url.endsWith("/attachments") && options.method === "POST") {
+    return reply({ id: `image-${fixture.calls.length}`, name: body.name, mimeType: body.mimeType, size: atob(body.dataBase64).length });
+  }
   if (url.endsWith("/preview")) {
     if (fixture.holdNextPreview) {
       fixture.holdNextPreview = false;

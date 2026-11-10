@@ -7,6 +7,7 @@ import { createServer, preview } from "vite";
 import { toPhonePoint, pointerCommand } from "../web/interaction.mjs";
 
 let browser, dev, built, base, builtBase;
+let streamFixtureBytes;
 const root = new URL("..", import.meta.url).pathname;
 const fixturePage = `<!doctype html>
 <html lang="zh-CN">
@@ -40,6 +41,13 @@ before(async () => {
         name: "explicit-browser-fixture",
         configureServer(server) {
           server.middlewares.use((req, res, next) => {
+            if (req.url?.endsWith('/preview/mjpeg/browser-fixture') && streamFixtureBytes) {
+              res.writeHead(200, { 'Content-Type': 'multipart/x-mixed-replace; boundary=fixture', 'Cache-Control': 'no-store' });
+              const write = () => res.write(Buffer.concat([Buffer.from(`--fixture\r\nContent-Type: image/jpeg\r\nContent-Length: ${streamFixtureBytes.length}\r\n\r\n`), streamFixtureBytes, Buffer.from('\r\n')]));
+              write(); const timer = setInterval(write, 100);
+              res.on('close', () => clearInterval(timer));
+              return;
+            }
             if (req.url === "/__test__/fixture.mjs") {
               res.setHeader("Content-Type", "text/javascript");
               res.end(fixtureScript);
@@ -427,4 +435,72 @@ test("a delayed command from a previous session cannot start a screenshot reques
     ),
     countBefore,
   );
+});
+
+
+test("task composer supports selecting, pasting, dropping and removing reference images", async t => {
+  const page = await pageFor(t); await connect(page);
+  const png = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 16; canvas.height = 16;
+    return canvas.toDataURL('image/png').split(',')[1];
+  }), 'base64');
+  await page.getByLabel('添加任务图片').setInputFiles({ name: 'reference.png', mimeType: 'image/png', buffer: png });
+  await page.getByRole('img', { name: 'reference.png', exact: true }).waitFor();
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(document.querySelector('.image-thumbnails img').src.split(',')[1]), c => c.charCodeAt(0))], 'pasted.png', { type: 'image/png' }));
+    document.querySelector('#task-instruction').dispatchEvent(new ClipboardEvent('paste', { bubbles: true, clipboardData: data }));
+  });
+  await page.getByRole('img', { name: 'pasted.png', exact: true }).waitFor();
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(document.querySelector('.image-thumbnails img').src.split(',')[1]), c => c.charCodeAt(0))], 'dropped.png', { type: 'image/png' }));
+    document.querySelector('#task-instruction').dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: data }));
+  });
+  await page.getByRole('img', { name: 'dropped.png', exact: true }).waitFor();
+  await page.getByRole('button', { name: '移除图片' }).last().click();
+  await page.waitForFunction(() => document.querySelectorAll('.image-thumbnails img').length === 2);
+  await page.locator('#task-instruction').fill('Use the supplied pictures');
+  await page.getByRole('button', { name: /开始任务/ }).click();
+  await page.waitForFunction(() => window.fixture.calls.some(c => c.url?.endsWith('/tasks')));
+  const body = await page.evaluate(() => window.fixture.calls.find(c => c.url?.endsWith('/tasks')).body);
+  assert.equal(body.attachments.length, 2);
+  assert.ok(body.attachments.every(id => id.startsWith('image-')));
+});
+
+
+test('MJPEG image renders while task is running and maps native pixels back to phone points', async t => {
+  const page = await pageFor(t);
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 400; canvas.height = 800;
+    canvas.getContext('2d').fillRect(0, 0, 400, 800);
+    return canvas.toDataURL('image/jpeg').split(',')[1];
+  }), 'base64');
+  await page.evaluate(() => {
+    fixture.enableStream = true;
+    fixture.state.daemon.persisted = { screen: { width: 100, height: 200 } };
+    fixture.state.preview = { state: 'streaming', ageMs: 10 };
+  });
+  await connect(page);
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 400);
+  await page.getByText('MJPEG 连续画面', { exact: true }).waitFor();
+  const image = page.locator('.phone-screen');
+  const box = await image.boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(() => fixture.calls.some(c => c.body?.tool === 'iphone_tap'));
+  const tap = await page.evaluate(() => fixture.calls.find(c => c.body?.tool === 'iphone_tap').body);
+  assert.ok(Math.abs(tap.args.x - 50) < 1); assert.ok(Math.abs(tap.args.y - 100) < 1);
+  await page.locator('#task-instruction').fill('Inspect current screen');
+  await page.getByRole('button', { name: /开始任务/ }).click();
+  await page.waitForFunction(() => document.querySelector('.task-status')?.textContent.includes('等待你的确认'));
+  assert.equal(await image.getAttribute('src'), '/api/sessions/session-1/preview/mjpeg/browser-fixture');
+  assert.equal(await image.evaluate(img => img.naturalHeight), 800);
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 800; canvas.height = 400;
+    canvas.getContext('2d').fillRect(0, 0, 800, 400);
+    return canvas.toDataURL('image/jpeg').split(',')[1];
+  }), 'base64');
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 800);
+  await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'), null, { timeout: 4000 });
+
 });

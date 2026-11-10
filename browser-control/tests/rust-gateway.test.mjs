@@ -782,3 +782,105 @@ contract('Rust serves WASM GET and HEAD with streaming MIME and rejects missing 
   assert.equal(await head.text(), '');
   assert.equal((await fetch(app.base + '/assets/missing.wasm')).status, 404);
 });
+
+contract('MJPEG descriptor requires session credentials and preview ticket cannot authorize commands', async t => {
+  const app = await harness(t);
+  const session = await app.session();
+  await peer(t, session); await ready(app, session);
+  const route = `/api/sessions/${session.id}`;
+  assert.equal((await app.api(route + '/preview/stream', 'wrong')).status, 401);
+  const descriptor = await app.api(route + '/preview/stream', session.token);
+  assert.equal(descriptor.status, 200);
+  const { url } = await descriptor.json();
+  assert.ok(url.startsWith(route + '/preview/mjpeg/'));
+  assert.ok(!url.includes(session.token));
+  const ticket = url.split('/').at(-1);
+  assert.equal((await app.api(route, ticket)).status, 401);
+  assert.equal((await app.api(route + '/preview/mjpeg/invalid', session.token)).status, 401);
+  assert.equal((await app.api(url, '', undefined, { Origin: 'https://evil.test' })).status, 403);
+  await app.api(route, session.token, undefined, {}, 'DELETE');
+  assert.ok([401, 404].includes((await app.api(url, '')).status));
+});
+
+contract('task permits one hundred actions then completion, and blocks action 101', async t => {
+  for (const doneAtLimit of [true, false]) {
+    await t.test(doneAtLimit ? 'completion after 100' : 'reject 101', async t => {
+      const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call > 100 && doneAtLimit
+        ? { type: 'done', message: '100 verified' }
+        : { type: 'action', tool: 'iphone_status', args: {}, reason: 'Read fixture status' })));
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+      assert.equal(state.task.steps.length, 100);
+      assert.equal(state.task.state, doneAtLimit ? 'completed' : 'failed');
+      if (!doneAtLimit) assert.match(state.task.error, /100/);
+    });
+  }
+});
+
+contract('task attachments validate image bytes, enforce ownership and reach model as separate references', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'done', message: 'Reference verified' })));
+  await until(async () => (await fixture.snapshot()).task?.state === 'completed');
+  const app = fixture.app, s = fixture.session, route = fixture.route;
+  const photo = { name: 'posting.png', mimeType: 'image/png', dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC' };
+  assert.equal((await app.api(route + '/attachments', 'wrong', photo)).status, 401);
+  assert.equal((await app.api(route + '/attachments', s.token, { ...photo, dataBase64: 'dGV4dA==' })).status, 400);
+  const response = await app.api(route + '/attachments', s.token, photo);
+  assert.equal(response.status, 201, await response.clone().text());
+  const attachment = await response.json();
+  assert.equal(attachment.name, 'posting.png'); assert.equal(attachment.mimeType, 'image/png');
+  const other = await app.session();
+  assert.equal((await app.api(`/api/sessions/${other.id}/tasks`, other.token, { instruction: 'Inspect', attachments: [attachment.id] })).status, 404);
+  const start = await app.api(route + '/tasks', s.token, { instruction: 'Inspect reference picture', attachments: [attachment.id] });
+  assert.equal(start.status, 201);
+  await until(async () => (await fixture.snapshot()).task?.state === 'completed');
+  const payload = fixture.requests.at(-1);
+  const content = payload.messages[1].content;
+  assert.equal(content.filter(c => c.type === 'image_url').length, 2);
+  assert.ok(content.some(c => c.image_url?.url.startsWith('data:image/png;base64,')));
+  assert.match(JSON.stringify(content), /posting.png/);
+  const state = await fixture.snapshot();
+  assert.ok(!JSON.stringify(state).includes(photo.dataBase64));
+  assert.equal((await app.api(route + '/attachments/' + attachment.id, s.token, undefined, {}, 'DELETE')).status, 200);
+  assert.equal((await app.api(route + '/tasks', s.token, { instruction: 'Inspect', attachments: [attachment.id] })).status, 404);
+});
+
+contract('MJPEG preview receives independent USB frames while model is thinking and closes on disconnect', async t => {
+  const fixture = await modelReplyTask(t, () => null);
+  const { app, session: first } = fixture;
+  await app.api(fixture.route, first.token, undefined, {}, 'DELETE');
+  const s = await app.session();
+  const ws = new WebSocket(s.relayUrl, { origin });
+  const ports = new Map(); const intervals = [];
+  ws.on('message', bytes => {
+    const f = decodeFrame(bytes);
+    if (f.type === F.OpenStream) {
+      ports.set(f.streamId, JSON.parse(f.payload).port);
+      ws.send(encodeFrame({ type: F.OpenResult, requestId: f.requestId, streamId: f.streamId, payload: jsonPayload({ ok: true }) }));
+    }
+    if (f.type === F.StreamData && ports.get(f.streamId) === 9100) {
+      assert.match(f.payload.toString(), /GET \/ HTTP/);
+      const send = bytes => { if (ws.readyState === WebSocket.OPEN) ws.send(encodeFrame({ type: F.StreamData, streamId: f.streamId, payload: bytes })); };
+      send(Buffer.from('HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n'));
+      const image = Buffer.from([255,216,255,217]);
+      const frame = Buffer.concat([Buffer.from('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n'), image, Buffer.from('\r\n')]);
+      send(frame); intervals.push(setInterval(() => send(frame), 60));
+    }
+  });
+  t.after(() => { for (const timer of intervals) clearInterval(timer); ws.terminate(); });
+  await once(ws, 'open'); ws.send(encodeFrame({ type: F.DeviceHello, payload: jsonPayload(device) }));
+  await ready(app, s);
+  const route = `/api/sessions/${s.id}`;
+  await app.api(route + '/tasks', s.token, { instruction: 'Inspect reference safely' });
+  await until(async () => (await (await app.api(route, s.token)).json()).task?.state === 'thinking');
+  const descriptor = await (await app.api(route + '/preview/stream', s.token)).json();
+  const response = await fetch(app.base + descriptor.url);
+  assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /multipart\/x-mixed-replace/);
+  assert.equal(response.headers.get('x-accel-buffering'), 'no');
+  const reader = response.body.getReader(); const received = await reader.read();
+  assert.ok(Buffer.from(received.value).includes(Buffer.from([255,216,255,217])));
+  const state = await (await app.api(route, s.token)).json();
+  assert.equal(state.task.state, 'thinking'); assert.equal(state.preview.state, 'streaming'); assert.ok(state.preview.frames >= 1);
+  ws.close(); await once(ws, 'close');
+  for (let i = 0; i < 10; i++) { if ((await reader.read()).done) return; }
+  assert.fail('preview did not close with its owning session');
+});

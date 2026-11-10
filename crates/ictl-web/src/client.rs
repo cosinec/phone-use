@@ -253,6 +253,27 @@ impl BrowserClient {
     pub fn screen(&self) -> Promise {
         self.session_promise("/preview", "GET", JsValue::UNDEFINED)
     }
+    #[wasm_bindgen(js_name=previewStream)]
+    pub fn preview_stream(&self) -> Promise {
+        let Some(attempt) = self.inner.borrow().attempt.clone() else {
+            return Promise::reject(&error("请先连接手机"));
+        };
+        let base = attempt.borrow().base.clone();
+        let id = text(&attempt.borrow().session, "id");
+        let pending = self.session_promise("/preview/stream", "GET", JsValue::UNDEFINED);
+        let this = self.clone();
+        future_to_promise(async move {
+            let descriptor = resolved(pending.into()).await?;
+            if !this.current(&attempt) {
+                return Err(error("会话已切换"));
+            }
+            let route = text(&descriptor, "url");
+            if !route.starts_with(&format!("/api/sessions/{id}/preview/mjpeg/")) {
+                return Err(error("无效的预览地址"));
+            }
+            Ok(format!("{base}{route}").into())
+        })
+    }
     pub fn command(&self, tool: String, args: JsValue) -> Promise {
         let request_id = {
             let function = self.inner.borrow().uuid.clone();
@@ -279,12 +300,31 @@ impl BrowserClient {
         self.session_promise("/setup/input", "POST", obj(&[("line", line.into())]))
     }
     #[wasm_bindgen(js_name=startTask)]
-    pub fn start_task(&self, instruction: String, model: Option<String>) -> Promise {
+    pub fn start_task(&self, instruction: String, model: Option<String>, attachments: JsValue) -> Promise {
         let data = obj(&[("instruction", instruction.into())]);
         if let Some(model) = model.filter(|m| !m.is_empty()) {
             set(&data, "model", &model.into());
         }
+        if !attachments.is_null() && !attachments.is_undefined() {
+            set(&data, "attachments", &attachments);
+        }
         self.session_promise("/tasks", "POST", data)
+    }
+    #[wasm_bindgen(js_name=uploadAttachment)]
+    pub fn upload_attachment(&self, name: String, mime_type: String, data_base64: String) -> Promise {
+        self.session_promise(
+            "/attachments",
+            "POST",
+            obj(&[("name", name.into()), ("mimeType", mime_type.into()), ("dataBase64", data_base64.into())]),
+        )
+    }
+    #[wasm_bindgen(js_name=deleteAttachment)]
+    pub fn delete_attachment(&self, id: String) -> Promise {
+        self.session_promise(
+            &format!("/attachments/{}", js_sys::encode_uri_component(&id)),
+            "DELETE",
+            JsValue::UNDEFINED,
+        )
     }
     #[wasm_bindgen(js_name=confirmTask)]
     pub fn confirm_task(&self, id: String, action_id: String, approved: bool) -> Promise {
