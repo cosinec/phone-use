@@ -262,10 +262,11 @@ fn App(options: JsValue) -> impl IntoView {
         }
         let pending = ui.client.get_value().preview_stream();
         spawn_local(async move {
-            if let Ok(url) = resolved(pending.into()).await {
-                if ui.current_session(&id) && ui.ready() {
-                    ui.preview_url.set(url.as_string().unwrap_or_default());
-                }
+            if let Ok(url) = resolved(pending.into()).await
+                && ui.current_session(&id)
+                && ui.ready()
+            {
+                ui.preview_url.set(url.as_string().unwrap_or_default());
             }
         });
     });

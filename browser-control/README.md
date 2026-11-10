@@ -35,6 +35,10 @@ Chrome Network 中 5 次空闲设置页面 `/preview` 请求为 494、501、470�
 
 ## Rust/WASM 浏览器客户端
 
+任务最多执行 100 步，总时限为 30 分钟。任务输入框支持选择、粘贴和拖入 JPEG/PNG 图片，可预览和移除。每个会话最多 6 张，单张 5 MiB，总计 20 MiB。模型能查看参考图片，并获得用于手机 Safari 打开的短期链接。发帖配图需要先通过手机系统界面保存到照片，再从目标 App 选图，导入结果以真机界面为准。
+
+iPhone 预览优先使用 WDA 的独立 MJPEG 通道，在 AI 思考和操作期间持续更新。连接不可用时使用截图后备，过旧的流画面会暂停手动点击。预览链接只能读取对应会话的画面，会话结束后失效。
+
 浏览器页面由 `crates/ictl-web/src/ui` 的 Leptos CSR 组件生成。会话、HTTP、轮询、手势、Android 命令和视频帧管理位于同一个 Rust crate。`web/main.mjs` 加载 WASM 并挂载页面，`web/android` 和 `web/client.mjs` 保留第三方 SDK 的构造和互操作桥。
 
 本地构建需要 Rust 1.90.0、`wasm32-unknown-unknown` 编译目标、与锁定依赖匹配的 wasm-bindgen CLI 0.2.130，以及 Node 22.13+。

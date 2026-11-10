@@ -64,13 +64,13 @@ impl<R: AsyncBufRead + Unpin> Reader<R> {
                 }
                 continue;
             }
-            if let Some((key, value)) = line.split_once(':') {
-                if key.eq_ignore_ascii_case("content-length") {
-                    ensure!(length.is_none(), "Duplicate MJPEG length");
-                    let size: usize = value.trim().parse()?;
-                    ensure!((4..=MAX_FRAME).contains(&size), "MJPEG frame exceeds limit");
-                    length = Some(size);
-                }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                ensure!(length.is_none(), "Duplicate MJPEG length");
+                let size: usize = value.trim().parse()?;
+                ensure!((4..=MAX_FRAME).contains(&size), "MJPEG frame exceeds limit");
+                length = Some(size);
             }
         }
         let mut bytes = vec![0; length.ok_or_else(|| anyhow!("Missing MJPEG length"))?];

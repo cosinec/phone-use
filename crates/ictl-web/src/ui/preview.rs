@@ -36,13 +36,13 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     // with session status so rotation of later frames also updates the phone layout.
     Effect::new(move |_| {
         let _ = ui.state.get();
-        if !ui.preview_url.get().is_empty() {
-            if let Some(image) = image_ref.get() {
-                if image.natural_width() > 0 && image.natural_height() > 0 {
-                    loaded.set(true);
-                    landscape.set(image.natural_width() > image.natural_height());
-                }
-            }
+        if !ui.preview_url.get().is_empty()
+            && let Some(image) = image_ref.get()
+            && image.natural_width() > 0
+            && image.natural_height() > 0
+        {
+            loaded.set(true);
+            landscape.set(image.natural_width() > image.natural_height());
         }
     });
     let disabled = move || {
