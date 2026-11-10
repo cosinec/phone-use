@@ -32,7 +32,7 @@ RUN rustup target add wasm32-unknown-unknown
 RUN tool="wasm-bindgen-0.2.130-$(uname -m)-unknown-linux-musl" \
     && curl -fsSL --retry 3 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/${tool}.tar.gz" -o "/tmp/${tool}.tar.gz" \
     && curl -fsSL --retry 3 "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/${tool}.tar.gz.sha256sum" -o "/tmp/${tool}.tar.gz.sha256sum" \
-    && (cd /tmp && sha256sum -c "${tool}.tar.gz.sha256sum") \
+    && (cd /tmp && awk -v file="${tool}.tar.gz" '{print $1 "  " file}' "${tool}.tar.gz.sha256sum" | sha256sum -c -) \
     && tar -xzf "/tmp/${tool}.tar.gz" -C /tmp \
     && install -m 755 "/tmp/${tool}/wasm-bindgen" /usr/local/bin/wasm-bindgen
 COPY browser-control/scripts/build-wasm.sh browser-control/scripts/build-wasm.sh
