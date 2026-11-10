@@ -39,7 +39,10 @@ COPY browser-control/scripts/build-wasm.sh browser-control/scripts/build-wasm.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target \
-    WASM_BUILD_PROFILE=release sh browser-control/scripts/build-wasm.sh
+    # Source archive timestamps can predate an overlapping build's cached WASM.
+    # Recompile the web crate against this stage's source snapshot.
+    touch crates/ictl-web/src/lib.rs \
+    && WASM_BUILD_PROFILE=release sh browser-control/scripts/build-wasm.sh
 
 FROM node:22-trixie-slim AS web-build
 ARG WEB_BASE=/
