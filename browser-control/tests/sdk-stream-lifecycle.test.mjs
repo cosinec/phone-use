@@ -318,3 +318,13 @@ test("a reset during connection setup returns failure and releases the pending s
   assert.equal(f.target.session.streams.size, 0);
   assert.equal(f.relay.streams.size, 0);
 });
+
+test("an OpenStream already queued when relay closes cannot create a new SYN", async (t) => {
+  const f = await fixture(t);
+  const pending = f.send(2, 1, new TextEncoder().encode('{"port":8100}'));
+  f.relay.close();
+  await pending;
+  assert.equal(f.sent.filter((p) => p.flags & 2).length, 0);
+  assert.equal(f.target.session.streams.size, 0);
+  assert.equal(f.relay.streams.size, 0);
+});

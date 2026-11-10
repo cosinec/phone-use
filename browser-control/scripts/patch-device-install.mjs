@@ -20,6 +20,14 @@ const originalHash =
   "da410b47f3150df18f0dab904d16d22f20f0fd2141d0846c1431d4d921375a20";
 const marker = "// phone-use: device-install stream lifecycle v1";
 const replacements = [
+  [
+    "  async handleFrame(t) {\n    switch (t.type) {",
+    "  async handleFrame(t) {\n    if (this.closed) return;\n    switch (t.type) {",
+  ],
+  [
+    "  async handleOpenStream(t, n, r) {\n    try {",
+    "  async handleOpenStream(t, n, r) {\n    if (this.closed) return;\n    try {",
+  ],
   ["async function Q(e, t) {", "async function Q(e, t, onCreate) {"],
   [
     "  return e.streams.set(g(t, a.sport), a), await w(a, m, new Uint8Array()), await a.opened, a;",
