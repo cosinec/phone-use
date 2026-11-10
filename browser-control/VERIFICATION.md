@@ -101,3 +101,27 @@ AI 沿用当前 Rust TaskManager 的观察与操作循环，通过 VPS 现有 Ma
 这是人工生成测试图片的单次接口验收，不是模型速度排名或公网真机任务基准。真实 Xiaomi 平板的本机截图、点击、长按、滑动、中文输入、返回和横竖屏证据与耗时见 README 的平板实测段落；本次未增加公网真机操控证据。Mac 锁屏使人工 Chrome 页面检查未能执行，界面由 SSR 回归、类型检查、生产构建及实际静态资源请求验证。
 
 本次 137 项浏览器/协议测试和 19 项 Rust 网关单元测试通过，0 失败、0 跳过；TypeScript、Vite `/iphone/` 构建、Clippy `-D warnings` 和 Linux Docker 构建通过。新增回归覆盖模型目录合并缓存、非法模型、跨会话模型隔离、目录重定向与凭据保护、默认模型回退及模型选择框的运行状态。
+
+## 浏览器 Rust/WASM 重构（2026-11-10，分支 `codex/rust-wasm-refactor`）
+
+用户选择方案 A：项目自有的页面、连接/会话状态、HTTP/WebSocket、轮询、任务协调、手势坐标、Android 命令/中继/视频帧管理迁移到 Rust/WASM；第三方 iPhone WebUSB、Tango ADB、scrcpy 组件保留在职责明确的 JS 桥中。React 生产源码与相关构建依赖已移除，页面由 Leptos CSR + wasm-bindgen 挂载。
+
+基线为 `e1e3bb46b85ffff1d859dc4e7ce6c014036df41f`，并已合并当时主分支 `a3715cd` 的新增能力（WDA 复用、输入焦点恢复、结构化模型回复、会话占用提示）。本记录对应分支头 `6f4f6f20fcbaa0cb7406e616ba56c006bc9cf548`。
+
+### 自动化验证
+
+- 完整 Node/协议套件 177/177 通过，0 失败、0 跳过（含真实 Rust 网关二进制 fixture）。日志 `.superpowers/sdd/final-all-tests.log`。
+- Rust 原生测试 22/22 通过（网关 19 + 浏览器核心 3），默认线程执行。日志 `.superpowers/sdd/final-native-default.log`。
+- WASM 目标 Clippy `-D warnings`、网关全目标 Clippy、rustfmt、`git diff --check` 通过。
+- Chrome（157.0.8103.39）根路径与 `/iphone/` 生产构建均通过最终验收：WASM 以 `application/wasm` 返回 200，无页面异常或失败请求；验证了“AI 尚未配置”状态、任务输入 UTF-16 计数（测试😀 为 4/4000）、快捷建议回填、Android 切换、令牌输入启用、1440×1100 与 390×844 布局。证据 `final-root-chrome.json`、`final-subpath-chrome.json`。
+- 关键行为回归：断线清理、迟到响应归属、同设备重连后旧截图丢弃、任务停止独立请求、Android 大写 URL 方案、视频绘制失败不发布旧画面、准备日志滚动与刷新期间输入焦点保持。
+
+### 尚未在本地验证
+
+- Docker 镜像构建（本机无 Docker CLI）与新增的 `browser.yml` GitHub CI 工作流。
+- 真机（iPhone/Android）USB 操作链；浏览器测试使用明确标注的模拟设备与模型 fixture。
+- 性能对比：仅记录优化 WASM 体积约 2.35 MB（gzip 约 772 KB），未做网络或真机分阶段基准。
+
+### 偶发说明
+
+原生进程清理测试 `cleanup_escalates_to_kill_an_uncooperative_process_group` 在默认线程下出现过两次偶发失败，单独运行与串行全量运行均通过，未修改相关代码，根因未定位。串行执行 `-- --test-threads=1` 为稳定通过的完整结果。
