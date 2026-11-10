@@ -54,6 +54,7 @@ assert.equal(wasm.toPhonePoint(25, 110, {left:20,top:10,width:200,height:200},10
 - Create `crates/ictl-web/src/ui/{mod,connection,preview,setup,task}.rs` and Rust view helpers as needed.
 - Replace `browser-control/web/main.tsx` with a WASM bootstrap `web/main.mjs`; remove replaced React components, TS declarations and obsolete React-only dependencies.
 - Update `browser-control/index.html`, `package.json`, lockfile, `vite.config.mjs`, `Dockerfile`, `.gitignore`, `THIRD_PARTY.md` and build documentation for the actual Rust frontend entry point.
+- Update `crates/ictl-gateway/src/static_files.rs` to serve `.wasm` as `application/wasm`, with regression coverage of GET/HEAD MIME and missing-asset handling through the real gateway.
 - Replace React SSR tests with browser-facing tests of the Rust UI and retain shared gesture/runtime coverage.
 
 **Interfaces**
@@ -66,6 +67,7 @@ assert.equal(wasm.toPhonePoint(25, 110, {left:20,top:10,width:200,height:200},10
 - [ ] Implement the Leptos UI with the existing CSS. Keep the image DOM element stable while refreshing screenshots so pointer capture and text input survive status updates.
 - [ ] Ensure USB selection is invoked directly inside the click handler and clear token/setup inputs synchronously when submitted.
 - [ ] Replace production entry and package dependencies, update Vite WASM packaging and Docker build prerequisites. Keep source-path and `/iphone/` builds valid.
+- [ ] Confirm the built WASM asset loads from the Rust static server with the correct MIME type and passes the existing traversal/missing-file guards.
 - [ ] Run Rust core tests, browser runtime/protocol tests, Rust UI browser regressions, production builds and format/lint checks. Inspect the rendered Chrome page and browser console.
 - [ ] Commit task changes and record complete results in `.superpowers/sdd/task-2-report.md`.
 
