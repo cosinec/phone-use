@@ -160,7 +160,7 @@ impl Gateway {
         let mut hash = Sha256::new();
         hash.update(self.config.token.as_bytes());
         hash.update(record.pair_record_base64.as_bytes());
-        self.config.runtime.join("record-map").join(format!("{:x}.json", hash.finalize()))
+        self.config.runtime.join("record-map").join(format!("{}.json", hex::encode(hash.finalize())))
     }
     async fn saved_namespace(&self, record: &PairRecord) -> Result<Option<String>> {
         match tokio::fs::read(self.record_path(record)).await {
@@ -211,7 +211,7 @@ impl Gateway {
             return Err(ApiError::new(429, "Session limit reached"));
         }
         let mut namespace = if device.platform == Platform::Android {
-            format!("android-{:x}", Sha256::digest(device.serial_number.as_bytes()))
+            format!("android-{}", hex::encode(Sha256::digest(device.serial_number.as_bytes())))
         } else {
             id()
         };
