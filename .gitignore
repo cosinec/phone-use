@@ -17,3 +17,7 @@ browser-control/dist/
 browser-control/.runtime/
 browser-control/.env
 .superpowers/
+
+# Generated browser WASM bindings
+browser-control/pkg/
+browser-control/pkg-node/

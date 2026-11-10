@@ -627,6 +627,19 @@ where
     }
 }
 
+fn installed_wda_is_reusable(
+    persisted: &ictl_daemon::core::Persisted,
+    apps: &[ictl_device::AppInfo],
+    profiles: &[Vec<u8>],
+    udid: &str,
+    now: std::time::SystemTime,
+) -> bool {
+    let Some(bundle) = &persisted.wda_bundle else { return false };
+    apps.iter().any(|app| &app.bundle_id == bundle)
+        && ictl_daemon::core::wda_profile_expiry(profiles, persisted.team_id.as_deref(), bundle, udid)
+            .is_some_and(|expires| expires > now)
+}
+
 async fn setup(cli: &Cli) -> anyhow::Result<()> {
     use ictl_device::{Device, DeviceError};
     let socket = &cli.socket;
@@ -717,48 +730,84 @@ async fn setup(cli: &Cli) -> anyhow::Result<()> {
         println!("{}", ictl_l10n::tr!("  已打开", "  Turned on"));
     }
 
-    println!("{}", ictl_l10n::tr!("[4/6] 登录 Apple ID", "[4/6] Apple ID sign-in"));
-    match account_dir(&cli.data_dir).selected_email().await {
-        Ok(e) => println!("{}", ictl_l10n::trf!("  已登录 {e}", "  Signed in as {e}")),
-        Err(_) => login(&cli.data_dir, None).await?,
+    // Enabling Developer Mode can reboot the phone and change its usbmuxd device ID.
+    let device = Device::find(udid.as_deref()).await?;
+    let persisted = snapshot(socket).await?.persisted;
+    let reuse_wda = if persisted.wda_bundle.is_some() {
+        let profiles = device.installed_profiles().await.context(ictl_l10n::tr!(
+            "检查手机上的 WDA 描述文件失败，请保持手机解锁后重试",
+            "Could not check the installed WDA profile; keep the phone unlocked and retry"
+        ))?;
+        let apps = device.list_apps(false).await.context(ictl_l10n::tr!(
+            "检查手机上已安装的 WDA 失败，请保持手机解锁后重试",
+            "Could not check the installed WDA app; keep the phone unlocked and retry"
+        ))?;
+        installed_wda_is_reusable(&persisted, &apps, &profiles, &device.udid, std::time::SystemTime::now())
+    } else {
+        false
+    };
+    if reuse_wda {
+        println!(
+            "{}",
+            ictl_l10n::tr!(
+                "[4/6] 已安装的 WDA 签名有效，直接复用",
+                "[4/6] Reusing installed WDA with a valid provisioning profile"
+            )
+        );
+        println!(
+            "{}",
+            ictl_l10n::tr!(
+                "[5/6] 跳过 Apple ID 登录、重签和安装",
+                "[5/6] Skipping Apple ID sign-in, signing and installation"
+            )
+        );
+    } else {
+        println!("{}", ictl_l10n::tr!("[4/6] 登录 Apple ID", "[4/6] Apple ID sign-in"));
+        match account_dir(&cli.data_dir).selected_email().await {
+            Ok(e) => println!("{}", ictl_l10n::trf!("  已登录 {e}", "  Signed in as {e}")),
+            Err(_) => login(&cli.data_dir, None).await?,
+        }
+
+        println!(
+            "{}",
+            ictl_l10n::tr!(
+                "[5/6] 注册设备、签名 WDA 并安装到手机（手机要保持解锁）",
+                "[5/6] Registering the device, signing WDA and installing it on the phone (keep the phone unlocked)"
+            )
+        );
+        // 前几步直接问 usbmuxd，重签却由守护进程做：它每 10 秒巡检一次才认到手机。手机刚重启完、usbmuxd 刚重启时
+        // 这里会先看到手机，马上请求重签就报「手机未连接」，所以先等守护进程认到同一台
+        let target = device.udid.clone();
+        let seen = wait_until(Duration::from_secs(60), Duration::from_secs(2), || async {
+            snapshot(socket).await.is_ok_and(|s| {
+                s.state != ictl_daemon::machine::DeviceState::Absent
+                    && s.device.as_ref().is_none_or(|d| d.udid == target)
+            })
+        })
+        .await;
+        if !seen {
+            bail!(
+                "{}",
+                ictl_l10n::trf!(
+                    "守护进程 1 分钟内没认到手机 {}，运行 iphone-control doctor 看看卡在哪",
+                    "The daemon didn't pick up the phone {} within a minute; run iphone-control doctor to see where it is stuck",
+                    device.udid
+                )
+            );
+        }
+        print_text(socket, Request::Resign { force: true }).await?;
     }
 
-    println!(
-        "{}",
-        ictl_l10n::tr!(
-            "[5/6] 注册设备、签名 WDA 并安装到手机（手机要保持解锁）",
-            "[5/6] Registering the device, signing WDA and installing it on the phone (keep the phone unlocked)"
-        )
-    );
-    // 前几步直接问 usbmuxd，重签却由守护进程做：它每 10 秒巡检一次才认到手机。手机刚重启完、usbmuxd 刚重启时
-    // 这里会先看到手机，马上请求重签就报「手机未连接」，所以先等守护进程认到同一台
-    let target = device.udid.clone();
-    let seen = wait_until(Duration::from_secs(60), Duration::from_secs(2), || async {
-        snapshot(socket).await.is_ok_and(|s| {
-            s.state != ictl_daemon::machine::DeviceState::Absent && s.device.as_ref().is_none_or(|d| d.udid == target)
-        })
-    })
-    .await;
-    if !seen {
-        bail!(
+    println!("{}", ictl_l10n::tr!("[6/6] 等待 WDA 启动", "[6/6] Waiting for WDA to start"));
+    if !reuse_wda {
+        println!(
             "{}",
-            ictl_l10n::trf!(
-                "守护进程 1 分钟内没认到手机 {}，运行 iphone-control doctor 看看卡在哪",
-                "The daemon didn't pick up the phone {} within a minute; run iphone-control doctor to see where it is stuck",
-                device.udid
+            ictl_l10n::tr!(
+                "  首次安装:在手机 设置 → 通用 → VPN 与设备管理 里找到你的 Apple ID,点「信任」(需要联网)。",
+                "  First install: on the phone, open Settings → General → VPN & Device Management, find your Apple ID and tap “Trust” (needs internet)."
             )
         );
     }
-    print_text(socket, Request::Resign { force: true }).await?;
-
-    println!("{}", ictl_l10n::tr!("[6/6] 等待 WDA 启动", "[6/6] Waiting for WDA to start"));
-    println!(
-        "{}",
-        ictl_l10n::tr!(
-            "  首次安装:在手机 设置 → 通用 → VPN 与设备管理 里找到你的 Apple ID,点「信任」(需要联网)。",
-            "  First install: on the phone, open Settings → General → VPN & Device Management, find your Apple ID and tap “Trust” (needs internet)."
-        )
-    );
     println!(
         "{}",
         ictl_l10n::tr!(
@@ -767,7 +816,13 @@ async fn setup(cli: &Cli) -> anyhow::Result<()> {
         )
     );
     let ready = wait_until(Duration::from_secs(600), Duration::from_secs(10), || async {
-        snapshot(socket).await.map(|s| s.state == ictl_daemon::machine::DeviceState::Ready).unwrap_or(false)
+        snapshot(socket)
+            .await
+            .map(|s| {
+                s.state == ictl_daemon::machine::DeviceState::Ready
+                    && s.device.as_ref().is_some_and(|d| d.udid == device.udid)
+            })
+            .unwrap_or(false)
     })
     .await;
     println!(
@@ -883,7 +938,53 @@ fn host_is_loopback(head: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::host_is_loopback;
+    use super::{host_is_loopback, installed_wda_is_reusable};
+    use ictl_daemon::core::Persisted;
+    use ictl_device::AppInfo;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn setup_reuses_only_an_installed_wda_with_a_valid_matching_device_profile() {
+        let bundle = "com.facebook.WebDriverAgentRunner.xctrunner.TEAM1";
+        let persisted =
+            Persisted { wda_bundle: Some(bundle.into()), team_id: Some("TEAM1".into()), ..Default::default() };
+        let app = AppInfo { name: "WebDriverAgentRunner".into(), bundle_id: bundle.into() };
+        let profile = |team: &str, device: &str, expires: &str| {
+            format!(
+                r#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>ExpirationDate</key><date>{expires}</date>
+            <key>ProvisionedDevices</key><array><string>{device}</string></array>
+            <key>Entitlements</key><dict><key>application-identifier</key><string>{team}.{bundle}</string></dict>
+            </dict></plist>"#
+            )
+            .into_bytes()
+        };
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let valid = profile("TEAM1", "fixture-device", "2099-01-01T00:00:00Z");
+        assert!(installed_wda_is_reusable(
+            &persisted,
+            std::slice::from_ref(&app),
+            std::slice::from_ref(&valid),
+            "fixture-device",
+            now
+        ));
+        assert!(!installed_wda_is_reusable(&persisted, &[], std::slice::from_ref(&valid), "fixture-device", now));
+        assert!(!installed_wda_is_reusable(&persisted, std::slice::from_ref(&app), &[], "fixture-device", now));
+        for profile in [
+            profile("TEAM1", "fixture-device", "2000-01-01T00:00:00Z"),
+            profile("TEAM2", "fixture-device", "2099-01-01T00:00:00Z"),
+            profile("TEAM1", "different-device", "2099-01-01T00:00:00Z"),
+        ] {
+            assert!(!installed_wda_is_reusable(
+                &persisted,
+                std::slice::from_ref(&app),
+                &[profile],
+                "fixture-device",
+                now
+            ));
+        }
+        assert!(!installed_wda_is_reusable(&Persisted::default(), &[app], &[valid], "fixture-device", now));
+    }
 
     #[test]
     fn bridge_only_accepts_loopback_host() {

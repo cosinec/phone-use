@@ -13,6 +13,7 @@ pub async fn serve(root: &Path, method: &Method, path: &str) -> Option<Response>
     if path == "/api"
         || path.starts_with("/api/")
         || path.starts_with("/ios/")
+        || path.starts_with("/device/")
         || path.contains(['\0', '\\'])
         || path.split('/').any(|p| p.starts_with('.'))
     {
@@ -46,6 +47,7 @@ pub async fn serve(root: &Path, method: &Method, path: &str) -> Option<Response>
         "html" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
+        "wasm" => "application/wasm",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "ico" => "image/x-icon",

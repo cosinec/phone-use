@@ -10,3 +10,6 @@ docs
 **/*.rs.bk
 README.md
 website
+
+browser-control/pkg/
+browser-control/pkg-node/

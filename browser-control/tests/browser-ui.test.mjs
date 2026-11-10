@@ -1,253 +1,525 @@
-import test from "node:test";
+import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "vite";
-import { renderToStaticMarkup } from "react-dom/server";
-import { createElement } from "react";
-const mod = await import("../web/interaction.mjs").catch(() => ({}));
-test("pointer math uses JPEG native point dimensions with object-fit letterboxing and gesture bounds", () => {
-  assert.equal(typeof mod.toPhonePoint, "function");
-  const rect = { left: 20, top: 10, width: 200, height: 200 };
-  assert.deepEqual(mod.toPhonePoint(120, 110, rect, 100, 200), {
-    x: 50,
-    y: 100,
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { chromium } from "playwright";
+import { createServer, preview } from "vite";
+import { toPhonePoint, pointerCommand } from "../web/interaction.mjs";
+
+let browser, dev, built, base, builtBase;
+let streamFixtureBytes;
+const root = new URL("..", import.meta.url).pathname;
+const fixturePage = `<!doctype html>
+<html lang="zh-CN">
+  <head><link rel="stylesheet" href="/web/styles.css"></head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/__test__/fixture.mjs"></script>
+  </body>
+</html>`;
+const fixtureScript = await readFile(
+  new URL("./fixtures/browser-console.mjs", import.meta.url),
+  "utf8",
+);
+
+before(async () => {
+  const chrome =
+    process.env.CHROME_BIN ||
+    (process.platform === "darwin"
+      ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      : undefined);
+  browser = await chromium.launch({
+    headless: true,
+    ...(chrome && existsSync(chrome) ? { executablePath: chrome } : {}),
   });
-  assert.equal(mod.toPhonePoint(25, 110, rect, 100, 200), null);
-  assert.deepEqual(
-    mod.pointerCommand(
-      { point: { x: 1, y: 2 }, x: 0, y: 0, time: 0 },
-      { point: { x: 1, y: 2 }, x: 1, y: 1, time: 100 },
-    ),
-    { tool: "iphone_tap", args: { x: 1, y: 2 } },
+  dev = await createServer({
+    root,
+    configFile: new URL("../vite.config.mjs", import.meta.url).pathname,
+    server: { host: "127.0.0.1", port: 0, strictPort: false },
+    plugins: [
+      {
+        name: "explicit-browser-fixture",
+        configureServer(server) {
+          server.middlewares.use((req, res, next) => {
+            if (req.url?.endsWith('/preview/mjpeg/browser-fixture') && streamFixtureBytes) {
+              res.writeHead(200, { 'Content-Type': 'multipart/x-mixed-replace; boundary=fixture', 'Cache-Control': 'no-store' });
+              const write = () => res.write(Buffer.concat([Buffer.from(`--fixture\r\nContent-Type: image/jpeg\r\nContent-Length: ${streamFixtureBytes.length}\r\n\r\n`), streamFixtureBytes, Buffer.from('\r\n')]));
+              write(); const timer = setInterval(write, 100);
+              res.on('close', () => clearInterval(timer));
+              return;
+            }
+            if (req.url === "/__test__/fixture.mjs") {
+              res.setHeader("Content-Type", "text/javascript");
+              res.end(fixtureScript);
+              return;
+            }
+            if (req.url !== "/__test__/console.html") return next();
+            res.setHeader("Content-Type", "text/html");
+            res.end(fixturePage);
+          });
+        },
+      },
+    ],
+  });
+  await dev.listen();
+  base = `http://127.0.0.1:${dev.httpServer.address().port}`;
+  built = await preview({
+    root,
+    configFile: new URL("../vite.config.mjs", import.meta.url).pathname,
+    preview: { host: "127.0.0.1", port: 0, strictPort: false },
+  });
+  builtBase = `http://127.0.0.1:${built.httpServer.address().port}`;
+});
+after(async () => {
+  await browser?.close();
+  await dev?.close();
+  if (built) await new Promise((resolve) => built.httpServer.close(resolve));
+});
+async function pageFor(t, fixture = true) {
+  const page = await browser.newPage({
+    viewport: { width: 1440, height: 1100 },
+  });
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  t.after(async () => {
+    await page.close();
+    assert.deepEqual(
+      errors,
+      [],
+      "browser must have no uncaught runtime errors",
+    );
+  });
+  if (!fixture)
+    await page.route("**/api/config", (route) =>
+      route.fulfill({ json: { aiReady: false, model: null, models: [] } }),
+    );
+  await page.goto(fixture ? base + "/__test__/console.html" : builtBase + "/");
+  await page.getByRole("heading", { name: "让手机帮你做事." }).waitFor();
+  return page;
+}
+async function connect(page, platform = "ios") {
+  await page.locator("#device-platform").selectOption(platform);
+  await page.locator("#server-token").fill("explicit-fixture-controller");
+  await page
+    .getByRole("button", {
+      name: platform === "android" ? "连接 Android" : "连接 iPhone",
+      exact: true,
+    })
+    .click();
+  await page.getByRole("button", { name: "断开连接", exact: true }).waitFor();
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".connection-status")
+      .textContent.includes("可以控制"),
   );
+}
+
+test("production bootstrap loads Rust WASM UI with honest empty phone and accessible offline controls", async (t) => {
+  const page = await pageFor(t, false);
+  await page.getByText("AI 尚未配置", { exact: true }).waitFor();
+  assert.equal(await page.locator(".phone-screen").count(), 0);
   assert.equal(
-    mod.pointerCommand(
-      { point: { x: 1, y: 2 }, x: 0, y: 0, time: 0 },
-      { point: { x: 2, y: 3 }, x: 1, y: 1, time: 20000 },
-    ).args.seconds,
+    await page
+      .getByRole("button", { name: "主屏幕", exact: true })
+      .isDisabled(),
+    true,
+  );
+  assert.equal(await page.locator("#task-model").isDisabled(), true);
+  await page.getByRole("button", { name: "回到主屏幕", exact: false }).click();
+  assert.equal(
+    await page.locator("#task-instruction").inputValue(),
+    "回到主屏幕",
+  );
+  await page.locator("#task-instruction").fill("中文😀");
+  assert.match(
+    await page.locator(".task-input-footer").textContent(),
+    /4\/4000/,
+  );
+  await page.locator("#task-instruction").focus();
+  await page.getByRole("button", { name: "刷新列表", exact: true }).click();
+  await page.locator("#task-instruction").focus();
+  await page.getByText("AI 尚未配置", { exact: true }).waitFor();
+  assert.equal(
+    await page
+      .locator("#task-instruction")
+      .evaluate((node) => node === document.activeElement),
+    true,
+  );
+  assert.equal(await page.locator("#device-platform option").count(), 2);
+});
+
+test("Rust gestures preserve letterbox mapping and pointer gesture bounds", () => {
+  const rect = { left: 20, top: 10, width: 200, height: 200 };
+  assert.deepEqual(toPhonePoint(120, 110, rect, 100, 200), { x: 50, y: 100 });
+  assert.equal(toPhonePoint(25, 110, rect, 100, 200), null);
+  const start = { point: { x: 1, y: 2 }, x: 0, y: 0, time: 0 };
+  assert.equal(
+    pointerCommand(start, { point: { x: 1, y: 2 }, x: 0, y: 0, time: 20000 })
+      .args.seconds,
     10,
   );
-  assert.deepEqual(
-    mod.pointerCommand(
-      { point: { x: 1, y: 2 }, x: 0, y: 0, time: 0 },
-      { point: { x: 4, y: 5 }, x: 20, y: 20, time: 300 },
-    ),
-    {
-      tool: "iphone_swipe",
-      args: { from_x: 1, from_y: 2, to_x: 4, to_y: 5, seconds: 0.3 },
-    },
-  );
-});
-test("UI renders honest empty phone, manual-disabled state and AI unconfigured", async (t) => {
-  const server = await createServer({
-    optimizeDeps: { noDiscovery: true },
-    server: { middlewareMode: true },
-    appType: "custom",
-  });
-  t.after(() => server.close());
-  const { PhonePreview } = await server.ssrLoadModule(
-    "/web/components/PhonePreview.tsx",
-  );
-  const { TaskPanel } = await server.ssrLoadModule(
-    "/web/components/TaskPanel.tsx",
-  );
-  const phone = renderToStaticMarkup(
-    createElement(PhonePreview, {
-      screen: null,
-      status: "未连接设备",
-      canControl: false,
-      busy: false,
-      onCommand: () => {},
-      onRefresh: () => {},
-    }),
-  );
-  assert.match(phone, /未连接设备/);
-  assert.ok(!phone.includes("<img"));
-  assert.match(phone, /disabled/);
-  const task = renderToStaticMarkup(
-    createElement(TaskPanel, {
-      ai: { aiReady: false, model: null },
-      task: null,
-      canRun: false,
-      busy: false,
-      onStart: () => {},
-      onConfirm: () => {},
-      onStop: () => {},
-    }),
-  );
-  assert.match(task, /AI 尚未配置/);
-  assert.match(task, /disabled/);
-});
-test("native transport ready alone cannot enable manual control; active AI disables manual controls and keeps stop/confirmation visible", async (t) => {
-  const server = await createServer({
-    optimizeDeps: { noDiscovery: true },
-    server: { middlewareMode: true },
-    appType: "custom",
-  });
-  t.after(() => server.close());
-  const { App } = await server.ssrLoadModule("/web/App.tsx");
-  const state = {
-    phase: "connected",
-    device: { productName: "Real session label" },
-    error: null,
-    session: {
-      id: "fixture",
-      deviceId: "fixture",
-      state: "connected",
-      ready: true,
-      daemon: { state: { state: "needs_trust" } },
-      setup: { state: "idle", transcript: "", exitCode: null },
-      task: null,
-    },
-  };
-  const client = { snapshot: () => state, subscribe: () => () => {} };
-  let html = renderToStaticMarkup(createElement(App, { client }));
-  assert.match(html, /WDA 准备中/);
-  assert.match(html, /<button disabled=""[^>]*><span>⌂/);
-  state.session.daemon.state.state = "ready";
-  html = renderToStaticMarkup(createElement(App, { client }));
-  assert.match(html, /可以控制/);
-  assert.ok(!html.includes('<button disabled=""><span>⌂'));
-  state.session.task = {
-    id: "task",
-    instruction: "发送前确认",
-    state: "awaiting_confirmation",
-    steps: [],
-    confirmation: {
-      actionId: "a",
-      tool: "iphone_type_text",
-      args: { text: "消息", submit: true },
-      reason: "发送消息需要确认",
-    },
-  };
-  html = renderToStaticMarkup(createElement(App, { client }));
-  assert.match(html, /<button disabled=""[^>]*><span>⌂/);
-  assert.match(html, /停止任务/);
-  assert.match(html, /拒绝并停止/);
-  assert.match(html, /确认这一步/);
-  assert.match(html, /手动操作已暂停/);
-});
-test("Stop stays enabled during unrelated busy confirmation/status requests", async (t) => {
-  const server = await createServer({
-    optimizeDeps: { noDiscovery: true },
-    server: { middlewareMode: true },
-    appType: "custom",
-  });
-  t.after(() => server.close());
-  const { TaskPanel } = await server.ssrLoadModule(
-    "/web/components/TaskPanel.tsx",
-  );
-  const html = renderToStaticMarkup(
-    createElement(TaskPanel, {
-      ai: { aiReady: true, model: "fixture" },
-      task: {
-        id: "task",
-        instruction: "fixture",
-        state: "executing",
-        steps: [],
-        confirmation: null,
-      },
-      canRun: false,
-      busy: true,
-      onStart: () => {},
-      onConfirm: () => {},
-      onStop: () => {},
-    }),
-  );
-  const stop = html.match(/<button[^>]*>停止任务<\/button>/)?.[0];
-  assert.ok(stop);
-  assert.ok(!stop.includes("disabled"), "Stop must bypass unrelated busy flag");
-});
-test("screenshot img has stable React identity across frame changes, preserving the pointer capture target", async () => {
-  const { readFile } = await import("node:fs/promises");
-  const ts = await import("typescript");
-  const source = ts.createSourceFile(
-    "PhonePreview.tsx",
-    await readFile(
-      new URL("../web/components/PhonePreview.tsx", import.meta.url),
-      "utf8",
-    ),
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  );
-  const images = [];
-  function visit(node) {
-    if (
-      ts.isJsxSelfClosingElement(node) &&
-      node.tagName.getText(source) === "img"
-    )
-      images.push(node);
-    ts.forEachChild(node, visit);
-  }
-  visit(source);
-  assert.equal(images.length, 1);
-  const key = images[0].attributes.properties.find(
-    (attr) => attr.name?.getText(source) === "key",
-  );
-  assert.ok(
-    !key || ts.isStringLiteral(key.initializer),
-    "polling must not change the captured img React key",
-  );
-  const start = { point: { x: 10, y: 20 }, x: 10, y: 20, time: 0 };
-  const nextPoint = mod.toPhonePoint(
-    40,
-    50,
-    { left: 0, top: 0, width: 100, height: 200 },
-    100,
-    200,
-  );
   assert.equal(
-    mod.pointerCommand(start, { point: nextPoint, x: 40, y: 50, time: 700 })
+    pointerCommand(start, { point: { x: 4, y: 5 }, x: 20, y: 20, time: 300 })
       .tool,
     "iphone_swipe",
   );
 });
-test("offline custody wait is explicit in the connection panel", async (t) => {
-  const server = await createServer({
-    optimizeDeps: { noDiscovery: true },
-    server: { middlewareMode: true },
-    appType: "custom",
-  });
-  t.after(() => server.close());
-  const { ConnectionPanel } = await server.ssrLoadModule(
-    "/web/components/ConnectionPanel.tsx",
+
+test("iPhone readiness gate, setup labels and prompt input retain current behavior", async (t) => {
+  const page = await pageFor(t);
+  await page.evaluate(() => (fixture.state.daemon.state.state = "needs_trust"));
+  await page.locator("#server-token").fill("explicit-fixture-controller");
+  await page.getByRole("button", { name: "连接 iPhone", exact: true }).click();
+  await page.getByRole("button", { name: "断开连接", exact: true }).waitFor();
+  await page.getByText("WDA 准备中", { exact: true }).first().waitFor();
+  assert.equal(
+    await page
+      .getByRole("button", { name: "主屏幕", exact: true })
+      .isDisabled(),
+    true,
   );
-  const html = renderToStaticMarkup(
-    createElement(ConnectionPanel, {
-      state: {
-        phase: "offline",
-        session: null,
-        cleanupPending: true,
-        warning: "请等待 USB 配对结束，必要时刷新页面。",
-      },
-      supported: true,
-      apiBase: "",
-      onBase: () => {},
-      onConnect: () => {},
-      onDisconnect: () => {},
-    }),
+  await page.getByText("向导已结束", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "重新启动向导", exact: true }).click();
+  await page.locator("#setup-line").fill("explicit-fake-2fa");
+  await page.getByRole("button", { name: "提交", exact: true }).click();
+  assert.equal(await page.locator("#setup-line").inputValue(), "");
+  await page.evaluate(() => (fixture.state.daemon.state.state = "ready"));
+  await page.waitForFunction(
+    () => !document.querySelector(".hardware-buttons button").disabled,
   );
-  assert.match(html, /等待 USB 释放/);
-  assert.match(html, /请等待 USB 配对结束/);
+  const choices = await page.evaluate(() =>
+    fixture.calls.filter((c) => c.choose),
+  );
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].active, true);
+  assert.equal(await page.locator("#server-token").inputValue(), "");
 });
-test("native setup complete state renders the localized finished label", async (t) => {
-  const server = await createServer({
-    optimizeDeps: { noDiscovery: true },
-    server: { middlewareMode: true },
-    appType: "custom",
+
+test("Android ready UI provides back control and excludes Apple setup", async (t) => {
+  const page = await pageFor(t);
+  await connect(page, "android");
+  assert.equal(
+    await page.getByRole("button", { name: "返回", exact: true }).isEnabled(),
+    true,
+  );
+  assert.equal(await page.locator(".setup-transcript").count(), 0);
+  await page.getByRole("button", { name: "返回", exact: true }).click();
+  await page.waitForFunction(() =>
+    fixture.calls.some((c) => c.body?.args?.button === "back"),
+  );
+});
+
+test("recovering task shows the waiting message, uncertain step and usable Stop control", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: "task", instruction: "Inspect fixture screen", state: "recovering", confirmation: null,
+      message: "正在等待 WDA 恢复，最多 120 秒。",
+      steps: [{ id: "step", tool: "iphone_tap", reason: "Inspect fixture target", state: "uncertain" }],
+    };
   });
-  t.after(() => server.close());
-  const { SetupPanel } = await server.ssrLoadModule(
-    "/web/components/SetupPanel.tsx",
+  await page.getByText("正在等待设备恢复", { exact: false }).waitFor();
+  await page.getByText("正在等待 WDA 恢复，最多 120 秒。", { exact: true }).waitFor();
+  assert.equal(await page.locator(".step-state").textContent(), "结果不确定");
+  assert.equal(await page.locator("#task-instruction").isDisabled(), true);
+  await page.getByRole("button", { name: "停止任务", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".task-status")?.textContent.includes("任务已停止"));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith("/stop")).length), 1);
+});
+
+test("model selection, confirmation details and Stop remain independent of held confirm request", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.locator("#task-model").selectOption("fixture/other");
+  await page.locator("#task-instruction").fill("发送前确认");
+  await page.getByRole("button", { name: "开始任务", exact: false }).click();
+  await page.getByText("这一步需要你的确认", { exact: true }).waitFor();
+  assert.equal(await page.locator("#task-model").isDisabled(), true);
+  assert.equal(
+    await page
+      .getByRole("button", { name: "主屏幕", exact: true })
+      .isDisabled(),
+    true,
   );
-  const html = renderToStaticMarkup(
-    createElement(SetupPanel, {
-      setup: { state: "complete", transcript: "", exitCode: 0 },
-      busy: false,
-      onStart: () => {},
-      onInput: () => {},
-    }),
+  assert.match(
+    await page.locator(".confirmation pre").textContent(),
+    /"submit": true/,
   );
-  assert.match(html, /向导已结束/);
-  assert.ok(!html.includes(">complete<"));
+  assert.match(
+    await page.locator('[aria-label="最近一轮耗时"]').textContent(),
+    /观察 0.10 秒.*模型 0.20 秒.*操作 0.30 秒/,
+  );
+  assert.match(
+    await page
+      .locator(".field-hint")
+      .allTextContents()
+      .then((x) => x.join(" ")),
+    /本次任务模型：fixture\/other/,
+  );
+  await page.evaluate(() => (fixture.holdConfirm = true));
+  await page.getByRole("button", { name: "确认这一步", exact: true }).click();
+  await page.waitForFunction(() =>
+    fixture.calls.some((c) => c.url?.endsWith("/confirm")),
+  );
+  assert.equal(
+    await page
+      .getByRole("button", { name: "停止任务", exact: true })
+      .isEnabled(),
+    true,
+  );
+  await page.getByRole("button", { name: "停止任务", exact: true }).click();
+  await page.waitForFunction(() =>
+    document.querySelector(".task-status")?.textContent.includes("任务已停止"),
+  );
+  assert.equal(
+    await page.evaluate(
+      () => fixture.calls.filter((c) => c.url?.endsWith("/stop")).length,
+    ),
+    1,
+  );
+  await page.evaluate(() => fixture.releaseConfirm());
+  await page.waitForTimeout(50);
+  assert.match(await page.locator(".task-status").textContent(), /任务已停止/);
+});
+
+test("screen refresh preserves image pointer capture and text focus while manual input dispatches once", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  const image = page.locator(".phone-screen");
+  await image.waitFor();
+  await page.waitForFunction(
+    () => document.querySelector(".phone-screen")?.naturalWidth === 100,
+  );
+  await image.evaluate((node) => (window.capturedImage = node));
+  const initialSource = await image.getAttribute("src");
+  await page.locator("#phone-text").fill("中文输入");
+  await page.locator("#phone-text").focus();
+  await page.waitForTimeout(2100);
+  assert.equal(
+    await image.evaluate((node) => node === window.capturedImage),
+    true,
+  );
+  assert.notEqual(await image.getAttribute("src"), initialSource);
+  assert.equal(
+    await page
+      .locator("#phone-text")
+      .evaluate((node) => node === document.activeElement),
+    true,
+  );
+  await page.getByRole("button", { name: "输入", exact: true }).click();
+  await page.waitForFunction(() =>
+    fixture.calls.some((c) => c.body?.tool === "iphone_type_text"),
+  );
+  assert.equal(await page.locator("#phone-text").inputValue(), "");
+  assert.equal(
+    await page.evaluate(
+      () =>
+        fixture.calls.filter((c) => c.body?.tool === "iphone_type_text").length,
+    ),
+    1,
+  );
+  await page.waitForFunction(
+    () => !document.querySelector("#phone-text").disabled,
+  );
+  const box = await image.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  assert.notEqual(
+    await page.locator(".screen-meta code").textContent(),
+    "坐标随指针显示",
+  );
+  await page.mouse.down();
+  await page.waitForTimeout(2100);
+  assert.equal(
+    await image.evaluate((node) => node === window.capturedImage),
+    true,
+  );
+  await page.mouse.up();
+  await page.waitForFunction(() =>
+    fixture.calls.some((c) => c.body?.tool === "iphone_long_press"),
+  );
+});
+
+test("cancelled pending pairing shows USB custody wait until the SDK settles", async (t) => {
+  const page = await pageFor(t);
+  await page.evaluate(() => (fixture.holdPair = true));
+  await page.locator("#server-token").fill("explicit-fixture-controller");
+  await page.getByRole("button", { name: "连接 iPhone", exact: true }).click();
+  await page.waitForFunction(() => fixture.pairStarted);
+  await page.getByRole("button", { name: "取消连接", exact: true }).click();
+  await page
+    .getByRole("button", { name: "等待 USB 释放", exact: true })
+    .waitFor();
+  assert.equal(
+    await page
+      .getByRole("button", { name: "等待 USB 释放", exact: true })
+      .isDisabled(),
+    true,
+  );
+  await page.evaluate(() => fixture.releasePair());
+  await page
+    .getByRole("button", { name: "连接 iPhone", exact: true })
+    .waitFor();
+});
+
+test("setup transcript preserves user scroll on status polls and follows actual new output", async (t) => {
+  const page = await pageFor(t);
+  await page.evaluate(
+    () =>
+      (fixture.state.setup.transcript = Array.from(
+        { length: 100 },
+        (_, i) => `line ${i}`,
+      ).join("\n")),
+  );
+  await connect(page);
+  const transcript = page.locator(".setup-transcript");
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".setup-transcript")
+      ?.textContent.includes("line 99"),
+  );
+  await transcript.evaluate((node) => (node.scrollTop = 0));
+  await page.waitForTimeout(1300);
+  assert.equal(
+    await transcript.evaluate((node) => node.scrollTop),
+    0,
+    "unchanged polling must preserve the user's scroll position",
+  );
+  await page.evaluate(
+    () => (fixture.state.setup.transcript += "\nnew fixture output"),
+  );
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".setup-transcript")
+      ?.textContent.includes("new fixture output"),
+  );
+  await page.waitForFunction(() => {
+    const node = document.querySelector(".setup-transcript");
+    return (
+      node.scrollTop > 0 &&
+      Math.abs(node.scrollHeight - node.clientHeight - node.scrollTop) <= 1
+    );
+  });
+});
+
+test("a manual preview from a previous session cannot replace a reconnected same-device screen", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  await page.evaluate(() => (fixture.holdNextPreview = true));
+  await page.getByRole("button", { name: "刷新屏幕", exact: true }).click();
+  await page.waitForFunction(() => fixture.heldPreview);
+  await page.getByRole("button", { name: "断开连接", exact: true }).click();
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  assert.equal(await page.evaluate(() => fixture.state.id), "session-2");
+  await page.evaluate(() => fixture.releasePreview());
+  await page.waitForFunction(
+    () => !document.querySelector("#phone-text").disabled,
+  );
+  assert.equal(
+    await page
+      .locator(".phone-screen")
+      .evaluate((node) => node.src === fixture.staleSource),
+    false,
+  );
+});
+
+test("a delayed command from a previous session cannot start a screenshot request in the new session", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  await page.evaluate(() => (fixture.holdNextCommand = true));
+  await page.getByRole("button", { name: "主屏幕", exact: true }).click();
+  await page.waitForFunction(() => fixture.heldCommand);
+  await page.getByRole("button", { name: "断开连接", exact: true }).click();
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  const countBefore = await page.evaluate(
+    () =>
+      fixture.calls.filter(
+        (c) => c.url?.includes("/session-2/") && c.url.endsWith("/preview"),
+      ).length,
+  );
+  await page.evaluate(() => fixture.releaseCommand());
+  await page.waitForFunction(
+    () => !document.querySelector("#phone-text").disabled,
+  );
+  assert.equal(
+    await page.evaluate(
+      () =>
+        fixture.calls.filter(
+          (c) => c.url?.includes("/session-2/") && c.url.endsWith("/preview"),
+        ).length,
+    ),
+    countBefore,
+  );
+});
+
+
+test("task composer supports selecting, pasting, dropping and removing reference images", async t => {
+  const page = await pageFor(t); await connect(page);
+  const png = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 16; canvas.height = 16;
+    return canvas.toDataURL('image/png').split(',')[1];
+  }), 'base64');
+  await page.getByLabel('添加任务图片').setInputFiles({ name: 'reference.png', mimeType: 'image/png', buffer: png });
+  await page.getByRole('img', { name: 'reference.png', exact: true }).waitFor();
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(document.querySelector('.image-thumbnails img').src.split(',')[1]), c => c.charCodeAt(0))], 'pasted.png', { type: 'image/png' }));
+    document.querySelector('#task-instruction').dispatchEvent(new ClipboardEvent('paste', { bubbles: true, clipboardData: data }));
+  });
+  await page.getByRole('img', { name: 'pasted.png', exact: true }).waitFor();
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(document.querySelector('.image-thumbnails img').src.split(',')[1]), c => c.charCodeAt(0))], 'dropped.png', { type: 'image/png' }));
+    document.querySelector('#task-instruction').dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: data }));
+  });
+  await page.getByRole('img', { name: 'dropped.png', exact: true }).waitFor();
+  await page.getByRole('button', { name: '移除图片' }).last().click();
+  await page.waitForFunction(() => document.querySelectorAll('.image-thumbnails img').length === 2);
+  await page.locator('#task-instruction').fill('Use the supplied pictures');
+  await page.getByRole('button', { name: /开始任务/ }).click();
+  await page.waitForFunction(() => window.fixture.calls.some(c => c.url?.endsWith('/tasks')));
+  const body = await page.evaluate(() => window.fixture.calls.find(c => c.url?.endsWith('/tasks')).body);
+  assert.equal(body.attachments.length, 2);
+  assert.ok(body.attachments.every(id => id.startsWith('image-')));
+});
+
+
+test('MJPEG image renders while task is running and maps native pixels back to phone points', async t => {
+  const page = await pageFor(t);
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 400; canvas.height = 800;
+    canvas.getContext('2d').fillRect(0, 0, 400, 800);
+    return canvas.toDataURL('image/jpeg').split(',')[1];
+  }), 'base64');
+  await page.evaluate(() => {
+    fixture.enableStream = true;
+    fixture.state.daemon.persisted = { screen: { width: 100, height: 200 } };
+    fixture.state.preview = { state: 'streaming', ageMs: 10 };
+  });
+  await connect(page);
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 400);
+  await page.getByText('MJPEG 连续画面', { exact: true }).waitFor();
+  const image = page.locator('.phone-screen');
+  const box = await image.boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(() => fixture.calls.some(c => c.body?.tool === 'iphone_tap'));
+  const tap = await page.evaluate(() => fixture.calls.find(c => c.body?.tool === 'iphone_tap').body);
+  assert.ok(Math.abs(tap.args.x - 50) < 1); assert.ok(Math.abs(tap.args.y - 100) < 1);
+  await page.locator('#task-instruction').fill('Inspect current screen');
+  await page.getByRole('button', { name: /开始任务/ }).click();
+  await page.waitForFunction(() => document.querySelector('.task-status')?.textContent.includes('等待你的确认'));
+  assert.equal(await image.getAttribute('src'), '/api/sessions/session-1/preview/mjpeg/browser-fixture');
+  assert.equal(await image.evaluate(img => img.naturalHeight), 800);
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 800; canvas.height = 400;
+    canvas.getContext('2d').fillRect(0, 0, 800, 400);
+    return canvas.toDataURL('image/jpeg').split(',')[1];
+  }), 'base64');
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 800);
+  await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'), null, { timeout: 4000 });
+
 });
