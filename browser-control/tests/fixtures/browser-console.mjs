@@ -33,9 +33,11 @@ const fixture = (window.fixture = {
     elementsError: "Fixture tree unavailable",
   },
 });
-let releaseConfirm, releasePair;
+let releaseConfirm, releasePair, releasePreview, releaseCommand;
 fixture.releaseConfirm = () => releaseConfirm?.();
 fixture.releasePair = () => releasePair?.();
+fixture.releasePreview = () => releasePreview?.();
+fixture.releaseCommand = () => releaseCommand?.();
 const sdk = {
   requestUSBAccess() {
     fixture.calls.push({
@@ -71,23 +73,52 @@ const fetchImpl = async (url, options = {}) => {
     });
   if (url.endsWith("/api/config")) return reply(fixture.ai);
   if (url.endsWith("/api/sessions") && options.method === "POST") {
+    fixture.sessionCount = (fixture.sessionCount || 0) + 1;
+    fixture.state.id = `session-${fixture.sessionCount}`;
     fixture.state.platform = body.device.platform || "ios";
     fixture.state.deviceId = body.device.serialNumber;
     fixture.image.deviceId = body.device.serialNumber;
     return reply({
-      id: "session",
+      id: fixture.state.id,
       deviceId: body.device.serialNumber,
       token: "explicit-fixture-token",
     });
   }
   if (url.endsWith("/preview")) {
+    if (fixture.holdNextPreview) {
+      fixture.holdNextPreview = false;
+      const stale = document.createElement("canvas");
+      stale.width = 100;
+      stale.height = 200;
+      stale.getContext("2d").fillStyle = "#f00";
+      stale.getContext("2d").fillRect(0, 0, 100, 200);
+      fixture.staleSource = stale.toDataURL("image/jpeg");
+      const held = {
+        ...fixture.image,
+        imageBase64: fixture.staleSource.split(",")[1],
+      };
+      fixture.heldPreview = url;
+      return new Promise(
+        (resolve) => (releasePreview = () => resolve(reply(held))),
+      );
+    }
     fixture.frames = (fixture.frames || 0) + 1;
     canvas.getContext("2d").fillStyle = fixture.frames % 2 ? "#234" : "#567";
     canvas.getContext("2d").fillRect(0, 0, 100, 200);
     fixture.image.imageBase64 = canvas.toDataURL("image/jpeg").split(",")[1];
     return reply(fixture.image);
   }
-  if (url.endsWith("/command")) return reply({ kind: "text", text: "{}" });
+  if (url.endsWith("/command")) {
+    if (fixture.holdNextCommand) {
+      fixture.holdNextCommand = false;
+      fixture.heldCommand = url;
+      return new Promise(
+        (resolve) =>
+          (releaseCommand = () => resolve(reply({ kind: "text", text: "{}" }))),
+      );
+    }
+    return reply({ kind: "text", text: "{}" });
+  }
   if (url.endsWith("/setup/input")) return reply({});
   if (url.endsWith("/setup")) {
     fixture.state.setup.state = "running";

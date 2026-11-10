@@ -93,3 +93,7 @@ idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Keep WASM feature metadata available to wasm-bindgen while removing debug info.
+[profile.release.package.ictl-web]
+strip = "debuginfo"

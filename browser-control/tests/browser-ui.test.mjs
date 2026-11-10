@@ -334,3 +334,97 @@ test("cancelled pending pairing shows USB custody wait until the SDK settles", a
     .getByRole("button", { name: "连接 iPhone", exact: true })
     .waitFor();
 });
+
+test("setup transcript preserves user scroll on status polls and follows actual new output", async (t) => {
+  const page = await pageFor(t);
+  await page.evaluate(
+    () =>
+      (fixture.state.setup.transcript = Array.from(
+        { length: 100 },
+        (_, i) => `line ${i}`,
+      ).join("\n")),
+  );
+  await connect(page);
+  const transcript = page.locator(".setup-transcript");
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".setup-transcript")
+      ?.textContent.includes("line 99"),
+  );
+  await transcript.evaluate((node) => (node.scrollTop = 0));
+  await page.waitForTimeout(1300);
+  assert.equal(
+    await transcript.evaluate((node) => node.scrollTop),
+    0,
+    "unchanged polling must preserve the user's scroll position",
+  );
+  await page.evaluate(
+    () => (fixture.state.setup.transcript += "\nnew fixture output"),
+  );
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".setup-transcript")
+      ?.textContent.includes("new fixture output"),
+  );
+  await page.waitForFunction(() => {
+    const node = document.querySelector(".setup-transcript");
+    return (
+      node.scrollTop > 0 &&
+      Math.abs(node.scrollHeight - node.clientHeight - node.scrollTop) <= 1
+    );
+  });
+});
+
+test("a manual preview from a previous session cannot replace a reconnected same-device screen", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  await page.evaluate(() => (fixture.holdNextPreview = true));
+  await page.getByRole("button", { name: "刷新屏幕", exact: true }).click();
+  await page.waitForFunction(() => fixture.heldPreview);
+  await page.getByRole("button", { name: "断开连接", exact: true }).click();
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  assert.equal(await page.evaluate(() => fixture.state.id), "session-2");
+  await page.evaluate(() => fixture.releasePreview());
+  await page.waitForFunction(
+    () => !document.querySelector("#phone-text").disabled,
+  );
+  assert.equal(
+    await page
+      .locator(".phone-screen")
+      .evaluate((node) => node.src === fixture.staleSource),
+    false,
+  );
+});
+
+test("a delayed command from a previous session cannot start a screenshot request in the new session", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  await page.evaluate(() => (fixture.holdNextCommand = true));
+  await page.getByRole("button", { name: "主屏幕", exact: true }).click();
+  await page.waitForFunction(() => fixture.heldCommand);
+  await page.getByRole("button", { name: "断开连接", exact: true }).click();
+  await connect(page);
+  await page.locator(".phone-screen").waitFor();
+  const countBefore = await page.evaluate(
+    () =>
+      fixture.calls.filter(
+        (c) => c.url?.includes("/session-2/") && c.url.endsWith("/preview"),
+      ).length,
+  );
+  await page.evaluate(() => fixture.releaseCommand());
+  await page.waitForFunction(
+    () => !document.querySelector("#phone-text").disabled,
+  );
+  assert.equal(
+    await page.evaluate(
+      () =>
+        fixture.calls.filter(
+          (c) => c.url?.includes("/session-2/") && c.url.endsWith("/preview"),
+        ).length,
+    ),
+    countBefore,
+  );
+});

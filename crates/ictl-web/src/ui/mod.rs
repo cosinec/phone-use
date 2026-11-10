@@ -77,7 +77,13 @@ impl Ui {
         });
         let _ = call(&self.actions.get_value(), "run", &[action]);
     }
-    pub fn accept_screen(self, screen: JsValue) {
+    fn current_session(self, session_id: &str) -> bool {
+        !session_id.is_empty() && self.state.get_untracked()["session"]["id"] == session_id
+    }
+    pub fn accept_screen(self, session_id: &str, screen: JsValue) {
+        if !self.current_session(session_id) {
+            return;
+        }
         let image = value_from_js(screen);
         if !image.is_null() && image["deviceId"] == self.session()["deviceId"] {
             self.screen.set(image);
@@ -87,9 +93,17 @@ impl Ui {
         if !self.can_control() || self.busy.get_untracked() {
             return;
         }
+        let session_id = string(&self.session(), "id");
         self.run(move |client| {
+            if !self.current_session(&session_id) {
+                return Promise::resolve(&JsValue::UNDEFINED);
+            }
+            let pending = client.command(tool, json(args));
             future_to_promise(async move {
-                let result = resolved(client.command(tool, json(args)).into()).await?;
+                let result = resolved(pending.into()).await?;
+                if !self.current_session(&session_id) {
+                    return Ok(JsValue::UNDEFINED);
+                }
                 if text(&result, "kind") == "error" {
                     return Err(error(if text(&result, "message").is_empty() {
                         "设备操作失败。已经发出的操作不会自动重试。".into()
@@ -97,15 +111,20 @@ impl Ui {
                         text(&result, "message")
                     }));
                 }
-                self.accept_screen(resolved(client.screen().into()).await?);
+                self.accept_screen(&session_id, resolved(client.screen().into()).await?);
                 Ok(JsValue::UNDEFINED)
             })
         });
     }
     pub fn refresh_screen(self) {
+        let session_id = string(&self.session(), "id");
         self.run(move |client| {
+            if !self.current_session(&session_id) {
+                return Promise::resolve(&JsValue::UNDEFINED);
+            }
+            let pending = client.screen();
             future_to_promise(async move {
-                self.accept_screen(resolved(client.screen().into()).await?);
+                self.accept_screen(&session_id, resolved(pending.into()).await?);
                 Ok(JsValue::UNDEFINED)
             })
         });
@@ -243,6 +262,7 @@ fn App(options: JsValue) -> impl IntoView {
             ui.screen.set(Value::Null);
             return;
         }
+        let origin_session = id;
         let stop = start_session_polling(
             ui.client.get_value().into(),
             obj(&[
@@ -252,7 +272,7 @@ fn App(options: JsValue) -> impl IntoView {
                         if image.is_null() {
                             ui.screen.set(Value::Null);
                         } else {
-                            ui.accept_screen(image);
+                            ui.accept_screen(&origin_session, image);
                         }
                         JsValue::UNDEFINED
                     }),

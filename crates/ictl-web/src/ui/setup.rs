@@ -5,8 +5,9 @@ pub(super) fn SetupPanel(ui: Ui) -> impl IntoView {
     let transcript = NodeRef::<leptos::html::Pre>::new();
     let setup = move || ui.session()["setup"].clone();
     let running = move || setup()["state"] == "running";
+    let transcript_text = Memo::new(move |_| string(&setup(), "transcript"));
     Effect::new(move |_| {
-        let _ = setup()["transcript"].clone();
+        let _ = transcript_text.get();
         if let Some(pre) = transcript.get() {
             pre.set_scroll_top(pre.scroll_height());
         }
@@ -41,7 +42,7 @@ pub(super) fn SetupPanel(ui: Ui) -> impl IntoView {
                 aria-live="polite"
             >
                 {move || {
-                    let text = string(&setup(), "transcript");
+                    let text = transcript_text.get();
                     if text.is_empty() {
                         "等待设备连接和原生向导输出…".into()
                     } else {
