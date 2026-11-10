@@ -48,6 +48,7 @@ FROM node:22-trixie-slim AS web-build
 ARG WEB_BASE=/
 WORKDIR /web
 COPY browser-control/package.json browser-control/package-lock.json ./
+COPY browser-control/scripts/patch-device-install.mjs ./scripts/patch-device-install.mjs
 RUN npm ci
 COPY browser-control/ ./
 COPY --from=wasm-build /src/browser-control/pkg/ ./pkg/
