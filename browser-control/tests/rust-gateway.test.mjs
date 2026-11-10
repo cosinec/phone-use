@@ -63,6 +63,152 @@ async function ready(app, session) {
 }
 const contract = (name, fn) => test(name, { skip: !binary }, fn);
 
+async function modelReplyTask(t, respond) {
+  const requests = [];
+  const provider = http.createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    requests.push(JSON.parse(body));
+    const reply = await respond(requests.length);
+    if (!reply) return;
+    res.writeHead(reply.status || 200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(reply.body));
+  });
+  await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
+  t.after(() => { provider.closeAllConnections(); provider.close(); });
+  const app = await harness(t, {
+    LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`,
+    LLM_MODEL: 'fixture-replies', LLM_API_KEY: 'fixture-reply-key',
+  });
+  const session = await app.session();
+  await peer(t, session);
+  await ready(app, session);
+  const route = `/api/sessions/${session.id}`;
+  const response = await app.api(route + '/tasks', session.token, { instruction: 'Inspect the fixture safely' });
+  assert.equal(response.status, 201);
+  const task = await response.json();
+  const snapshot = async () => (await app.api(route, session.token)).json();
+  return { app, session, route, task, requests, snapshot };
+}
+
+function modelCompletion(content, finish_reason = 'stop') {
+  return { body: { choices: [{ finish_reason, message: { content } }] } };
+}
+
+contract('model reply accepts complete JSON fences and text content parts', async t => {
+  const done = JSON.stringify({ type: 'done', message: 'Fixture verified' });
+  for (const [name, content] of [
+    ['JSON fence', '```json\n' + done + '\n```'],
+    ['text parts', [{ type: 'text', text: done.slice(0, 15) }, { type: 'text', text: done.slice(15) }]],
+  ]) {
+    await t.test(name, async t => {
+      const fixture = await modelReplyTask(t, () => modelCompletion(content));
+      let state;
+      await until(async () => {
+        state = await fixture.snapshot();
+        return ['completed', 'failed'].includes(state.task?.state);
+      });
+      assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+      assert.equal(fixture.requests.length, 1);
+    });
+  }
+});
+
+contract('model reply honors optional null parameters accepted by the native command validator', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1
+    ? { type: 'action', tool: 'iphone_swipe', args: { from_x: 1, from_y: 2, to_x: 3, to_y: 4, seconds: null }, reason: 'Fixture swipe' }
+    : { type: 'done', message: 'Fixture verified' })));
+  let state;
+  await until(async () => {
+    state = await fixture.snapshot();
+    return ['completed', 'failed'].includes(state.task?.state);
+  });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(state.task.steps[0].state, 'succeeded');
+});
+
+contract('model reply correction preserves confirmation and executes the corrected action once', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(call === 1
+    ? 'I will inspect the fixture next.'
+    : JSON.stringify(call === 2
+      ? { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Fixture action', requiresConfirmation: true }
+      : { type: 'done', message: 'Fixture verified' })));
+  let state;
+  await until(async () => {
+    state = await fixture.snapshot();
+    return state.task?.state === 'awaiting_confirmation' || state.task?.state === 'failed';
+  });
+  assert.equal(state.task.state, 'awaiting_confirmation', JSON.stringify(state.task));
+  assert.equal(fixture.requests.length, 2);
+  assert.deepEqual(fixture.requests[1].messages.slice(0, 2), fixture.requests[0].messages);
+  assert.match(fixture.requests[1].messages.at(-1).content, /JSON/);
+  const command = { requestId: 'before-confirmation', deviceId: fixture.session.deviceId, tool: 'iphone_status' };
+  const before = await (await fixture.app.api(fixture.route + '/command', fixture.session.token, command)).json();
+  assert.equal(JSON.parse(before.text).taps, 0);
+  await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/confirm`, fixture.session.token, {
+    actionId: state.task.confirmation.actionId, approved: true,
+  });
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed'; });
+  const after = await (await fixture.app.api(fixture.route + '/command', fixture.session.token, {
+    ...command, requestId: 'after-confirmation',
+  })).json();
+  assert.equal(JSON.parse(after.text).taps, 1);
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(fixture.requests.length, 3);
+});
+
+contract('model reply correction is bounded and reports the invalid argument without raw reply text', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_tap', args: { x: 'private-invalid-value', y: 7 }, reason: 'Fixture action',
+  })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(state.task.steps.length, 0);
+  assert.match(state.task.error, /args.*x|Invalid x/);
+  assert.ok(!JSON.stringify(state.task).includes('private-invalid-value'));
+});
+
+contract('model reply marked length is corrected before any device action even when its JSON parses', async t => {
+  const fixture = await modelReplyTask(t, call => call === 1
+    ? modelCompletion(JSON.stringify({ type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Truncated response' }), 'length')
+    : modelCompletion(JSON.stringify({ type: 'done', message: 'No action was required' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.steps.length, 0);
+  assert.equal(fixture.requests.length, 2);
+  assert.ok(fixture.requests[1].max_tokens > fixture.requests[0].max_tokens);
+});
+
+contract('model reply recovery stops on provider failures and explicit refusals', async t => {
+  for (const [name, response, error] of [
+    ['HTTP failure', { status: 403, body: { error: 'private-provider-error' } }, /HTTP 403/],
+    ['refusal', { body: { choices: [{ message: { content: null, refusal: 'private refusal text' } }] } }, /refus|拒绝/i],
+  ]) {
+    await t.test(name, async t => {
+      const fixture = await modelReplyTask(t, () => response);
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+      assert.match(state.task.error, error);
+      assert.equal(fixture.requests.length, 1);
+      assert.equal(state.task.steps.length, 0);
+      assert.ok(!JSON.stringify(state.task).includes('private'));
+    });
+  }
+});
+
+contract('model reply correction is cancelled when the user stops the task', async t => {
+  const fixture = await modelReplyTask(t, call => call === 1 ? modelCompletion('not JSON') : undefined);
+  await until(async () => fixture.requests.length === 2 || (await fixture.snapshot()).task?.state === 'failed');
+  assert.equal(fixture.requests.length, 2);
+  await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/stop`, fixture.session.token, {});
+  const state = await fixture.snapshot();
+  assert.equal(state.task.state, 'stopped');
+  assert.equal(state.task.steps.length, 0);
+});
+
 contract('provider model catalog is cached and each task keeps its own validated model selection', async t => {
   let catalogCalls = 0; const generated = [];
   const provider = http.createServer(async (req, res) => {

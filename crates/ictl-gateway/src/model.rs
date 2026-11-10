@@ -156,46 +156,33 @@ impl Model {
             content.push(image_content(image)?);
         }
         let operation = async {
-            let payload = json!({
-                "model": self.name,
-                "messages": [
-                    {"role": "system", "content": include_str!("model-prompt.txt")},
-                    {"role": "user", "content": content}
-                ],
-                "temperature": 0,
-                "max_tokens": 1024
-            });
-            let mut response = self
-                .client
-                .post(endpoint)
-                .bearer_auth(&self.key)
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|_| ApiError::unavailable("Model provider request failed"))?;
-            if !response.status().is_success() {
-                return Err(ApiError::unavailable(format!(
-                    "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
-                    response.status().as_u16()
-                )));
-            }
-            if response.content_length().is_some_and(|n| n > 65536) {
-                return Err(ApiError::unavailable("Model response too large"));
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) =
-                response.chunk().await.map_err(|_| ApiError::unavailable("Model provider request failed"))?
-            {
-                if bytes.len() + chunk.len() > 65536 {
-                    return Err(ApiError::unavailable("Model response too large"));
+            let mut messages = vec![
+                json!({"role":"system","content":include_str!("model-prompt.txt")}),
+                json!({"role":"user","content":content}),
+            ];
+            let choice = self.completion(&endpoint, &messages, 1024).await?;
+            match decode_reply(&choice) {
+                Ok(action) => Ok(action),
+                Err(error) => {
+                    eprintln!(
+                        "Model reply rejected: model={} attempt=1 reason={error}",
+                        self.name.as_deref().unwrap_or("")
+                    );
+                    // No device action has been dispatched. Re-plan once from the same
+                    // observation, retaining the original task and confirmation rules.
+                    messages.push(json!({"role":"user","content":format!(
+                        "Your previous reply failed validation: {}. Return exactly one complete JSON action or done object using the original schema. Preserve the original task, safety and confirmation requirements. If you cannot proceed, return done with an explanation. Do not include markdown or extra text.",
+                        error.message
+                    )}));
+                    let choice = self.completion(&endpoint, &messages, 2048).await?;
+                    decode_reply(&choice).inspect_err(|error| {
+                        eprintln!(
+                            "Model reply rejected: model={} attempt=2 reason={error}",
+                            self.name.as_deref().unwrap_or("")
+                        );
+                    })
                 }
-                bytes.extend_from_slice(&chunk);
             }
-            let parse = || -> Option<Value> {
-                let envelope: Value = serde_json::from_slice(&bytes).ok()?;
-                serde_json::from_str(envelope["choices"][0]["message"]["content"].as_str()?).ok()
-            };
-            validate_reply(parse().ok_or_else(|| ApiError::unavailable("Invalid model JSON response"))?)
         };
         tokio::select! {
             biased;
@@ -204,6 +191,48 @@ impl Model {
                 result.unwrap_or_else(|_| Err(ApiError::unavailable("Model request timed out")))
             }
         }
+    }
+
+    async fn completion(&self, endpoint: &reqwest::Url, messages: &[Value], max_tokens: u32) -> Result<Value> {
+        let payload = json!({"model":self.name,"messages":messages,"temperature":0,"max_tokens":max_tokens});
+        let mut response = self
+            .client
+            .post(endpoint.clone())
+            .bearer_auth(&self.key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|_| ApiError::unavailable("Model provider request failed"))?;
+        if !response.status().is_success() {
+            return Err(ApiError::unavailable(format!(
+                "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
+                response.status().as_u16()
+            )));
+        }
+        if response.content_length().is_some_and(|n| n > 65536) {
+            return Err(ApiError::unavailable("Model response too large"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) =
+            response.chunk().await.map_err(|_| ApiError::unavailable("Model provider request failed"))?
+        {
+            if bytes.len() + chunk.len() > 65536 {
+                return Err(ApiError::unavailable("Model response too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| ApiError::unavailable("Model provider returned an invalid JSON envelope"))?;
+        let choice = envelope["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .ok_or_else(|| ApiError::unavailable("Model provider response is missing choices[0]"))?;
+        if choice["finish_reason"] == "content_filter"
+            || choice["message"]["refusal"].as_str().is_some_and(|s| !s.is_empty())
+        {
+            return Err(ApiError::unavailable("模型拒绝生成本次操作，请调整任务内容。"));
+        }
+        Ok(choice.clone())
     }
 }
 fn valid_model_id(name: &str) -> bool {
@@ -220,29 +249,79 @@ fn image_content(image: &str) -> Result<Value> {
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
+
+fn invalid_reply(detail: &str) -> ApiError {
+    ApiError::unavailable(format!("Invalid model reply: {detail}"))
+}
+
+fn decode_reply(choice: &Value) -> Result<Value> {
+    if choice["finish_reason"] == "length" {
+        return Err(invalid_reply("response was truncated (finish_reason=length)"));
+    }
+    let content = &choice["message"]["content"];
+    let text = if let Some(text) = content.as_str() {
+        text.to_owned()
+    } else if let Some(parts) = content.as_array() {
+        parts
+            .iter()
+            .map(|part| match part["type"].as_str() {
+                Some("text" | "output_text") => part["text"].as_str(),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| invalid_reply("message.content must contain text parts"))?
+            .join("")
+    } else {
+        return Err(invalid_reply("message.content must be text"));
+    };
+    let text = text.trim().trim_start_matches('\u{feff}').trim();
+    let json = if text.starts_with("```") && text.ends_with("```") && text.len() >= 6 {
+        let (language, json) =
+            text[3..text.len() - 3].split_once('\n').ok_or_else(|| invalid_reply("incomplete JSON code fence"))?;
+        if !language.trim().is_empty() && !language.trim().eq_ignore_ascii_case("json") {
+            return Err(invalid_reply("code fence must contain JSON"));
+        }
+        json.trim()
+    } else {
+        text
+    };
+    let reply = serde_json::from_str(json)
+        .map_err(|error| invalid_reply(&format!("invalid JSON at line {}, column {}", error.line(), error.column())))?;
+    validate_reply(reply)
+}
+
 pub fn validate_reply(mut value: Value) -> Result<Value> {
-    let invalid = || ApiError::unavailable("Invalid model reply");
-    let obj = value.as_object().ok_or_else(invalid)?;
+    let obj = value.as_object().ok_or_else(|| invalid_reply("expected a JSON object"))?;
     if obj.get("type").and_then(Value::as_str) == Some("done") {
-        if obj.keys().any(|k| !["type", "message"].contains(&k.as_str())) || !valid_string(&value["message"], 4000) {
-            return Err(invalid());
+        if obj.keys().any(|k| !["type", "message"].contains(&k.as_str())) {
+            return Err(invalid_reply("done only accepts type and message fields"));
+        }
+        if !valid_string(&value["message"], 4000) {
+            return Err(invalid_reply("message must be nonempty text of at most 4000 characters"));
         }
         return Ok(value);
     }
-    if value["type"] != "action"
-        || obj.keys().any(|k| !["type", "tool", "args", "reason", "requiresConfirmation"].contains(&k.as_str()))
-        || !valid_string(&value["reason"], 2000)
-        || value.get("requiresConfirmation").is_some_and(|v| !v.is_boolean())
-    {
-        return Err(invalid());
+    if value["type"] != "action" {
+        return Err(invalid_reply("type must be action or done"));
     }
-    let tool = value["tool"].as_str().ok_or_else(invalid)?;
+    if obj.keys().any(|k| !["type", "tool", "args", "reason", "requiresConfirmation"].contains(&k.as_str())) {
+        return Err(invalid_reply("action contains unsupported fields"));
+    }
+    if !valid_string(&value["reason"], 2000) {
+        return Err(invalid_reply("reason must be nonempty text of at most 2000 characters"));
+    }
+    if value.get("requiresConfirmation").is_some_and(|v| !v.is_boolean()) {
+        return Err(invalid_reply("requiresConfirmation must be a boolean"));
+    }
+    let tool = value["tool"].as_str().ok_or_else(|| invalid_reply("tool must be text"))?;
     let args = value.get("args").cloned().unwrap_or(json!({}));
-    let args_obj = args.as_object().ok_or_else(invalid)?;
-    if args_obj.values().any(|v| !v.is_string() && !v.is_boolean() && !v.is_number()) {
-        return Err(invalid());
-    }
-    command_request(tool, &args).map_err(|_| invalid())?;
+    command_request(tool, &args).map_err(|error| {
+        if error.message.starts_with("Unknown or unsupported tool") {
+            invalid_reply("tool is not supported")
+        } else {
+            invalid_reply(&format!("args: {}", error.message))
+        }
+    })?;
     value["args"] = args;
     if value.get("requiresConfirmation").is_none() {
         value["requiresConfirmation"] = json!(false);
