@@ -5,7 +5,7 @@ use crate::{
 use base64::Engine;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,6 +19,7 @@ pub struct Model {
     pub name: Option<String>,
     key: String,
     catalog: Arc<Mutex<Catalog>>,
+    format_refused: Arc<Mutex<HashSet<String>>>,
 }
 #[derive(Default)]
 struct Catalog {
@@ -54,7 +55,14 @@ impl Model {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { client, endpoint, name: ready.then_some(name), key, catalog: Arc::default() })
+        Ok(Self {
+            client,
+            endpoint,
+            name: ready.then_some(name),
+            key,
+            catalog: Arc::default(),
+            format_refused: Arc::default(),
+        })
     }
     pub fn ready(&self) -> bool {
         self.endpoint.is_some()
@@ -171,7 +179,7 @@ impl Model {
                     // No device action has been dispatched. Re-plan once from the same
                     // observation, retaining the original task and confirmation rules.
                     messages.push(json!({"role":"user","content":format!(
-                        "Your previous reply failed validation: {}. Return exactly one complete JSON action or done object using the original schema. Preserve the original task, safety and confirmation requirements. If you cannot proceed, return done with an explanation. Do not include markdown or extra text.",
+                        "Your previous reply failed validation: {}. Return exactly one complete JSON action or done object using the response schema. An action must have a string tool name and object args, for example {{\"type\":\"action\",\"tool\":\"iphone_screenshot\",\"args\":{{}},\"reason\":\"Inspect the current screen\",\"requiresConfirmation\":false}}. Choose the actual tool and arguments from the original tool catalog. For completion or inability to proceed, use {{\"type\":\"done\",\"message\":\"Explain the result\"}}. Preserve the original task, safety and confirmation requirements. Do not include markdown or extra text.",
                         error.message
                     )}));
                     let choice = self.completion(&endpoint, &messages, 2048).await?;
@@ -194,46 +202,80 @@ impl Model {
     }
 
     async fn completion(&self, endpoint: &reqwest::Url, messages: &[Value], max_tokens: u32) -> Result<Value> {
-        let payload = json!({"model":self.name,"messages":messages,"temperature":0,"max_tokens":max_tokens});
-        let mut response = self
-            .client
-            .post(endpoint.clone())
-            .bearer_auth(&self.key)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|_| ApiError::unavailable("Model provider request failed"))?;
-        if !response.status().is_success() {
-            return Err(ApiError::unavailable(format!(
-                "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
-                response.status().as_u16()
-            )));
+        // Request the reply shape upstream; command_request still validates every tool and argument locally.
+        let schema: Value = serde_json::from_str(include_str!("model-reply.schema.json"))
+            .map_err(|_| ApiError::unavailable("Invalid model reply schema"))?;
+        let mut payload = json!({"model":self.name,"messages":messages,"temperature":0,"max_tokens":max_tokens,
+            "response_format":{"type":"json_schema","json_schema":{"name":"phone_reply","strict":false,"schema":schema}}});
+        let name = self.name.as_deref().unwrap_or("");
+        if self.format_refused.lock().await.contains(name) {
+            use_prompt_schema(&mut payload);
         }
-        if response.content_length().is_some_and(|n| n > 65536) {
-            return Err(ApiError::unavailable("Model response too large"));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) =
-            response.chunk().await.map_err(|_| ApiError::unavailable("Model provider request failed"))?
-        {
-            if bytes.len() + chunk.len() > 65536 {
+        loop {
+            let mut response = self
+                .client
+                .post(endpoint.clone())
+                .bearer_auth(&self.key)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|_| ApiError::unavailable("Model provider request failed"))?;
+            let status = response.status();
+            let can_fallback = matches!(status.as_u16(), 400 | 422) && payload.get("response_format").is_some();
+            if !status.is_success() && !can_fallback {
+                return Err(ApiError::unavailable(format!(
+                    "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
+                    status.as_u16()
+                )));
+            }
+            if response.content_length().is_some_and(|n| n > 65536) {
                 return Err(ApiError::unavailable("Model response too large"));
             }
-            bytes.extend_from_slice(&chunk);
+            let mut bytes = Vec::new();
+            while let Some(chunk) =
+                response.chunk().await.map_err(|_| ApiError::unavailable("Model provider request failed"))?
+            {
+                if bytes.len() + chunk.len() > 65536 {
+                    return Err(ApiError::unavailable("Model response too large"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if !status.is_success() {
+                let body = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                if body.contains("response_format") || body.contains("json_schema") {
+                    self.format_refused.lock().await.insert(name.to_owned());
+                    use_prompt_schema(&mut payload);
+                    eprintln!("Model structured output refused: model={name}; using schema instructions");
+                    continue;
+                }
+                return Err(ApiError::unavailable(format!(
+                    "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
+                    status.as_u16()
+                )));
+            }
+            let envelope: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::unavailable("Model provider returned an invalid JSON envelope"))?;
+            let choice = envelope["choices"]
+                .as_array()
+                .and_then(|choices| choices.first())
+                .ok_or_else(|| ApiError::unavailable("Model provider response is missing choices[0]"))?;
+            if choice["finish_reason"] == "content_filter"
+                || choice["message"]["refusal"].as_str().is_some_and(|s| !s.is_empty())
+            {
+                return Err(ApiError::unavailable("模型拒绝生成本次操作，请调整任务内容。"));
+            }
+            return Ok(choice.clone());
         }
-        let envelope: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| ApiError::unavailable("Model provider returned an invalid JSON envelope"))?;
-        let choice = envelope["choices"]
-            .as_array()
-            .and_then(|choices| choices.first())
-            .ok_or_else(|| ApiError::unavailable("Model provider response is missing choices[0]"))?;
-        if choice["finish_reason"] == "content_filter"
-            || choice["message"]["refusal"].as_str().is_some_and(|s| !s.is_empty())
-        {
-            return Err(ApiError::unavailable("模型拒绝生成本次操作，请调整任务内容。"));
-        }
-        Ok(choice.clone())
     }
+}
+
+fn use_prompt_schema(payload: &mut Value) {
+    let format = payload.as_object_mut().unwrap().remove("response_format").unwrap();
+    payload["messages"][0]["content"] = json!(format!(
+        "{}\nRespond only with a JSON object matching this schema: {}",
+        payload["messages"][0]["content"].as_str().unwrap(),
+        format["json_schema"]["schema"]
+    ));
 }
 fn valid_model_id(name: &str) -> bool {
     !name.is_empty() && name.len() <= 256 && name.trim() == name && !name.chars().any(char::is_control)

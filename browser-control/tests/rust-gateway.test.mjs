@@ -69,7 +69,7 @@ async function modelReplyTask(t, respond, env = {}) {
     let body = '';
     for await (const chunk of req) body += chunk;
     requests.push(JSON.parse(body));
-    const reply = await respond(requests.length);
+    const reply = await respond(requests.length, requests.at(-1));
     if (!reply) return;
     res.writeHead(reply.status || 200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(reply.body));
@@ -126,6 +126,93 @@ contract('model reply honors optional null parameters accepted by the native com
   assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
   assert.equal(state.task.steps.length, 1);
   assert.equal(state.task.steps[0].state, 'succeeded');
+});
+
+contract('model reply requests a schema requiring a non-null action tool from the provider', async t => {
+  const fixture = await modelReplyTask(t, (_call, request) => modelCompletion(JSON.stringify(
+    request.response_format?.type === 'json_schema'
+      ? { type: 'done', message: 'Structured fixture verified' }
+      : { type: 'action', tool: null, args: {}, reason: 'Malformed fixture action' }
+  )));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  const format = fixture.requests[0].response_format;
+  const action = format.json_schema.schema.anyOf.find(branch => branch.properties.type.enum.includes('action'));
+  assert.equal(format.json_schema.name, 'phone_reply');
+  assert.equal(format.json_schema.strict, false);
+  assert.ok(action.required.includes('tool'));
+  assert.equal(action.properties.tool.type, 'string');
+  assert.equal(action.additionalProperties, false);
+  assert.equal(fixture.requests.length, 1);
+  assert.equal(state.task.steps.length, 0);
+});
+
+contract('model reply corrects missing and non-text tools with the same schema before dispatch', async t => {
+  for (const [name, fields] of [['missing', {}], ['null', { tool: null }], ['object', { tool: { name: 'iphone_tap' } }]]) {
+    await t.test(name, async t => {
+      const fixture = await modelReplyTask(t, (call, request) => modelCompletion(JSON.stringify(
+        call === 1 || !request.response_format
+          ? { type: 'action', ...fields, args: {}, reason: 'Malformed fixture action' }
+          : { type: 'done', message: 'No action needed' }
+      )));
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+      assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+      assert.equal(fixture.requests.length, 2);
+      assert.deepEqual(fixture.requests[1].response_format, fixture.requests[0].response_format);
+      assert.match(fixture.requests[1].messages.at(-1).content, /iphone_screenshot/);
+      assert.equal(state.task.steps.length, 0);
+    });
+  }
+});
+
+contract('model reply schema never bypasses native validation and correction cannot replay earlier actions', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1
+    ? { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Fixture action' }
+    : call === 2
+      ? { type: 'action', tool: null, args: {}, reason: 'Malformed fixture action' }
+      : { type: 'done', message: 'Fixture verified' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(fixture.requests.length, 3);
+  assert.equal((await nativeCounts(fixture)).taps, 1);
+});
+
+contract('model reply schema refusal falls back to schema instructions and remembers the model capability', async t => {
+  const fixture = await modelReplyTask(t, call => call === 1
+    ? { status: 400, body: { error: { message: 'Unsupported response_format json_schema' } } }
+    : modelCompletion(JSON.stringify({ type: 'done', message: 'Fixture verified' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(fixture.requests[1].response_format, undefined);
+  assert.match(fixture.requests[1].messages[0].content, /"required":\["type","tool","args","reason"\]/);
+  await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Inspect the fixture again' });
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed' && fixture.requests.length === 3; });
+  assert.equal(fixture.requests[2].response_format, undefined);
+  assert.equal(state.task.steps.length, 0);
+});
+
+contract('model reply schema fallback is bounded and unrelated provider errors remain fatal', async t => {
+  for (const [name, first, calls, status] of [
+    ['unrelated 400', { status: 400, body: { error: 'private invalid argument' } }, 1, 400],
+    ['unrelated 422', { status: 422, body: { error: 'private invalid request' } }, 1, 422],
+    ['refused format then HTTP failure', { status: 422, body: { error: 'json_schema unsupported' } }, 2, 403],
+  ]) {
+    await t.test(name, async t => {
+      const fixture = await modelReplyTask(t, call => call === 1 ? first : { status: 403, body: { error: 'private HTTP error' } });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+      assert.match(state.task.error, new RegExp(`HTTP ${status}`));
+      assert.equal(fixture.requests.length, calls);
+      assert.equal(state.task.steps.length, 0);
+      assert.ok(!JSON.stringify(state.task).includes('private'));
+    });
+  }
 });
 
 contract('model reply correction preserves confirmation and executes the corrected action once', async t => {
