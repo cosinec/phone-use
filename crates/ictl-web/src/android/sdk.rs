@@ -162,9 +162,108 @@ async fn capture_inner(
         };
         source_bytes = get(&bytes, "length");
     }
-    let result=async{abort_check(&signal)?;let native_width=number(&bitmap,"width");let native_height=number(&bitmap,"height");let scale=(1280.0/native_width.max(native_height)).min(1.0);let width=(native_width*scale).round().max(1.0);let height=(native_height*scale).round().max(1.0);let orientation=if truth(&viewport){get(&viewport,"orientation")}else{JsValue::NULL};let view=obj(&[("width",width.into()),("height",height.into()),("nativeWidth",if truth(&viewport){get(&viewport,"width")}else{native_width.into()}),("nativeHeight",if truth(&viewport){get(&viewport,"height")}else{native_height.into()}),("orientation",orientation.clone())]);let mut source=[0.0,0.0,native_width,native_height];let mut out_width=width;let mut out_height=height;let mut caption=format!("Android full screen {width}x{height}. Coordinates use these screenshot pixels (native {}x{}).",number(&view,"nativeWidth"),number(&view,"nativeHeight"));
-        if truth(&region){if !truth(&previous)||get(&previous,"nativeWidth")!=get(&view,"nativeWidth")||get(&previous,"nativeHeight")!=get(&view,"nativeHeight")||get(&previous,"orientation")!=orientation{return Err(error("Android display changed; take a full screenshot before requesting a region"));}let values=Array::from(&region);let(x,y,w,h)=(values.get(0).as_f64().unwrap_or(f64::NAN),values.get(1).as_f64().unwrap_or(f64::NAN),values.get(2).as_f64().unwrap_or(f64::NAN),values.get(3).as_f64().unwrap_or(f64::NAN));if ![x,y,w,h].iter().all(|v|v.is_finite())||x<0.0||y<0.0||w<=0.0||h<=0.0||x+w>number(&previous,"width")||y+h>number(&previous,"height"){return Err(error("Screenshot region outside Android screen"));}source=[x*native_width/number(&previous,"width"),y*native_height/number(&previous,"height"),w*native_width/number(&previous,"width"),h*native_height/number(&previous,"height")];out_width=w.round();out_height=h.round();if out_width==0.0||out_height==0.0{return Err(error("Screenshot region too small"));}caption=format!("Android crop at x={x}, y={y}, width={w}, height={h} in full screenshot {}x{}. Add this origin to crop pixel coordinates.",number(&previous,"width"),number(&previous,"height"));}
-        let canvas=ctor("OffscreenCanvas",&[out_width.into(),out_height.into()])?;let context=call(&canvas,"getContext",&["2d".into()])?;if !truth(&context){return Err(error("Screenshot canvas unavailable"));}let mut args=vec![bitmap.clone()];args.extend(source.map(JsValue::from_f64));args.extend([0.into(),0.into(),out_width.into(),out_height.into()]);call(&context,"drawImage",&args)?;let mut jpeg=JsValue::UNDEFINED;for quality in [0.78,0.65,0.5,0.35]{jpeg=invoke(&canvas,"convertToBlob",&[obj(&[("type","image/jpeg".into()),("quality",quality.into())])]).await?;if number(&jpeg,"size")<=480.0*1024.0{break;}}if number(&jpeg,"size")>480.0*1024.0{return Err(error("Android screenshot exceeds relay limit"));}let data=Uint8Array::new(&invoke(&jpeg,"arrayBuffer",&[]).await?).to_vec();let binary=data.iter().map(|b|char::from(*b)).collect::<String>();let encoded=global_call("btoa",&[binary.into()])?;Ok(obj(&[("imageBase64",encoded),("caption",caption.into()),("view",view),("sourceBytes",source_bytes),("sourceFormat",source_format.into()),("uploadedBytes",get(&jpeg,"size"))]))}.await;
+    let result = async {
+        abort_check(&signal)?;
+        let native_width = number(&bitmap, "width");
+        let native_height = number(&bitmap, "height");
+        let scale = (1280.0 / native_width.max(native_height)).min(1.0);
+        let width = (native_width * scale).round().max(1.0);
+        let height = (native_height * scale).round().max(1.0);
+        let orientation = if truth(&viewport) {
+            get(&viewport, "orientation")
+        } else {
+            JsValue::NULL
+        };
+        let view = obj(&[
+            ("width", width.into()),
+            ("height", height.into()),
+            ("nativeWidth", if truth(&viewport) { get(&viewport, "width") } else { native_width.into() }),
+            ("nativeHeight", if truth(&viewport) { get(&viewport, "height") } else { native_height.into() }),
+            ("orientation", orientation.clone()),
+        ]);
+        let mut source = [0.0, 0.0, native_width, native_height];
+        let mut out_width = width;
+        let mut out_height = height;
+        let mut caption = format!(
+            "Android full screen {width}x{height}. Coordinates use these screenshot pixels (native {}x{}).",
+            number(&view, "nativeWidth"),
+            number(&view, "nativeHeight")
+        );
+        if truth(&region) {
+            if !truth(&previous)
+                || get(&previous, "nativeWidth") != get(&view, "nativeWidth")
+                || get(&previous, "nativeHeight") != get(&view, "nativeHeight")
+                || get(&previous, "orientation") != orientation
+            {
+                return Err(error("Android display changed; take a full screenshot before requesting a region"));
+            }
+            let values = Array::from(&region);
+            let x = values.get(0).as_f64().unwrap_or(f64::NAN);
+            let y = values.get(1).as_f64().unwrap_or(f64::NAN);
+            let w = values.get(2).as_f64().unwrap_or(f64::NAN);
+            let h = values.get(3).as_f64().unwrap_or(f64::NAN);
+            if ![x, y, w, h].iter().all(|value| value.is_finite())
+                || x < 0.0
+                || y < 0.0
+                || w <= 0.0
+                || h <= 0.0
+                || x + w > number(&previous, "width")
+                || y + h > number(&previous, "height")
+            {
+                return Err(error("Screenshot region outside Android screen"));
+            }
+            source = [
+                x * native_width / number(&previous, "width"),
+                y * native_height / number(&previous, "height"),
+                w * native_width / number(&previous, "width"),
+                h * native_height / number(&previous, "height"),
+            ];
+            out_width = w.round();
+            out_height = h.round();
+            if out_width == 0.0 || out_height == 0.0 {
+                return Err(error("Screenshot region too small"));
+            }
+            caption = format!(
+                "Android crop at x={x}, y={y}, width={w}, height={h} in full screenshot {}x{}. Add this origin to crop pixel coordinates.",
+                number(&previous, "width"),
+                number(&previous, "height")
+            );
+        }
+        let canvas = ctor("OffscreenCanvas", &[out_width.into(), out_height.into()])?;
+        let context = call(&canvas, "getContext", &["2d".into()])?;
+        if !truth(&context) {
+            return Err(error("Screenshot canvas unavailable"));
+        }
+        let mut args = vec![bitmap.clone()];
+        args.extend(source.map(JsValue::from_f64));
+        args.extend([0.into(), 0.into(), out_width.into(), out_height.into()]);
+        call(&context, "drawImage", &args)?;
+        let mut jpeg = JsValue::UNDEFINED;
+        for quality in [0.78, 0.65, 0.5, 0.35] {
+            jpeg = invoke(
+                &canvas,
+                "convertToBlob",
+                &[obj(&[("type", "image/jpeg".into()), ("quality", quality.into())])]
+            ).await?;
+            if number(&jpeg, "size") <= 480.0 * 1024.0 {
+                break;
+            }
+        }
+        if number(&jpeg, "size") > 480.0 * 1024.0 {
+            return Err(error("Android screenshot exceeds relay limit"));
+        }
+        let data = Uint8Array::new(&invoke(&jpeg, "arrayBuffer", &[]).await?).to_vec();
+        let binary = data.iter().map(|byte| char::from(*byte)).collect::<String>();
+        let encoded = global_call("btoa", &[binary.into()])?;
+        Ok(obj(&[
+            ("imageBase64", encoded),
+            ("caption", caption.into()),
+            ("view", view),
+            ("sourceBytes", source_bytes),
+            ("sourceFormat", source_format.into()),
+            ("uploadedBytes", get(&jpeg, "size")),
+        ]))
+    }.await;
     let _ = call(&bitmap, "close", &[]);
     result
 }

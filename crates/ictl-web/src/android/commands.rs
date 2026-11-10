@@ -562,7 +562,11 @@ impl AndroidCommands {
                 if !Regex::new(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$").unwrap().is_match(&app) {
                     return Err(error("Use an installed Android package ID from list_apps"));
                 }
-                let resolved=self.shell_command(format!("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER {}",quote(app.into())),&signal,Some(5000.0)).await?;
+                let resolve_command = format!(
+                    "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER {}",
+                    quote(app.into())
+                );
+                let resolved = self.shell_command(resolve_command, &signal, Some(5000.0)).await?;
                 let resolved = resolved.as_string().unwrap_or_default();
                 let component = resolved.trim().lines().last().unwrap_or("");
                 if !Regex::new(r"^[\w.$]+/[\w.$]+$").unwrap().is_match(component) {
@@ -584,7 +588,9 @@ impl AndroidCommands {
             }
             "open_url" => {
                 let url = text(&request, "url");
-                if !["http:", "https:", "tel:", "sms:", "mailto:"].iter().any(|prefix| url.starts_with(prefix)) {
+                let scheme = url.split_once(':').map(|(scheme, _)| scheme.to_ascii_lowercase());
+                if !scheme.as_deref().is_some_and(|scheme| ["http", "https", "tel", "sms", "mailto"].contains(&scheme))
+                {
                     return Err(error("Unsupported URL scheme"));
                 }
                 let result = self

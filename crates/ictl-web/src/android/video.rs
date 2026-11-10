@@ -280,10 +280,13 @@ impl AndroidVideoCapture {
         let weak = Rc::downgrade(&capture.inner);
         let draw_canvas = canvas.clone();
         let draw = callback(move |frame| {
-            let _ = call(&context, "drawImage", &[frame, 0.into(), 0.into()]);
+            let result = call(&context, "drawImage", &[frame, 0.into(), 0.into()]);
             if let Some(inner) = weak.upgrade() {
                 let mailbox = inner.borrow().mailbox.clone();
-                mailbox.publish(draw_canvas.clone());
+                match result {
+                    Ok(_) => mailbox.publish(draw_canvas.clone()),
+                    Err(error) => mailbox.fail(error),
+                }
             }
             JsValue::UNDEFINED
         });
