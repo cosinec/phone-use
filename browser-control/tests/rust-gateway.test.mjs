@@ -17,8 +17,8 @@ const device = { serialNumber: '00008110-001234567890001E', vendorId: 1452, prod
 const origin = 'http://localhost:5173';
 const token = 'rust-contract-controller';
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-async function until(check) {
-  for (let i = 0; i < 250; i++) { if (await check()) return; await pause(20); }
+async function until(check, attempts = 250) {
+  for (let i = 0; i < attempts; i++) { if (await check()) return; await pause(20); }
   throw new Error('condition timed out');
 }
 async function harness(t, env = {}, fileEnv = {}) {
@@ -94,6 +94,141 @@ async function modelReplyTask(t, respond, env = {}) {
 function modelCompletion(content, finish_reason = 'stop') {
   return { body: { choices: [{ finish_reason, message: { content } }] } };
 }
+
+contract('WDA recovery waits for readiness and a fresh observation without replaying an uncertain tap', async t => {
+  for (const interrupted of [false, true]) {
+    await t.test(interrupted ? 'interrupted native response' : 'native WDA timeout', async t => {
+      const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1
+        ? { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen' }
+        : { type: 'done', message: 'Fresh screen verified' })), {
+        FIXTURE_TAP_WDA_FAILURES: '1', FIXTURE_WDA_RECOVERY_MS: '600',
+        FIXTURE_RECOVERY_OBSERVATION_FAILURES: '1', ...(interrupted ? { FIXTURE_TAP_INTERRUPTED: '1' } : {}),
+      });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return ['recovering', 'failed'].includes(state.task?.state); });
+      assert.equal(state.task.state, 'recovering', JSON.stringify(state.task));
+      assert.equal(state.task.steps[0].state, 'uncertain');
+      assert.equal(state.task.recovery.maxWaitSeconds, 120);
+      await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); }, 600);
+      assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+      assert.equal(state.task.steps.length, 1);
+      assert.equal(state.task.steps[0].state, 'uncertain');
+      assert.equal(fixture.requests.length, 2);
+      const context = JSON.parse(fixture.requests[1].messages[1].content[0].text);
+      assert.equal(context.recentHistory[0].state, 'uncertain');
+      assert.equal(context.observation.caption, 'fixture fresh screen after action');
+      const counters = JSON.parse(context.observation.elementsText);
+      assert.equal(counters.taps, 1);
+      assert.ok(counters.counts.screenshot >= 3);
+    });
+  }
+});
+
+contract('WDA recovery is cancelled promptly by stop or device disconnection', async t => {
+  for (const disconnect of [false, true]) {
+    await t.test(disconnect ? 'device disconnect' : 'user stop', async t => {
+      const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+        type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen',
+      })), { FIXTURE_TAP_WDA_FAILURES: '1', FIXTURE_WDA_RECOVERY_MS: '300000' });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return ['recovering', 'failed'].includes(state.task?.state); });
+      assert.equal(state.task.state, 'recovering', JSON.stringify(state.task));
+      if (disconnect) {
+        assert.equal((await fixture.app.api(fixture.route, fixture.session.token, undefined, {}, 'DELETE')).status, 200);
+      } else {
+        const stopped = await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/stop`, fixture.session.token, {});
+        assert.equal((await stopped.json()).state, 'stopped');
+        await pause(2200);
+        assert.equal((await fixture.snapshot()).task.state, 'stopped');
+      }
+      assert.equal(fixture.requests.length, 1);
+    });
+  }
+});
+
+contract('WDA recovery preserves unrelated failures and uncertain confirmed actions', async t => {
+  for (const confirmed of [false, true]) {
+    await t.test(confirmed ? 'confirmed action needs manual outcome check' : 'unrelated error remains fatal', async t => {
+      const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+        type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen', requiresConfirmation: confirmed,
+      })), { FIXTURE_TAP_WDA_FAILURES: '1', ...(confirmed ? {} : { FIXTURE_TAP_ERROR: 'Fixture validation failure' }) });
+      if (confirmed) {
+        let waiting;
+        await until(async () => { waiting = await fixture.snapshot(); return waiting.task?.state === 'awaiting_confirmation'; });
+        await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/confirm`, fixture.session.token, {
+          actionId: waiting.task.confirmation.actionId, approved: true,
+        });
+      }
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+      assert.equal(state.task.steps[0].state, confirmed ? 'uncertain' : 'failed');
+      assert.equal(fixture.requests.length, 1);
+      assert.match(state.task.error, confirmed ? /结果不确定|uncertain/i : /Fixture validation failure/);
+    });
+  }
+});
+
+contract('WDA recovery has a two-episode task limit while retaining uncertain steps', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_tap', args: { x: call, y: 7 }, reason: 'Inspect a different fixture target',
+  })), { FIXTURE_TAP_WDA_FAILURES: '3' });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.equal(state.task.steps.length, 3);
+  assert.ok(state.task.steps.every(step => step.state === 'uncertain'));
+  assert.match(state.task.error, /恢复次数|recovery limit/i);
+  assert.equal(fixture.requests.length, 3);
+});
+
+contract('WDA recovery rejects a fresh observation from a different device', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen',
+  })), { FIXTURE_TAP_WDA_FAILURES: '1', FIXTURE_RECOVERY_FOREIGN_OBSERVATION: '1' });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.match(state.task.error, /identity/);
+  assert.equal(state.task.steps[0].state, 'uncertain');
+  assert.equal(fixture.requests.length, 1);
+});
+
+contract('WDA recovery handles an unavailable initial observation before calling the model', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'done', message: 'Fresh fixture observed' })), {
+    FIXTURE_INITIAL_OBSERVATION_WDA_FAILURES: '1',
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.steps.length, 0);
+  assert.equal(state.task.recovery.attempt, 1);
+  assert.equal(fixture.requests.length, 1);
+});
+
+contract('WDA recovery requires checking uncertain text input before continuing', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_type_text', args: { text: 'fixture text' }, reason: 'Fill fixture input',
+  })), { FIXTURE_TAP_WDA_FAILURES: '1', FIXTURE_TYPE_TEXT_ERROR: 'WDA 请求超时（请求已发出，手机可能仍在执行，先截图确认）：WDA request timed out' });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.equal(state.task.steps[0].state, 'uncertain');
+  assert.match(state.task.error, /结果不确定/);
+  assert.equal(fixture.requests.length, 1);
+});
+
+contract('WDA recovery ends after the actual 120-second deadline', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen',
+  })), { FIXTURE_TAP_WDA_FAILURES: '1', FIXTURE_WDA_RECOVERY_MS: '300000' });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['recovering', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'recovering');
+  await pause(119000);
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.match(state.task.error, /120/);
+  assert.equal(state.task.steps[0].state, 'uncertain');
+  assert.ok(state.task.recovery.elapsedMs >= 120000);
+  assert.ok(state.task.recovery.elapsedMs < 125000);
+  assert.equal(fixture.requests.length, 1);
+});
 
 contract('model reply accepts complete JSON fences and text content parts', async t => {
   const done = JSON.stringify({ type: 'done', message: 'Fixture verified' });

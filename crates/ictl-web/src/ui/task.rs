@@ -21,6 +21,7 @@ fn state_label(state: &str) -> String {
         "thinking" => "正在规划下一步",
         "awaiting_confirmation" => "等待你的确认",
         "executing" => "正在操作",
+        "recovering" => "正在等待设备恢复",
         "completed" => "任务已完成",
         "failed" => "任务失败",
         "stopped" => "任务已停止",

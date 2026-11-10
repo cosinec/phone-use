@@ -115,7 +115,10 @@ fn id() -> String {
 fn equal(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
-fn native_error(_: anyhow::Error) -> ApiError {
+fn native_error(error: anyhow::Error) -> ApiError {
+    if crate::error::recoverable_wda_error(&error.to_string()) {
+        return ApiError::unavailable("Device response unavailable; action result is uncertain");
+    }
     ApiError::unavailable("Native operation failed; sent actions are not retried")
 }
 async fn private_dir(path: &std::path::Path) -> anyhow::Result<()> {
@@ -482,6 +485,9 @@ impl Session {
             let response =
                 native(json!({"op":"observe","limit":80,"snapshot_timeout_ms":1000})).await.map_err(native_error)?;
             if response["kind"] != "text" {
+                if crate::error::recoverable_wda_error(response["message"].as_str().unwrap_or("")) {
+                    return Err(ApiError::unavailable("WDA observation unavailable"));
+                }
                 return Err(ApiError::unavailable("Observation unavailable"));
             }
             let value: Value = serde_json::from_str(response["text"].as_str().unwrap_or(""))

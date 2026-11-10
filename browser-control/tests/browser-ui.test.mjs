@@ -209,6 +209,25 @@ test("Android ready UI provides back control and excludes Apple setup", async (t
   );
 });
 
+test("recovering task shows the waiting message, uncertain step and usable Stop control", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: "task", instruction: "Inspect fixture screen", state: "recovering", confirmation: null,
+      message: "正在等待 WDA 恢复，最多 120 秒。",
+      steps: [{ id: "step", tool: "iphone_tap", reason: "Inspect fixture target", state: "uncertain" }],
+    };
+  });
+  await page.getByText("正在等待设备恢复", { exact: false }).waitFor();
+  await page.getByText("正在等待 WDA 恢复，最多 120 秒。", { exact: true }).waitFor();
+  assert.equal(await page.locator(".step-state").textContent(), "结果不确定");
+  assert.equal(await page.locator("#task-instruction").isDisabled(), true);
+  await page.getByRole("button", { name: "停止任务", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".task-status")?.textContent.includes("任务已停止"));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith("/stop")).length), 1);
+});
+
 test("model selection, confirmation details and Stop remain independent of held confirm request", async (t) => {
   const page = await pageFor(t);
   await connect(page);

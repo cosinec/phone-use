@@ -22,6 +22,9 @@ if (process.argv[2] === 'descendant') {
 } else if (process.argv[2] === 'daemon') {
   let taps = 0;
   let typeRequests = 0;
+  let wdaUnavailableUntil = 0;
+  let recoveryObservationFailures = Number(process.env.FIXTURE_RECOVERY_OBSERVATION_FAILURES || 0);
+  let initialObservationFailures = Number(process.env.FIXTURE_INITIAL_OBSERVATION_WDA_FAILURES || 0);
   const counts = { screenshot: 0, list_elements: 0 };
   const sockets = new Set();
   const server = net.createServer(socket => {
@@ -41,10 +44,22 @@ if (process.argv[2] === 'descendant') {
       const elementDelay = Number(process.env.FIXTURE_ELEMENTS_DELAY_MS || 0);
       const budget = request.snapshot_timeout_ms ?? 1000;
       const typingError = process.env.FIXTURE_TYPE_TEXT_ERROR || (!taps && process.env.FIXTURE_TYPE_TEXT_NEEDS_FOCUS);
-      const response = request.op === 'type_text' && typingError
+      const tapFailure = request.op === 'tap' && taps <= Number(process.env.FIXTURE_TAP_WDA_FAILURES || 0);
+      const initialObservationFailure = request.op === 'observe' && initialObservationFailures > 0;
+      if (initialObservationFailure) initialObservationFailures--;
+      if (tapFailure) wdaUnavailableUntil = Date.now() + Number(process.env.FIXTURE_WDA_RECOVERY_MS || 0);
+      if (tapFailure && process.env.FIXTURE_TAP_INTERRUPTED) { socket.end(); return; }
+      const recovering = Date.now() < wdaUnavailableUntil;
+      const observationFailure = request.op === 'observe' && taps > 0 && (recovering || recoveryObservationFailures > 0);
+      if (observationFailure && !recovering) recoveryObservationFailures--;
+      const response = tapFailure || observationFailure || initialObservationFailure
+        ? { kind: 'error', message: process.env.FIXTURE_TAP_ERROR || 'WDA request timed out (it was sent, the phone may still be carrying it out; take a screenshot first): WDA request timed out' }
+        : request.op === 'daemon' && (process.env.FIXTURE_TAP_WDA_FAILURES || process.env.FIXTURE_INITIAL_OBSERVATION_WDA_FAILURES)
+        ? { kind: 'text', text: JSON.stringify({ state: { state: recovering ? 'wda_starting' : 'ready' } }) }
+        : request.op === 'type_text' && typingError
         ? { kind: 'error', message: typingError }
         : request.op === 'observe'
-        ? { kind: 'text', text: JSON.stringify({ deviceId: process.env.IPHONE_UDID, imageBase64: 'aW1hZ2U=', caption: 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
+        ? { kind: 'text', text: JSON.stringify({ deviceId: taps && process.env.FIXTURE_RECOVERY_FOREIGN_OBSERVATION ? 'different-device' : process.env.IPHONE_UDID, imageBase64: 'aW1hZ2U=', caption: taps ? 'fixture fresh screen after action' : 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request, taps, counts }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
         : request.op === 'screenshot'
         ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }
         : request.op === 'list_apps' ? { kind: 'text', text: 'Fixture App: com.example.fixture' }
