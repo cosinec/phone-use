@@ -63,7 +63,7 @@ async function ready(app, session) {
 }
 const contract = (name, fn) => test(name, { skip: !binary }, fn);
 
-async function modelReplyTask(t, respond) {
+async function modelReplyTask(t, respond, env = {}) {
   const requests = [];
   const provider = http.createServer(async (req, res) => {
     let body = '';
@@ -78,7 +78,7 @@ async function modelReplyTask(t, respond) {
   t.after(() => { provider.closeAllConnections(); provider.close(); });
   const app = await harness(t, {
     LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`,
-    LLM_MODEL: 'fixture-replies', LLM_API_KEY: 'fixture-reply-key',
+    LLM_MODEL: 'fixture-replies', LLM_API_KEY: 'fixture-reply-key', ...env,
   });
   const session = await app.session();
   await peer(t, session);
@@ -207,6 +207,20 @@ contract('model reply correction is cancelled when the user stops the task', asy
   const state = await fixture.snapshot();
   assert.equal(state.task.state, 'stopped');
   assert.equal(state.task.steps.length, 0);
+});
+
+contract('native action failure exposes its bounded cause and never retries typing', async t => {
+  const reason = 'No keyboard on screen; tap a text field first. ' + 'detail '.repeat(500);
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_type_text', args: { text: 'fixture draft', submit: false }, reason: 'Enter the draft',
+  })), { FIXTURE_TYPE_TEXT_ERROR: reason });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.match(state.task.error, /No keyboard on screen/);
+  assert.ok(state.task.error.length < 2200);
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(state.task.steps[0].state, 'failed');
+  assert.equal(fixture.requests.length, 1);
 });
 
 contract('provider model catalog is cached and each task keeps its own validated model selection', async t => {

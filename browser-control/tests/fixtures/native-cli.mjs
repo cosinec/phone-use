@@ -38,7 +38,9 @@ if (process.argv[2] === 'descendant') {
       if (request.op === 'tap' && request.x === 999) return;
       const elementDelay = Number(process.env.FIXTURE_ELEMENTS_DELAY_MS || 0);
       const budget = request.snapshot_timeout_ms ?? 1000;
-      const response = request.op === 'observe'
+      const response = request.op === 'type_text' && process.env.FIXTURE_TYPE_TEXT_ERROR
+        ? { kind: 'error', message: process.env.FIXTURE_TYPE_TEXT_ERROR }
+        : request.op === 'observe'
         ? { kind: 'text', text: JSON.stringify({ deviceId: process.env.IPHONE_UDID, imageBase64: 'aW1hZ2U=', caption: 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
         : request.op === 'screenshot'
         ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }

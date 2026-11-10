@@ -315,7 +315,12 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             })
             .await?;
         if failed {
-            return Err(ApiError::unavailable("Native action failed"));
+            let cause = result["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+                .map(|message| message.chars().take(2000).collect::<String>())
+                .unwrap_or_else(|| "Native action failed".into());
+            return Err(ApiError::unavailable(cause));
         }
         if missed {
             return Err(ApiError::new(409, "Element tap missed; task halted"));
