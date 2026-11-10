@@ -63,13 +63,13 @@ async function ready(app, session) {
 }
 const contract = (name, fn) => test(name, { skip: !binary }, fn);
 
-async function modelReplyTask(t, respond) {
+async function modelReplyTask(t, respond, env = {}) {
   const requests = [];
   const provider = http.createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
     requests.push(JSON.parse(body));
-    const reply = await respond(requests.length);
+    const reply = await respond(requests.length, requests.at(-1));
     if (!reply) return;
     res.writeHead(reply.status || 200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(reply.body));
@@ -78,7 +78,7 @@ async function modelReplyTask(t, respond) {
   t.after(() => { provider.closeAllConnections(); provider.close(); });
   const app = await harness(t, {
     LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`,
-    LLM_MODEL: 'fixture-replies', LLM_API_KEY: 'fixture-reply-key',
+    LLM_MODEL: 'fixture-replies', LLM_API_KEY: 'fixture-reply-key', ...env,
   });
   const session = await app.session();
   await peer(t, session);
@@ -126,6 +126,93 @@ contract('model reply honors optional null parameters accepted by the native com
   assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
   assert.equal(state.task.steps.length, 1);
   assert.equal(state.task.steps[0].state, 'succeeded');
+});
+
+contract('model reply requests a schema requiring a non-null action tool from the provider', async t => {
+  const fixture = await modelReplyTask(t, (_call, request) => modelCompletion(JSON.stringify(
+    request.response_format?.type === 'json_schema'
+      ? { type: 'done', message: 'Structured fixture verified' }
+      : { type: 'action', tool: null, args: {}, reason: 'Malformed fixture action' }
+  )));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  const format = fixture.requests[0].response_format;
+  const action = format.json_schema.schema.anyOf.find(branch => branch.properties.type.enum.includes('action'));
+  assert.equal(format.json_schema.name, 'phone_reply');
+  assert.equal(format.json_schema.strict, false);
+  assert.ok(action.required.includes('tool'));
+  assert.equal(action.properties.tool.type, 'string');
+  assert.equal(action.additionalProperties, false);
+  assert.equal(fixture.requests.length, 1);
+  assert.equal(state.task.steps.length, 0);
+});
+
+contract('model reply corrects missing and non-text tools with the same schema before dispatch', async t => {
+  for (const [name, fields] of [['missing', {}], ['null', { tool: null }], ['object', { tool: { name: 'iphone_tap' } }]]) {
+    await t.test(name, async t => {
+      const fixture = await modelReplyTask(t, (call, request) => modelCompletion(JSON.stringify(
+        call === 1 || !request.response_format
+          ? { type: 'action', ...fields, args: {}, reason: 'Malformed fixture action' }
+          : { type: 'done', message: 'No action needed' }
+      )));
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+      assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+      assert.equal(fixture.requests.length, 2);
+      assert.deepEqual(fixture.requests[1].response_format, fixture.requests[0].response_format);
+      assert.match(fixture.requests[1].messages.at(-1).content, /iphone_screenshot/);
+      assert.equal(state.task.steps.length, 0);
+    });
+  }
+});
+
+contract('model reply schema never bypasses native validation and correction cannot replay earlier actions', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1
+    ? { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Fixture action' }
+    : call === 2
+      ? { type: 'action', tool: null, args: {}, reason: 'Malformed fixture action' }
+      : { type: 'done', message: 'Fixture verified' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(fixture.requests.length, 3);
+  assert.equal((await nativeCounts(fixture)).taps, 1);
+});
+
+contract('model reply schema refusal falls back to schema instructions and remembers the model capability', async t => {
+  const fixture = await modelReplyTask(t, call => call === 1
+    ? { status: 400, body: { error: { message: 'Unsupported response_format json_schema' } } }
+    : modelCompletion(JSON.stringify({ type: 'done', message: 'Fixture verified' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(fixture.requests[1].response_format, undefined);
+  assert.match(fixture.requests[1].messages[0].content, /"required":\["type","tool","args","reason"\]/);
+  await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Inspect the fixture again' });
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed' && fixture.requests.length === 3; });
+  assert.equal(fixture.requests[2].response_format, undefined);
+  assert.equal(state.task.steps.length, 0);
+});
+
+contract('model reply schema fallback is bounded and unrelated provider errors remain fatal', async t => {
+  for (const [name, first, calls, status] of [
+    ['unrelated 400', { status: 400, body: { error: 'private invalid argument' } }, 1, 400],
+    ['unrelated 422', { status: 422, body: { error: 'private invalid request' } }, 1, 422],
+    ['refused format then HTTP failure', { status: 422, body: { error: 'json_schema unsupported' } }, 2, 403],
+  ]) {
+    await t.test(name, async t => {
+      const fixture = await modelReplyTask(t, call => call === 1 ? first : { status: 403, body: { error: 'private HTTP error' } });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+      assert.match(state.task.error, new RegExp(`HTTP ${status}`));
+      assert.equal(fixture.requests.length, calls);
+      assert.equal(state.task.steps.length, 0);
+      assert.ok(!JSON.stringify(state.task).includes('private'));
+    });
+  }
 });
 
 contract('model reply correction preserves confirmation and executes the corrected action once', async t => {
@@ -207,6 +294,85 @@ contract('model reply correction is cancelled when the user stops the task', asy
   const state = await fixture.snapshot();
   assert.equal(state.task.state, 'stopped');
   assert.equal(state.task.steps.length, 0);
+});
+
+contract('native action failure exposes its bounded cause and never retries typing', async t => {
+  const reason = 'No keyboard on screen; tap a text field first. ' + 'detail '.repeat(500);
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({
+    type: 'action', tool: 'iphone_type_text', args: { text: 'fixture draft', submit: false }, reason: 'Enter the draft',
+  })), { FIXTURE_TYPE_TEXT_ERROR: reason });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.match(state.task.error, /No keyboard on screen/);
+  assert.ok(state.task.error.length < 2200);
+  assert.equal(state.task.steps.length, 1);
+  assert.equal(state.task.steps[0].state, 'failed');
+  assert.equal(fixture.requests.length, 1);
+});
+
+const missingKeyboard = 'No keyboard on screen (no text field has focus), nothing typed; tap a text field first and check with a screenshot that the keyboard is up';
+const typeDraft = { type: 'action', tool: 'iphone_type_text', args: { text: 'fixture draft', submit: false }, reason: 'Enter the draft' };
+const focusField = { type: 'action', tool: 'iphone_tap', args: { x: 20, y: 50 }, reason: 'Focus the draft field' };
+async function nativeCounts(fixture) {
+  const response = await fixture.app.api(fixture.route + '/command', fixture.session.token, {
+    requestId: 'typing-counts', deviceId: fixture.session.deviceId, tool: 'iphone_status',
+  });
+  return JSON.parse((await response.json()).text);
+}
+contract('typing focus recovers only after a fresh observation and a focus tap', async t => {
+  for (const reason of [missingKeyboard, '屏幕上没有键盘(没有输入框获得焦点),什么都没输;先点一下输入框,截图确认键盘出来了再输入']) {
+    await t.test(reason.startsWith('No') ? 'English' : 'Chinese', async t => {
+      const actions = [typeDraft, focusField, typeDraft, { type: 'done', message: 'Draft entered' }];
+      const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(actions[n - 1])), {
+        FIXTURE_TYPE_TEXT_NEEDS_FOCUS: reason,
+      });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed'; });
+      assert.deepEqual(state.task.steps.map(step => step.state), ['failed', 'succeeded', 'succeeded']);
+      const input = JSON.parse(fixture.requests[1].messages[1].content[0].text);
+      assert.equal(input.recentHistory[0].result.message, reason);
+      assert.ok(fixture.requests[1].messages[1].content.some(part => part.type === 'image_url'));
+      const counts = await nativeCounts(fixture);
+      assert.equal(counts.typeRequests, 2);
+      assert.equal(counts.taps, 1);
+      assert.equal(counts.counts.screenshot, 4);
+    });
+  }
+});
+contract('typing focus rejects a blind second typing action before dispatch', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify(typeDraft)), {
+    FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(state.task.steps.length, 1);
+  assert.equal((await nativeCounts(fixture)).typeRequests, 1);
+  assert.match(state.task.error, /focus/i);
+});
+contract('typing focus stops after one unsuccessful focus recovery', async t => {
+  const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(n === 2 ? focusField : typeDraft)), {
+    FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed' && state.task.steps.length === 3; });
+  assert.equal(fixture.requests.length, 3);
+  assert.equal(state.task.error, missingKeyboard);
+  assert.equal((await nativeCounts(fixture)).typeRequests, 2);
+});
+contract('typing focus cannot report completion while the failed input is unresolved', async t => {
+  for (const tapped of [false, true]) {
+    await t.test(tapped ? 'after focus tap' : 'before focus tap', async t => {
+      const actions = [typeDraft, ...(tapped ? [focusField] : []), { type: 'done', message: 'Draft entered' }];
+      const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(actions[n - 1])), {
+        FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
+      });
+      let state;
+      await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
+      assert.equal(fixture.requests.length, actions.length);
+      assert.equal((await nativeCounts(fixture)).typeRequests, 1);
+    });
+  }
 });
 
 contract('provider model catalog is cached and each task keeps its own validated model selection', async t => {

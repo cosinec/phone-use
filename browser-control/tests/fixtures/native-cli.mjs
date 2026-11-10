@@ -21,6 +21,7 @@ if (process.argv[2] === 'descendant') {
   input.once('line', () => { process.stdout.write('Input received; setup complete\n'); input.close(); process.exit(0); });
 } else if (process.argv[2] === 'daemon') {
   let taps = 0;
+  let typeRequests = 0;
   const counts = { screenshot: 0, list_elements: 0 };
   const sockets = new Set();
   const server = net.createServer(socket => {
@@ -35,15 +36,19 @@ if (process.argv[2] === 'descendant') {
       if (request.op in counts) counts[request.op]++;
       if (request.op === 'observe') { counts.screenshot++; counts.list_elements++; }
       if (request.op === 'tap') taps++;
+      if (request.op === 'type_text') typeRequests++;
       if (request.op === 'tap' && request.x === 999) return;
       const elementDelay = Number(process.env.FIXTURE_ELEMENTS_DELAY_MS || 0);
       const budget = request.snapshot_timeout_ms ?? 1000;
-      const response = request.op === 'observe'
+      const typingError = process.env.FIXTURE_TYPE_TEXT_ERROR || (!taps && process.env.FIXTURE_TYPE_TEXT_NEEDS_FOCUS);
+      const response = request.op === 'type_text' && typingError
+        ? { kind: 'error', message: typingError }
+        : request.op === 'observe'
         ? { kind: 'text', text: JSON.stringify({ deviceId: process.env.IPHONE_UDID, imageBase64: 'aW1hZ2U=', caption: 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
         : request.op === 'screenshot'
         ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }
         : request.op === 'list_apps' ? { kind: 'text', text: 'Fixture App: com.example.fixture' }
-        : { kind: 'text', text: JSON.stringify({ request, taps, counts, env: {
+        : { kind: 'text', text: JSON.stringify({ request, taps, counts, typeRequests, env: {
           ICTL_ANISETTE_URL: process.env.ICTL_ANISETTE_URL, IPHONE_UDID: process.env.IPHONE_UDID, ICTL_SOCKET: process.env.ICTL_SOCKET,
           ICTL_DATA_DIR: process.env.ICTL_DATA_DIR, ICTL_MANAGE_USBMUXD: process.env.ICTL_MANAGE_USBMUXD,
           USBMUXD_SOCKET_ADDRESS: process.env.USBMUXD_SOCKET_ADDRESS,

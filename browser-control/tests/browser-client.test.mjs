@@ -136,6 +136,15 @@ test("pair failure closes USB and deletes session with visible claim error", asy
   assert.ok(calls.some((c) => c[0] === "usb.close"));
   assert.ok(calls.some((c) => c[2]?.method === "DELETE"));
 });
+test("active signing owner explains how to release the original session and closes local USB", async () => {
+  const { client, calls } = fixture({
+    fetchImpl: async () => ({ ok: false, status: 409, json: async () => ({ error: 'Native signing state has an active owner' }) }),
+  });
+  await assert.rejects(client.connect({ apiBase: 'http://cloud', accessToken: 'token' }), /另一个会话.*断开连接/);
+  assert.match(client.snapshot().error, /原工作台/);
+  assert.ok(calls.some(call => call[0] === 'usb.close'));
+  assert.equal(calls.filter(call => call[0] === 'pair').length, 0);
+});
 test("cancel chooser closes its late target without creating session", async () => {
   const chooser = deferred();
   const { client, calls } = fixture({

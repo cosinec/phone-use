@@ -348,13 +348,17 @@ impl BrowserClient {
     }
     fn safe_error(&self, value: &JsValue, attempt: &Rc<RefCell<Attempt>>) -> String {
         let a = attempt.borrow();
-        let mut m = message(value);
+        let mut safe_message = message(value);
+        if safe_message == "Native signing state has an active owner" {
+            safe_message =
+                "设备已被另一个会话占用。请回到原工作台点击“断开连接”，或关闭重复页面，等待释放后重连。".into();
+        }
         for secret in [&a.access_token, &text(&a.session, "token")] {
             if !secret.is_empty() {
-                m = m.replace(secret, "[已隐藏]");
+                safe_message = safe_message.replace(secret, "[已隐藏]");
             }
         }
-        m.chars().take(1600).collect()
+        safe_message.chars().take(1600).collect()
     }
     async fn request(
         &self,
