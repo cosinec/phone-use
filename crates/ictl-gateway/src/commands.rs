@@ -85,7 +85,7 @@ pub fn command_request(tool: &str, args: &Value) -> Result<Value> {
         }
         "iphone_press_button" => {
             let button = a.string("button", None, 10000)?;
-            if !["home", "volume_up", "volume_down", "lock"].contains(&button.as_str()) {
+            if !["home", "back", "volume_up", "volume_down", "lock"].contains(&button.as_str()) {
                 return Err(ApiError::new(400, "Invalid button"));
             }
             json!({"op":"press_button","button":button})

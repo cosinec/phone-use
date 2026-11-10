@@ -266,6 +266,27 @@ async fn read_packet(socket: &mut TcpStream) -> Result<(Value, u32)> {
     Ok((Value::from_reader(Cursor::new(body))?, tag))
 }
 
+/// Connect to the one device owned by this virtual mux. Never accepts a host from an API request.
+pub(crate) async fn connect_port(address: &str, port: u16) -> Result<TcpStream> {
+    let mut socket = TcpStream::connect(address).await?;
+    send(
+        &mut socket,
+        dict([
+            ("MessageType", string("Connect")),
+            ("DeviceID", integer(1)),
+            ("PortNumber", integer(port.swap_bytes() as u64)),
+        ]),
+        1,
+    )
+    .await?;
+    let (reply, tag) = read_packet(&mut socket).await?;
+    anyhow::ensure!(
+        tag == 1 && reply.as_dictionary().and_then(|v| number(v, "Number")) == Some(0),
+        "Device refused preview connection"
+    );
+    Ok(socket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,7 +311,13 @@ mod tests {
         let (outbound, _) = mpsc::channel(8);
         let relay = Relay::new(outbound, CancellationToken::new());
         let (pair_sender, _) = mpsc::channel(8);
-        let device = Device { serial_number: "a".repeat(40), vendor_id: 1452, product_id: 4776, product_name: None };
+        let device = Device {
+            platform: crate::identity::Platform::Ios,
+            serial_number: "a".repeat(40),
+            vendor_id: 1452,
+            product_id: 4776,
+            product_name: None,
+        };
         let mux = VirtualMux::start(device.clone(), None, relay, pair_sender, CancellationToken::new()).await.unwrap();
         let mut socket = TcpStream::connect(mux.address()).await.unwrap();
         send(&mut socket, dict([("MessageType", string("ListDevices"))]), 7).await.unwrap();
