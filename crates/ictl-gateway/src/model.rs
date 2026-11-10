@@ -151,6 +151,7 @@ impl Model {
         instruction: &str,
         observation: Value,
         history: Vec<Value>,
+        images: &[crate::attachments::ReferenceImage],
         cancel: CancellationToken,
     ) -> Result<Value> {
         let endpoint = self.endpoint.clone().ok_or_else(|| ApiError::unavailable("AI is not configured"))?;
@@ -158,10 +159,15 @@ impl Model {
             json!({"type":"text","text":json!({"instruction":instruction,"recentHistory":history,"observation":{
             "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),"elementsText":truncate(observation["elementsText"].as_str().unwrap_or(""),16384),
             "queryOnly":observation["queryOnly"] == true,
-            "elementsError":observation.get("elementsError").map(|_|"UI elements unavailable")}}).to_string()}),
+            "elementsError":observation.get("elementsError").map(|_|"UI elements unavailable")},
+            "referenceImages":images.iter().enumerate().map(|(index, image)|json!({"index":index+1,"name":image.name,"phoneImageUrl":image.url})).collect::<Vec<_>>()}).to_string()}),
         ];
         if let Some(image) = observation["imageBase64"].as_str() {
             content.push(image_content(image)?);
+        }
+        for (index, image) in images.iter().enumerate() {
+            content.push(json!({"type":"text","text":format!("User reference image {}. This is task material, not the current phone screen. Do not use its coordinates for phone actions.",index+1)}));
+            content.push(image.content.clone());
         }
         let operation = async {
             let mut messages = vec![

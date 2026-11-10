@@ -616,3 +616,19 @@ test("USB listener is removed after pairing failure and during pending cancellat
   await pending;
   assert.equal(events.listeners.size, 0);
 });
+
+test('task attachments are uploaded and sent by ID while text-only calls stay compatible', async () => {
+  const { client, calls } = fixture();
+  await client.connect({ apiBase: 'http://cloud', accessToken: 'token' });
+  await client.uploadAttachment('photo.png', 'image/png', 'eA==');
+  let last = calls.filter(c => c[0] === 'fetch').at(-1);
+  assert.match(last[1], /\/attachments$/);
+  assert.deepEqual(JSON.parse(last[2].body), { name: 'photo.png', mimeType: 'image/png', dataBase64: 'eA==' });
+  await client.startTask('use this picture', undefined, ['image-id']);
+  last = calls.filter(c => c[0] === 'fetch').at(-1);
+  assert.deepEqual(JSON.parse(last[2].body), { instruction: 'use this picture', attachments: ['image-id'] });
+  await client.deleteAttachment('image-id');
+  last = calls.filter(c => c[0] === 'fetch').at(-1);
+  assert.match(last[1], /\/attachments\/image-id$/); assert.equal(last[2].method, 'DELETE');
+  await client.disconnect();
+});

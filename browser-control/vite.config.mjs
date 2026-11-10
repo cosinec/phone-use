@@ -1,16 +1,25 @@
 import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
 export default defineConfig({
-  plugins: [react(), {
-    name: "android-third-party-notices",
-    async generateBundle() {
-      const { readFile } = await import("node:fs/promises");
-      for (const filename of ["LICENSE", "NOTICE", "TANGO-LICENSE"]) this.emitFile({
-        type: "asset", fileName: filename === "TANGO-LICENSE" ? "licenses/tango-MIT.txt" : `licenses/scrcpy-${filename}.txt`,
-        source: await readFile(new URL(`./web/android/vendor/${filename}`, import.meta.url), "utf8"),
-      });
+  plugins: [
+    {
+      name: "android-third-party-notices",
+      async generateBundle() {
+        const { readFile } = await import("node:fs/promises");
+        for (const filename of ["LICENSE", "NOTICE", "TANGO-LICENSE"])
+          this.emitFile({
+            type: "asset",
+            fileName:
+              filename === "TANGO-LICENSE"
+                ? "licenses/tango-MIT.txt"
+                : `licenses/scrcpy-${filename}.txt`,
+            source: await readFile(
+              new URL(`./web/android/vendor/${filename}`, import.meta.url),
+              "utf8",
+            ),
+          });
+      },
     },
-  }],
+  ],
   server: {
     port: 5173,
     strictPort: true,
@@ -20,5 +29,5 @@ export default defineConfig({
       "/ios": { target: "ws://127.0.0.1:8787", ws: true },
     },
   },
-  build: { outDir: "dist" },
+  build: { outDir: "dist", target: "es2022" },
 });

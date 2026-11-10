@@ -250,3 +250,48 @@ test("Android hardware buttons use the persistent control channel and release a 
   await assert.rejects(adapter.execute({op:'press_button',button:'back'},cancel.signal));
   assert.deepEqual(keys.map(key=>[key.action,key.keyCode]),[[0,4],[1,4]]);
 });
+
+test('failed video canvas draws never become fresh device observations', async (t) => {
+  const wasm = (await import('../web/wasm.mjs')).default;
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'OffscreenCanvas');
+  Object.defineProperty(globalThis, 'OffscreenCanvas', {
+    configurable: true,
+    value: class {
+      constructor(width, height) { this.width = width; this.height = height; }
+      getContext() { return {drawImage() { throw new Error('closed decoder frame'); }}; }
+    },
+  });
+  t.after(() => {
+    if (previous) Object.defineProperty(globalThis, 'OffscreenCanvas', previous);
+    else delete globalThis.OffscreenCanvas;
+  });
+  let renderer;
+  const capture = new wasm.AndroidVideoCapture({
+    signal: signal(),
+    controller: {},
+    readViewport: async () => ({width: 100, height: 200, orientation: 0}),
+    video: {metadata: {codec: 0}, stream: new ReadableStream()},
+    decoderFactory(options) {
+      renderer = options.renderer;
+      return {writable: new WritableStream(), dispose() {}};
+    },
+    streamFactory: sink => new WritableStream(sink),
+  });
+  t.after(() => capture.close());
+  renderer.draw({});
+  assert.equal(capture.mailbox.sequence, 0);
+  assert.equal(capture.mailbox.latest, null);
+  assert.match(capture.mailbox.error.message, /closed decoder frame/);
+  await assert.rejects(capture.ready(signal()), /closed decoder frame/);
+});
+
+test('Android URL schemes are case insensitive while preserving the original shell argument', async () => {
+  const commands = [];
+  const {adapter} = fixture({shell: async command => { commands.push(command); return 'Status: ok'; }});
+  await adapter.execute({op: 'open_url', url: 'HTTPS://Example.com/CaseSensitive?Key=Value'}, signal());
+  assert.equal(commands[0], "am start -W -a android.intent.action.VIEW -d 'HTTPS://Example.com/CaseSensitive?Key=Value'");
+  await adapter.execute({op: 'open_url', url: 'MAILTO:Test@Example.com'}, signal());
+  assert.equal(commands[1], "am start -W -a android.intent.action.VIEW -d 'MAILTO:Test@Example.com'");
+  await assert.rejects(adapter.execute({op: 'open_url', url: 'JAVASCRIPT:alert(1)'}, signal()), /Unsupported URL scheme/);
+  assert.equal(commands.length, 2);
+});

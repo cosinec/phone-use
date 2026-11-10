@@ -102,6 +102,9 @@ pub struct Session {
     jobs: mpsc::Sender<Job>,
     latest_screen: Mutex<Option<CapturedScreen>>,
     preview_lock: Mutex<()>,
+    mjpeg: crate::mjpeg::Preview,
+    preview_ticket: String,
+    attachments: crate::attachments::Attachments,
     close_lock: Mutex<bool>,
     pub tasks: TaskManager,
 }
@@ -112,7 +115,10 @@ fn id() -> String {
 fn equal(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
-fn native_error(_: anyhow::Error) -> ApiError {
+fn native_error(error: anyhow::Error) -> ApiError {
+    if crate::error::recoverable_wda_error(&error.to_string()) {
+        return ApiError::unavailable("Device response unavailable; action result is uncertain");
+    }
     ApiError::unavailable("Native operation failed; sent actions are not retried")
 }
 async fn private_dir(path: &std::path::Path) -> anyhow::Result<()> {
@@ -246,12 +252,15 @@ impl Gateway {
             mux: Mutex::new(None),
             relay: OnceCell::new(),
             pair: Mutex::new(pair),
+            attachments: crate::attachments::Attachments::new(socket_dir.clone()),
             socket_dir,
             data_dir: self.config.runtime.join("data").join(&namespace),
             commands: Mutex::new(Commands::default()),
             jobs,
             latest_screen: Mutex::new(None),
             preview_lock: Mutex::new(()),
+            mjpeg: crate::mjpeg::Preview::default(),
+            preview_ticket: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
             close_lock: Mutex::new(false),
             tasks: TaskManager::new(),
         });
@@ -476,6 +485,9 @@ impl Session {
             let response =
                 native(json!({"op":"observe","limit":80,"snapshot_timeout_ms":1000})).await.map_err(native_error)?;
             if response["kind"] != "text" {
+                if crate::error::recoverable_wda_error(response["message"].as_str().unwrap_or("")) {
+                    return Err(ApiError::unavailable("WDA observation unavailable"));
+                }
                 return Err(ApiError::unavailable("Observation unavailable"));
             }
             let value: Value = serde_json::from_str(response["text"].as_str().unwrap_or(""))
@@ -531,7 +543,8 @@ impl Session {
             "ready": native["ready"],
             "daemon": daemon,
             "setup": native["setup"],
-            "task": self.tasks.snapshot().await
+            "task": self.tasks.snapshot().await,
+            "preview": self.mjpeg.status().await
         })
     }
     async fn hello(self: &Arc<Self>, frame: Frame, outbound: mpsc::Sender<Frame>) -> anyhow::Result<()> {
@@ -724,7 +737,10 @@ impl Session {
 }
 
 async fn body(request: Request<Body>) -> Result<Value> {
-    let bytes = tokio::time::timeout(Duration::from_secs(15), to_bytes(request.into_body(), MAX_PAYLOAD))
+    body_with_limit(request, MAX_PAYLOAD).await
+}
+async fn body_with_limit(request: Request<Body>, limit: usize) -> Result<Value> {
+    let bytes = tokio::time::timeout(Duration::from_secs(15), to_bytes(request.into_body(), limit))
         .await
         .map_err(|_| ApiError::new(408, "Request body timeout"))?
         .map_err(|_| ApiError::new(413, "Request body too large"))?;
@@ -843,11 +859,65 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         .get(parts[2])
         .cloned()
         .ok_or_else(|| ApiError::new(404, "Session not found"))?;
-    if s.cancel.is_cancelled() || !equal(&token, &s.token) {
+    let route = &parts[3..];
+    if let (&Method::GET, ["media", key]) = (&method, route) {
+        if s.cancel.is_cancelled() {
+            return Err(ApiError::new(410, "Session closed"));
+        }
+        return s.attachments.serve(key).await;
+    }
+    let preview_access =
+        method == Method::GET && matches!(route, ["preview", "mjpeg", ticket] if equal(ticket, &s.preview_ticket));
+    if s.cancel.is_cancelled() || (!preview_access && !equal(&token, &s.token)) {
         return Err(ApiError::new(401, "Authentication required"));
     }
-    let route = &parts[3..];
     match (method, route) {
+        (Method::POST, ["attachments"]) => {
+            if s.tasks.active().await {
+                return Err(ApiError::new(409, "任务运行中，请结束后再修改附件"));
+            }
+            let input = body_with_limit(request, crate::attachments::MAX_UPLOAD_BODY).await?;
+            Ok(reply(201, s.attachments.add(input).await?))
+        }
+        (Method::DELETE, ["attachments", attachment]) => {
+            if s.tasks.active().await {
+                return Err(ApiError::new(409, "任务运行中，请结束后再修改附件"));
+            }
+            s.attachments.delete(attachment).await?;
+            Ok(reply(200, json!({"deleted":true})))
+        }
+        (Method::GET, ["preview", "stream"]) => {
+            if s.device.platform != Platform::Ios {
+                return Err(ApiError::new(400, "MJPEG preview requires iPhone"));
+            }
+            s.ready().await?;
+            Ok(reply(200, json!({"url":format!("/api/sessions/{}/preview/mjpeg/{}", s.id, s.preview_ticket)})))
+        }
+        (Method::GET, ["preview", "mjpeg", _]) => {
+            if !preview_access {
+                return Err(ApiError::new(401, "Authentication required"));
+            }
+            s.ready().await?;
+            let address = s
+                .mux
+                .lock()
+                .await
+                .as_ref()
+                .map(VirtualMux::address)
+                .ok_or_else(|| ApiError::new(409, "Device relay is not ready"))?;
+            let mut receiver = s.mjpeg.subscribe(address, s.cancel.clone()).await;
+            let first = tokio::select! {
+                biased;
+                _ = s.cancel.cancelled() => return Err(ApiError::new(410, "Session closed")),
+                result = tokio::time::timeout(Duration::from_secs(15), receiver.wait_for(|frame| frame.is_some())) => result,
+            };
+            if !matches!(first, Ok(Ok(_))) {
+                return Err(ApiError::unavailable("MJPEG unavailable; use screenshot preview"));
+            }
+            drop(first);
+            receiver.mark_changed();
+            Ok(crate::mjpeg::response(receiver, s.cancel.clone()))
+        }
         (Method::GET, []) => Ok(reply(200, s.snapshot().await)),
         (Method::DELETE, []) => {
             s.close().await;
@@ -876,13 +946,18 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             Ok(reply(200, json!({"accepted":true})))
         }
         (Method::POST, ["tasks"]) => {
+            let base = g.config.public_url.as_ref().map(|u| u.origin().ascii_serialization()).unwrap_or_else(|| {
+                format!("http://{}", request.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1"))
+            });
             let input = body(request).await?;
-            if input.as_object().unwrap().keys().any(|k| !["instruction", "model"].contains(&k.as_str())) {
+            if input.as_object().unwrap().keys().any(|k| !["instruction", "model", "attachments"].contains(&k.as_str()))
+            {
                 return Err(ApiError::new(400, "Invalid task request"));
             }
             let model = g.model.select(input.get("model")).await?;
+            let images = s.attachments.references(input.get("attachments"), &base, &s.id).await?;
             s.ready().await?;
-            Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model).await?))
+            Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model, images).await?))
         }
         (Method::POST, ["tasks", task, "stop"]) => {
             if !body(request).await?.as_object().unwrap().is_empty() {

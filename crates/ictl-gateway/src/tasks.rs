@@ -1,6 +1,6 @@
 use crate::{
     commands::command_request,
-    error::{ApiError, Result},
+    error::{ApiError, Result, recoverable_observation_error, recoverable_wda_error},
     gateway::Session,
     model::{Model, validate_reply},
 };
@@ -11,6 +11,10 @@ use std::{
 };
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
+
+const RECOVERY_WAIT: Duration = Duration::from_secs(120);
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_RECOVERIES: u32 = 2;
 
 struct Task {
     snapshot: Value,
@@ -41,7 +45,13 @@ impl TaskManager {
     pub async fn active(&self) -> bool {
         self.task.lock().await.as_ref().is_some_and(|t| !terminal(&t.snapshot["state"]))
     }
-    pub async fn start(&self, session: Arc<Session>, instruction: &str, model: Model) -> Result<Value> {
+    pub async fn start(
+        &self,
+        session: Arc<Session>,
+        instruction: &str,
+        model: Model,
+        images: Vec<crate::attachments::ReferenceImage>,
+    ) -> Result<Value> {
         if instruction.trim().is_empty() || instruction.chars().count() > 4000 || instruction.contains('\0') {
             return Err(ApiError::new(400, "Invalid task instruction"));
         }
@@ -56,7 +66,8 @@ impl TaskManager {
         let cancel = session.cancel.child_token();
         let snapshot = json!({
             "id": id, "instruction": instruction.trim(), "model": model.name, "state": "observing", "steps": [],
-            "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {}
+            "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
+            "attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100
         });
         *guard = Some(Task { snapshot: snapshot.clone(), cancel: cancel.clone(), confirmation: None });
         drop(guard);
@@ -64,8 +75,8 @@ impl TaskManager {
             tokio::select! {biased;
                 _=session.cancel.cancelled()=>session.tasks.finish(&id,"stopped",Some("Session disconnected. Already sent actions cannot be undone.".into()),None).await,
                 _=cancel.cancelled()=>{},
-                _=tokio::time::sleep(Duration::from_secs(360))=>session.tasks.finish(&id,"failed",None,Some("Task time limit reached".into())).await,
-                result=run(session.clone(),&id,model,cancel.clone())=>match result{
+                _=tokio::time::sleep(Duration::from_secs(1800))=>session.tasks.finish(&id,"failed",None,Some("任务已达到 30 分钟时限".into())).await,
+                result=run(session.clone(),&id,model,images,cancel.clone())=>match result{
                     Ok(message)=>session.tasks.finish(&id,"completed",Some(message),None).await,
                     Err(error)=>session.tasks.finish(&id,"failed",None,Some(error.message)).await,
                 }
@@ -172,27 +183,107 @@ fn confirmation_required(action: &Value, request: &Value) -> bool {
                 action["args"]["text"].as_str().unwrap_or("")
             )))
 }
-async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken) -> Result<String> {
+
+async fn recover_observation(s: &Session, id: &str, episode: u32, cancel: CancellationToken) -> Result<Value> {
+    if episode > MAX_RECOVERIES {
+        return Err(ApiError::unavailable("任务已达到 2 次恢复次数上限，请检查设备后重新开始。"));
+    }
+    s.tasks
+        .update(id, |task| {
+            task.snapshot["state"] = json!("recovering");
+            task.snapshot["message"] =
+                json!("正在等待 WDA 恢复，最多 120 秒。恢复后会重新查看屏幕，核对上一步的结果。");
+            task.snapshot["recovery"] = json!({
+                "attempt":episode,"maxAttempts":MAX_RECOVERIES,"maxWaitSeconds":RECOVERY_WAIT.as_secs(),
+                "startedAt":now(),"finishedAt":null,"elapsedMs":0
+            });
+        })
+        .await?;
+    let started = Instant::now();
+    let recovering = async {
+        loop {
+            let attempt = cancel.child_token();
+            // Cancel queued observations too if the recovery deadline drops this future.
+            let _guard = attempt.clone().drop_guard();
+            let controller =
+                s.controller.get().ok_or_else(|| ApiError::unavailable("Native control transport is not ready"))?;
+            let daemon = controller.request(json!({"op":"daemon"}), Duration::from_secs(3), attempt.clone()).await;
+            let ready = daemon
+                .ok()
+                .filter(|response| response["kind"] == "text")
+                .and_then(|response| serde_json::from_str::<Value>(response["text"].as_str()?).ok())
+                .is_some_and(|state| state["state"]["state"] == "ready");
+            if ready {
+                match s.screen(attempt).await {
+                    Ok(observation) => return Ok(observation),
+                    Err(error) if recoverable_observation_error(&error.message) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            s.tasks
+                .update(id, |task| {
+                    task.snapshot["recovery"]["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+                })
+                .await?;
+            tokio::time::sleep(RECOVERY_INTERVAL).await;
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ApiError::new(409,"Task cancelled")),
+        result = tokio::time::timeout(RECOVERY_WAIT, recovering) => result.unwrap_or_else(|_| {
+            Err(ApiError::unavailable("等待 WDA 恢复已超过 120 秒，任务已停止。请检查手机连接和 WDA 状态。"))
+        }),
+    };
+    s.tasks
+        .update(id, |task| {
+            task.snapshot["recovery"]["finishedAt"] = json!(now());
+            task.snapshot["recovery"]["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+            task.snapshot["message"] = Value::Null;
+        })
+        .await?;
+    result
+}
+
+async fn run(
+    s: Arc<Session>,
+    id: &str,
+    model: Model,
+    images: Vec<crate::attachments::ReferenceImage>,
+    cancel: CancellationToken,
+) -> Result<String> {
     // Keep bounded tool content private to the inference loop, out of polled UI snapshots.
     let mut history: Vec<Value> = Vec::new();
     let mut next_observation: Option<Value> = None;
     let mut focus_recoveries = 0;
     let mut typing_blocked = false;
     let mut input_pending = false;
+    let mut recoveries = 0;
     loop {
         let snapshot = s.tasks.update(id, |t| t.snapshot["state"] = json!("observing")).await?;
         let observing = Instant::now();
-        let direct = if history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
-            direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
-        } else {
-            None
-        };
+        let direct =
+            if images.is_empty() && history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
+                direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
+            } else {
+                None
+            };
         let observation = if direct.is_some() {
             json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"})
         } else if let Some(observation) = next_observation.take() {
             observation
         } else {
-            s.screen(cancel.clone()).await?
+            match s.screen(cancel.clone()).await {
+                Ok(observation) => observation,
+                Err(error)
+                    if s.device.platform == crate::identity::Platform::Ios
+                        && recoverable_observation_error(&error.message) =>
+                {
+                    recoveries += 1;
+                    recover_observation(&s, id, recoveries, cancel.clone()).await?
+                }
+                Err(error) => return Err(error),
+            }
         };
         let query_only = observation["queryOnly"] == true;
         if observation["deviceId"] != s.device.serial_number {
@@ -217,7 +308,13 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
         } else {
             validate_reply(
                 model
-                    .generate(snapshot["instruction"].as_str().unwrap(), observation, history.clone(), cancel.clone())
+                    .generate(
+                        snapshot["instruction"].as_str().unwrap(),
+                        observation,
+                        history.clone(),
+                        &images,
+                        cancel.clone(),
+                    )
                     .await?,
             )?
         };
@@ -232,8 +329,8 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             }
             return Ok(action["message"].as_str().unwrap().to_owned());
         }
-        if steps.len() >= 20 {
-            return Err(ApiError::new(409, "Task step limit reached"));
+        if steps.len() >= 100 {
+            return Err(ApiError::new(409, "任务已达到 100 步上限"));
         }
         // A text-only query result is sufficient for app lookup/completion, but
         // never authorizes invented screen coordinates. Re-observe and re-plan first.
@@ -279,7 +376,15 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             "tool": action["tool"], "args": action["args"]
         });
         let executing = Instant::now();
-        let result = s.run_command(command, cancel.clone()).await?;
+        let result = match s.run_command(command, cancel.clone()).await {
+            Ok(result) => result,
+            Err(error)
+                if s.device.platform == crate::identity::Platform::Ios && recoverable_wda_error(&error.message) =>
+            {
+                json!({"kind":"error","message":error.message})
+            }
+            Err(error) => return Err(error),
+        };
         timings["actionMs"] = json!(executing.elapsed().as_millis() as u64);
         let missed = if result.get("outcome").is_some() {
             result["outcome"]["tapped_nothing"] == true
@@ -289,8 +394,13 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
                 .any(|p| result["text"].as_str().unwrap_or("").starts_with(p))
         };
         let failed = result["kind"] == "error";
+        let recoverable = failed
+            && s.device.platform == crate::identity::Platform::Ios
+            && recoverable_wda_error(result["message"].as_str().unwrap_or(""));
         let missed = action["tool"] == "iphone_tap_element" && missed;
-        let state = if failed {
+        let state = if recoverable {
+            "uncertain"
+        } else if failed {
             "failed"
         } else if missed {
             "missed"
@@ -324,6 +434,16 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             })
             .await?;
         if failed {
+            if recoverable {
+                recoveries += 1;
+                next_observation = Some(recover_observation(&s, id, recoveries, cancel.clone()).await?);
+                if needs_confirmation || request["op"] == "type_text" {
+                    return Err(ApiError::unavailable(
+                        "设备已恢复，但上一步操作结果不确定。请先核对手机上的实际结果，再重新开始任务。",
+                    ));
+                }
+                continue;
+            }
             // These exact native preflight errors guarantee that no text was sent.
             // Re-observe and re-plan once, requiring a successful tap before typing.
             let no_input_sent = s.device.platform == crate::identity::Platform::Ios

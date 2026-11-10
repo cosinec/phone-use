@@ -266,6 +266,27 @@ async fn read_packet(socket: &mut TcpStream) -> Result<(Value, u32)> {
     Ok((Value::from_reader(Cursor::new(body))?, tag))
 }
 
+/// Connect to the one device owned by this virtual mux. Never accepts a host from an API request.
+pub(crate) async fn connect_port(address: &str, port: u16) -> Result<TcpStream> {
+    let mut socket = TcpStream::connect(address).await?;
+    send(
+        &mut socket,
+        dict([
+            ("MessageType", string("Connect")),
+            ("DeviceID", integer(1)),
+            ("PortNumber", integer(port.swap_bytes() as u64)),
+        ]),
+        1,
+    )
+    .await?;
+    let (reply, tag) = read_packet(&mut socket).await?;
+    anyhow::ensure!(
+        tag == 1 && reply.as_dictionary().and_then(|v| number(v, "Number")) == Some(0),
+        "Device refused preview connection"
+    );
+    Ok(socket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
