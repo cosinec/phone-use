@@ -71,6 +71,15 @@ function fixture(overrides = {}) {
     relay,
   };
 }
+test('task creation transmits the selected model once and keeps the omitted-model default compatible', async () => {
+  const { client, calls } = fixture();
+  await client.connect({ apiBase: 'http://cloud', accessToken: 'token' });
+  await client.startTask('look at screen', 'other/vision');
+  assert.deepEqual(JSON.parse(calls.filter(c => c[0] === 'fetch').at(-1)[2].body), { instruction: 'look at screen', model: 'other/vision' });
+  await client.startTask('default task');
+  assert.deepEqual(JSON.parse(calls.filter(c => c[0] === 'fetch').at(-1)[2].body), { instruction: 'default task' });
+  await client.disconnect();
+});
 test("chooser synchronous; canonical identity and session token reach SDK pair exactly once", async () => {
   const { client, calls } = fixture();
   const pending = client.connect({

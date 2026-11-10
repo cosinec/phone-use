@@ -5,7 +5,7 @@ interface Props {
   supported: boolean;
   apiBase: string;
   onBase: (base: string) => void;
-  onConnect: (token: string) => void;
+  onConnect: (token: string, platform: "ios" | "android") => void;
   onDisconnect: () => void;
 }
 export function ConnectionPanel({
@@ -16,19 +16,26 @@ export function ConnectionPanel({
   onConnect,
   onDisconnect,
 }: Props) {
+  const [platform, setPlatform] = useState<"ios" | "android">("ios");
   const [token, setToken] = useState("");
   const occupied =
     !!state.session ||
     ["selecting", "pairing", "connected"].includes(state.phase);
+  const selectedPlatform = occupied ? (state.session?.platform || state.device?.platform || platform) : platform;
   return (
     <section className="connection-panel">
       <div className="section-label">连接设备</div>
+      <label className="field-label" htmlFor="device-platform">手机系统</label>
+      <select id="device-platform" value={selectedPlatform} disabled={occupied} onChange={(e) => setPlatform(e.target.value as "ios" | "android")}>
+        <option value="ios">iPhone / iOS</option><option value="android">Android</option>
+      </select>
+      <p className="field-hint">{selectedPlatform === "android" ? "Android 8+：开启开发者选项与 USB 调试，在手机上允许 RSA 授权。无需 Apple ID。请退出本地 adb/scrcpy，释放 USB 接口。" : "Mac Chrome：保持手机解锁，完成信任与 WDA 准备。"}</p>
       <div className="connection-device">
         <div className="device-icon">▯</div>
         <div>
-          <strong>{state.device?.productName || "你的 iPhone"}</strong>
+          <strong>{state.device?.productName || (selectedPlatform === "android" ? "你的 Android 手机" : "你的 iPhone")}</strong>
           <span>
-            {occupied ? "保持 USB 连接与页面打开" : "通过 Mac Chrome 连接"}
+            {occupied ? "保持 USB 连接与页面打开" : "通过 Chrome 与 USB 连接"}
           </span>
         </div>
       </div>
@@ -71,12 +78,12 @@ export function ConnectionPanel({
           className="button primary full"
           disabled={!supported || !!state.cleanupPending || !token.trim()}
           onClick={() => {
-            onConnect(token);
+            onConnect(token, platform);
             setToken("");
           }}
         >
           <span>＋</span>{" "}
-          {state.cleanupPending ? "等待 USB 释放" : "连接 iPhone"}
+          {state.cleanupPending ? "等待 USB 释放" : selectedPlatform === "android" ? "连接 Android" : "连接 iPhone"}
         </button>
       )}
       {state.warning && (
@@ -86,7 +93,7 @@ export function ConnectionPanel({
       )}
       {!supported && (
         <p className="inline-error">
-          请用 Mac Chrome，在 HTTPS 或 localhost 打开此页面。
+          请用 Chrome，在 HTTPS 或 localhost 打开此页面。
         </p>
       )}
       <div className="connection-note">

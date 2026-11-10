@@ -1,7 +1,9 @@
 use crate::{
+    android::AndroidController,
     commands::command_request,
+    controller::Controller,
     error::{ApiError, Result},
-    identity::{Device, canonical_uid, validate_device},
+    identity::{Device, Platform, canonical_uid, device_uid, validate_device},
     model::Model,
     mux::{PairRecord, VirtualMux, read_pair_record},
     native::NativeController,
@@ -28,7 +30,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, OnceCell, mpsc, watch};
@@ -65,9 +67,20 @@ struct Commands {
     used: HashSet<String>,
 }
 struct Job {
-    request: Option<Value>,
+    request: JobRequest,
     result: watch::Sender<Option<Result<Value>>>,
     cancel: CancellationToken,
+    queued_at: Instant,
+}
+enum JobRequest {
+    Command(Value),
+    Observe,
+    Preview,
+}
+struct CapturedScreen {
+    at: Instant,
+    fresh: bool,
+    image: Value,
 }
 pub struct Session {
     pub id: String,
@@ -79,7 +92,7 @@ pub struct Session {
     hello: CancellationToken,
     state: Mutex<String>,
     attached: AtomicBool,
-    pub controller: OnceCell<NativeController>,
+    pub controller: OnceCell<Controller>,
     mux: Mutex<Option<VirtualMux>>,
     relay: OnceCell<Relay>,
     pair: Mutex<Option<PairRecord>>,
@@ -87,6 +100,8 @@ pub struct Session {
     data_dir: PathBuf,
     commands: Mutex<Commands>,
     jobs: mpsc::Sender<Job>,
+    latest_screen: Mutex<Option<CapturedScreen>>,
+    preview_lock: Mutex<()>,
     close_lock: Mutex<bool>,
     pub tasks: TaskManager,
 }
@@ -189,7 +204,14 @@ impl Gateway {
         if registry.sessions.len() >= 32 {
             return Err(ApiError::new(429, "Session limit reached"));
         }
-        let mut namespace = id();
+        let mut namespace = if device.platform == Platform::Android {
+            format!("android-{:x}", Sha256::digest(device.serial_number.as_bytes()))
+        } else {
+            id()
+        };
+        if device.platform == Platform::Android && pair.is_some() {
+            return Err(ApiError::new(400, "Android does not use Apple pairing records"));
+        }
         if let Some(ref mut record) = pair {
             read_pair_record(record, &device.serial_number).map_err(|_| ApiError::new(400, "Invalid pair record"))?;
             record.udid = canonical_uid(&record.udid).map_err(|_| ApiError::new(400, "Invalid pair record"))?;
@@ -228,6 +250,8 @@ impl Gateway {
             data_dir: self.config.runtime.join("data").join(&namespace),
             commands: Mutex::new(Commands::default()),
             jobs,
+            latest_screen: Mutex::new(None),
+            preview_lock: Mutex::new(()),
             close_lock: Mutex::new(false),
             tasks: TaskManager::new(),
         });
@@ -272,10 +296,11 @@ impl Session {
             registry.owners.remove(&self.namespace);
         }
         self.commands.lock().await.cached.clear();
+        *self.latest_screen.lock().await = None;
         *self.pair.lock().await = None;
         *done = true;
     }
-    pub async fn ready(&self) -> Result<&NativeController> {
+    pub async fn ready(&self) -> Result<&Controller> {
         if self.cancel.is_cancelled() {
             return Err(ApiError::new(410, "Session closed"));
         }
@@ -320,7 +345,7 @@ impl Session {
         }
     }
     pub async fn run_command(&self, input: Value, cancel: CancellationToken) -> Result<Value> {
-        if canonical_uid(input["deviceId"].as_str().unwrap_or("")).ok().as_deref()
+        if device_uid(self.device.platform, input["deviceId"].as_str().unwrap_or("")).ok().as_deref()
             != Some(self.device.serial_number.as_str())
         {
             return Err(ApiError::new(409, "Device identity mismatch"));
@@ -332,6 +357,9 @@ impl Session {
             })
             .ok_or_else(|| ApiError::new(400, "Invalid requestId"))?;
         let request = command_request(input["tool"].as_str().unwrap_or(""), input.get("args").unwrap_or(&json!({})))?;
+        if self.device.platform == Platform::Ios && request["op"] == "press_button" && request["button"] == "back" {
+            return Err(ApiError::new(400, "Back is supported on Android only"));
+        }
         let fingerprint = request.to_string();
         let mut commands = self.commands.lock().await;
         let receiver = if let Some(entry) = commands.cached.get(request_id) {
@@ -358,7 +386,12 @@ impl Session {
             }
             let (sender, receiver) = watch::channel(None);
             self.jobs
-                .try_send(Job { request: Some(request), result: sender.clone(), cancel: cancel.clone() })
+                .try_send(Job {
+                    request: JobRequest::Command(request),
+                    result: sender.clone(),
+                    cancel: cancel.clone(),
+                    queued_at: Instant::now(),
+                })
                 .map_err(|_| ApiError::new(429, "Command queue full"))?;
             commands.used.insert(request_id.to_owned());
             commands.order.push_back(request_id.to_owned());
@@ -371,39 +404,102 @@ impl Session {
     pub async fn screen(&self, cancel: CancellationToken) -> Result<Value> {
         let (result, receiver) = watch::channel(None);
         self.jobs
-            .try_send(Job { request: None, result, cancel: cancel.clone() })
+            .try_send(Job { request: JobRequest::Observe, result, cancel: cancel.clone(), queued_at: Instant::now() })
             .map_err(|_| ApiError::new(429, "Command queue full"))?;
         self.wait_result(receiver, cancel).await
+    }
+    // During a task, display its latest real observation without touching the device.
+    // Null means the first task observation has not arrived yet.
+    pub async fn preview(&self) -> Result<Value> {
+        if self.tasks.active().await {
+            return Ok(self.cached_preview().await);
+        }
+        let _guard = self.preview_lock.lock().await;
+        if self.tasks.active().await {
+            return Ok(self.cached_preview().await);
+        }
+        if let Some(frame) = self.latest_screen.lock().await.as_ref()
+            && frame.fresh
+            && frame.at.elapsed() < Duration::from_millis(250)
+        {
+            return Ok(frame.image.clone());
+        }
+        let (result, receiver) = watch::channel(None);
+        self.jobs
+            .try_send(Job {
+                request: JobRequest::Preview,
+                result,
+                cancel: self.cancel.clone(),
+                queued_at: Instant::now(),
+            })
+            .map_err(|_| ApiError::new(429, "Command queue full"))?;
+        self.wait_result(receiver, self.cancel.clone()).await
+    }
+    async fn cached_preview(&self) -> Value {
+        self.latest_screen.lock().await.as_ref().map(|s| s.image.clone()).unwrap_or(Value::Null)
     }
     async fn work(self: Arc<Self>, mut jobs: mpsc::Receiver<Job>) {
         loop {
             let job = tokio::select! {biased;_=self.cancel.cancelled()=>break,job=jobs.recv()=>match job{Some(j)=>j,None=>break}};
-            let result = if job.cancel.is_cancelled() {
+            let queue_ms = job.queued_at.elapsed().as_millis() as u64;
+            let mut result = if job.cancel.is_cancelled() {
                 Err(ApiError::new(409, "Request cancelled; sent action is not retried"))
             } else {
                 self.execute(job.request, job.cancel).await
             };
+            if let Ok(value) = &mut result
+                && value.is_object()
+            {
+                value["timings"]["queueMs"] = json!(queue_ms);
+            }
             job.result.send_replace(Some(result));
         }
         while let Ok(job) = jobs.try_recv() {
             job.result.send_replace(Some(Err(ApiError::new(410, "Session closed"))));
         }
     }
-    async fn execute(&self, request: Option<Value>, cancel: CancellationToken) -> Result<Value> {
+    async fn execute(&self, request: JobRequest, cancel: CancellationToken) -> Result<Value> {
+        let observe = matches!(request, JobRequest::Observe);
+        if matches!(request, JobRequest::Preview) && self.tasks.active().await {
+            return Ok(self.cached_preview().await);
+        }
         let controller = self.ready().await?;
         let native = |r| controller.request(r, Duration::from_secs(45), cancel.clone());
-        if let Some(request) = request {
+        if let JobRequest::Command(request) = request {
+            if let Some(frame) = self.latest_screen.lock().await.as_mut() {
+                frame.fresh = false;
+            }
             return native(request).await.map_err(native_error);
         }
-        let image = native(json!({"op":"screenshot","region":null})).await.map_err(native_error)?;
-        if image["kind"] != "image" {
-            return Err(ApiError::unavailable("Screenshot unavailable"));
-        }
-        let mut result = json!({"imageBase64":image["jpeg_base64"],"caption":image["caption"],"elementsText":"","deviceId":self.device.serial_number});
-        match native(json!({"op":"list_elements","filter":"","limit":80,"max_age_ms":0})).await {
-            Ok(v) if v["kind"] == "text" => result["elementsText"] = v["text"].clone(),
-            _ => result["elementsError"] = json!("UI elements unavailable"),
-        }
+        let capture = Instant::now();
+        let mut result = if observe {
+            let response =
+                native(json!({"op":"observe","limit":80,"snapshot_timeout_ms":1000})).await.map_err(native_error)?;
+            if response["kind"] != "text" {
+                return Err(ApiError::unavailable("Observation unavailable"));
+            }
+            let value: Value = serde_json::from_str(response["text"].as_str().unwrap_or(""))
+                .map_err(|_| ApiError::unavailable("Invalid native observation"))?;
+            if value["deviceId"] != self.device.serial_number
+                || !value["imageBase64"].is_string()
+                || !value["caption"].is_string()
+            {
+                return Err(ApiError::unavailable("Invalid native observation identity or image"));
+            }
+            value
+        } else {
+            let image = native(json!({"op":"screenshot","region":null})).await.map_err(native_error)?;
+            if image["kind"] != "image" {
+                return Err(ApiError::unavailable("Screenshot unavailable"));
+            }
+            json!({"imageBase64":image["jpeg_base64"],"caption":image["caption"],"elementsText":"","deviceId":self.device.serial_number,
+                "timings":{"screenshotMs":capture.elapsed().as_millis() as u64}})
+        };
+        result["capturedAt"] = json!(chrono::Utc::now().to_rfc3339());
+        let mut preview = result.clone();
+        preview["elementsText"] = json!("");
+        preview.as_object_mut().unwrap().remove("elementsError");
+        *self.latest_screen.lock().await = Some(CapturedScreen { at: Instant::now(), fresh: true, image: preview });
         Ok(result)
     }
     async fn snapshot(&self) -> Value {
@@ -430,6 +526,7 @@ impl Session {
         json!({
             "id": self.id,
             "deviceId": self.device.serial_number,
+            "platform": self.device.platform,
             "state": *self.state.lock().await,
             "ready": native["ready"],
             "daemon": daemon,
@@ -448,6 +545,21 @@ impl Session {
         );
         self.hello.cancel();
         *self.state.lock().await = "connecting".into();
+        if self.device.platform == Platform::Android {
+            anyhow::ensure!(device.platform == Platform::Android, "Device platform mismatch");
+            let controller =
+                AndroidController::new(self.device.serial_number.clone(), outbound.clone(), self.cancel.clone());
+            self.controller
+                .set(Controller::Android(controller))
+                .map_err(|_| anyhow::anyhow!("Android controller already started"))?;
+            *self.state.lock().await = "connected".into();
+            outbound
+                .send(Frame::json(17, 0, 0, &json!({"ready":true,"deviceId":self.device.serial_number})))
+                .await
+                .map_err(|_| anyhow::anyhow!("Android relay closed"))?;
+            return Ok(());
+        }
+        anyhow::ensure!(device.platform == Platform::Ios, "Device platform mismatch");
         let relay = Relay::new(outbound.clone(), self.cancel.clone());
         self.relay.set(relay.clone()).map_err(|_| anyhow::anyhow!("Duplicate DeviceHello"))?;
         let (pair_sender, mut records) = mpsc::channel::<PairRecord>(8);
@@ -470,7 +582,9 @@ impl Session {
             address,
             self.cancel.clone(),
         );
-        self.controller.set(controller.clone()).map_err(|_| anyhow::anyhow!("Native already started"))?;
+        self.controller
+            .set(Controller::Ios(controller.clone()))
+            .map_err(|_| anyhow::anyhow!("Native already started"))?;
         let session = self.clone();
         tokio::spawn(async move {
             let result = controller.start().await;
@@ -551,13 +665,20 @@ impl Session {
                         self.hello(frame, outbound.clone()).await
                     }
                     Ok(frame) => match frame.kind {
-                        2..=5 if frame.kind != 2 => self.relay.get().unwrap().handle(frame).await,
+                        2..=5 if frame.kind != 2 => match self.relay.get() {
+                            Some(relay) => relay.handle(frame).await,
+                            None => Err(anyhow::anyhow!("USB mux frames are invalid for Android")),
+                        },
+                        15 => match self.controller.get() {
+                            Some(Controller::Android(c)) => c.handle(frame).await,
+                            _ => Err(anyhow::anyhow!("Android result on non-Android session")),
+                        },
                         8 => outbound
                             .send(Frame::json(9, frame.request_id, 0, &Value::Null))
                             .await
                             .map_err(|_| anyhow::anyhow!("Relay closed")),
                         9 => Ok(()),
-                        10 => {
+                        10 if self.device.platform == Platform::Ios => {
                             if let Some(record) = self.pair.lock().await.clone() {
                                 outbound
                                     .send(Frame::json(12, 0, 0, &serde_json::to_value(record).unwrap()))
@@ -631,7 +752,7 @@ async fn handle(State(gateway): State<Arc<Gateway>>, request: Request<Body>) -> 
 async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
-    if path == "/ios/device/ws" {
+    if path == "/ios/device/ws" || path == "/device/ws" {
         let origin = request.headers().get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
         if !g.config.origins.contains(origin) {
             return Err(ApiError::new(403, "Origin denied"));
@@ -667,7 +788,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         return Ok(response);
     }
     if method == Method::GET && path == "/api/config" {
-        return Ok(reply(200, json!({"aiReady":g.model.ready(),"model":g.model.name})));
+        return Ok(reply(200, g.model.configuration().await));
     }
     if let Some(response) = crate::static_files::serve(&g.config.web_dist, &method, &path).await {
         return Ok(response);
@@ -685,8 +806,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         }
         let host = request.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1").to_owned();
         let input = body(request).await?;
-        let device =
-            validate_device(&input["device"]).map_err(|_| ApiError::new(400, "Invalid Apple device identity"))?;
+        let device = validate_device(&input["device"]).map_err(|_| ApiError::new(400, "Invalid device identity"))?;
         let pair = match input.get("pairRecord").filter(|v| !v.is_null()) {
             Some(v) => Some(serde_json::from_value(v.clone()).map_err(|_| ApiError::new(400, "Invalid pair record"))?),
             None => None,
@@ -698,7 +818,9 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             .map(Ok)
             .unwrap_or_else(|| reqwest::Url::parse(&format!("http://{host}")))
             .map_err(|_| ApiError::new(400, "Invalid host"))?;
-        let mut relay = base.join("/ios/device/ws").map_err(|_| ApiError::new(400, "Invalid host"))?;
+        let mut relay = base
+            .join(if device.platform == Platform::Android { "/device/ws" } else { "/ios/device/ws" })
+            .map_err(|_| ApiError::new(400, "Invalid host"))?;
         relay
             .set_scheme(if base.scheme() == "https" { "wss" } else { "ws" })
             .map_err(|_| ApiError::new(400, "Invalid host"))?;
@@ -733,6 +855,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         }
         (Method::POST, ["command"]) => Ok(reply(200, s.run_command(body(request).await?, s.cancel.clone()).await?)),
         (Method::GET, ["screen"]) => Ok(reply(200, s.screen(s.cancel.clone()).await?)),
+        (Method::GET, ["preview"]) => Ok(reply(200, s.preview().await?)),
         (Method::POST, ["setup"]) => {
             body(request).await?;
             let c = s.ready().await?;
@@ -754,17 +877,12 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         }
         (Method::POST, ["tasks"]) => {
             let input = body(request).await?;
-            if input.as_object().unwrap().keys().any(|k| k != "instruction") {
+            if input.as_object().unwrap().keys().any(|k| !["instruction", "model"].contains(&k.as_str())) {
                 return Err(ApiError::new(400, "Invalid task request"));
             }
-            if !g.model.ready() {
-                return Err(ApiError::unavailable("AI is not configured"));
-            }
+            let model = g.model.select(input.get("model")).await?;
             s.ready().await?;
-            Ok(reply(
-                201,
-                s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), g.model.clone()).await?,
-            ))
+            Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model).await?))
         }
         (Method::POST, ["tasks", task, "stop"]) => {
             if !body(request).await?.as_object().unwrap().is_empty() {

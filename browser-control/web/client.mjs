@@ -1,7 +1,12 @@
+import * as androidSDK from "./android/bridge.mjs";
+import { androidUID } from "./android/core.mjs";
 import * as publishedSDK from "@limrun/device-install";
 import { canonicalUID } from "../src/device-identity.mjs";
 import { completeUsbPacketReads } from "./usb-packets.mjs";
 const progressLabels = {
+  "Android authorization": "请在手机上允许 USB 调试（RSA 指纹授权）",
+  "Android control startup": "正在准备 Android 控制通道",
+  "Android ready": "Android 已就绪",
   "Selecting USB device": "等待 USB 授权",
   "Selected USB device": "已选择设备",
   "Claiming usbmux interface": "正在申请 USB 接口访问",
@@ -16,12 +21,14 @@ const progressLabels = {
 export class BrowserClient {
   constructor({
     sdk = publishedSDK,
+    androidSdk = androidSDK,
     fetchImpl = globalThis.fetch,
     uuid = () => crypto.randomUUID(),
     cleanupTimeoutMs = 5000,
     usbEvents = globalThis.navigator?.usb,
   } = {}) {
     this.sdk = sdk;
+    this.androidSdk = androidSdk;
     this.usbEvents = usbEvents;
     this.fetchImpl = fetchImpl;
     this.uuid = uuid;
@@ -59,14 +66,14 @@ export class BrowserClient {
       let matches = event.device === selectedDevice;
       if (!matches) {
         try {
-          matches = canonicalUID(event.device.serialNumber) === uid;
+          matches = (attempt.platform === "android" ? androidUID : canonicalUID)(event.device.serialNumber) === uid;
         } catch {}
       }
       if (matches)
         void this.connectionLost(attempt, {
           phase: "offline",
           message:
-            "iPhone 已断开 USB 连接。请重新连接设备；已经发出的操作可能已执行。",
+            "手机已断开 USB 连接。请重新连接设备；已经发出的操作可能已执行。",
         });
     };
     events.addEventListener("disconnect", disconnect);
@@ -119,7 +126,8 @@ export class BrowserClient {
     return this.request(apiBase.replace(/\/$/, ""), "/api/config");
   }
   // Keep this function synchronous up to requestUSBAccess: Chrome requires user activation.
-  connect({ apiBase = "", accessToken }) {
+  connect({ apiBase = "", accessToken, platform = "ios" }) {
+    if (!["ios", "android"].includes(platform)) return Promise.reject(new Error("不支持的设备系统"));
     if (this.attempt)
       return Promise.reject(new Error("连接仍在处理中，请先断开"));
     if (this.custody.size)
@@ -152,6 +160,8 @@ export class BrowserClient {
     const attempt = {
       base,
       accessToken,
+      platform,
+      sdk: platform === "android" ? this.androidSdk : this.sdk,
       cancelled: false,
       target: null,
       session: null,
@@ -167,7 +177,7 @@ export class BrowserClient {
     attempt.log = log;
     let chooser;
     try {
-      chooser = this.sdk.requestUSBAccess({ log });
+      chooser = attempt.sdk.requestUSBAccess({ log });
     } catch (error) {
       chooser = Promise.reject(error);
     }
@@ -185,15 +195,15 @@ export class BrowserClient {
       attempt.target = await chooser;
       if (attempt.cancelled) return;
       const hello = attempt.target.hello;
-      const uid = canonicalUID(hello.serialNumber);
+      const uid = (attempt.platform === "android" ? androidUID : canonicalUID)(hello.serialNumber);
       this.watchUSBDisconnect(attempt, uid);
-      if (typeof attempt.target.device?.transferIn === "function")
+      if (attempt.platform === "ios" && typeof attempt.target.device?.transferIn === "function")
         attempt.target.device = completeUsbPacketReads(attempt.target.device);
       this.update({
         phase: "pairing",
         device: { ...hello, serialNumber: uid },
       });
-      const stored = await this.sdk.getPairRecord(uid);
+      const stored = await attempt.sdk.getPairRecord(uid);
       if (attempt.cancelled) return;
       attempt.session = await this.request(
         attempt.base,
@@ -202,6 +212,7 @@ export class BrowserClient {
         "POST",
         {
           device: {
+            ...(attempt.platform === "android" ? { platform: "android" } : {}),
             serialNumber: uid,
             vendorId: hello.vendorId,
             productId: hello.productId,
@@ -222,6 +233,7 @@ export class BrowserClient {
       if (attempt.cancelled) return;
       this.update({
         session: {
+          platform: attempt.platform,
           id: attempt.session.id,
           deviceId: attempt.session.deviceId,
           state: "waiting_for_relay",
@@ -235,7 +247,7 @@ export class BrowserClient {
       this.holdCustody(attempt);
       let result;
       try {
-        result = await this.sdk.pairDevice({
+        result = await attempt.sdk.pairDevice({
           registryApiUrl: attempt.base || globalThis.location.origin,
           token: attempt.session.token,
           target,
@@ -248,7 +260,7 @@ export class BrowserClient {
       }
       attempt.relay = result.relay;
       if (attempt.cancelled) return;
-      await this.sdk.putPairRecord(
+      if (result.pairRecord) await attempt.sdk.putPairRecord(
         {
           udid: canonicalUID(result.pairRecord.udid),
           pairRecordBase64: result.pairRecord.pairRecordBase64,
@@ -297,7 +309,7 @@ export class BrowserClient {
           const owner = Symbol("USB cleanup");
           this.holdCustody(owner);
           try {
-            await this.sdk.closeDeviceRelayTarget(target);
+            await attempt.sdk.closeDeviceRelayTarget(target);
           } catch {
           } finally {
             this.releaseCustody(owner);
@@ -360,7 +372,7 @@ export class BrowserClient {
   async sessionRequest(route = "", method = "GET", data) {
     const attempt = this.attempt,
       session = attempt?.session;
-    if (!session || attempt.cancelled) throw new Error("请先连接 iPhone");
+    if (!session || attempt.cancelled) throw new Error("请先连接手机");
     try {
       return await this.request(
         attempt.base,
@@ -410,7 +422,7 @@ export class BrowserClient {
     }
   }
   screen() {
-    return this.sessionRequest("/screen");
+    return this.sessionRequest("/preview");
   }
   command(tool, args) {
     return this.sessionRequest("/command", "POST", {
@@ -426,8 +438,8 @@ export class BrowserClient {
   setupInput(line) {
     return this.sessionRequest("/setup/input", "POST", { line });
   }
-  startTask(instruction) {
-    return this.sessionRequest("/tasks", "POST", { instruction });
+  startTask(instruction, model) {
+    return this.sessionRequest("/tasks", "POST", { instruction, ...(model ? { model } : {}) });
   }
   confirmTask(id, actionId, approved) {
     return this.sessionRequest(

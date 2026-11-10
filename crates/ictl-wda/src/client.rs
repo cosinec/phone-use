@@ -112,11 +112,28 @@ pub struct WdaClient<T> {
     lock_state_trusted: bool,
     /// 点击前后要恢复的等待设置（第一次点击时读一次）
     idle_baseline: Option<IdleSettings>,
+    idle_current: Option<IdleSettings>,
+    low_latency: bool,
+    profile_applied: bool,
 }
 
 impl<T: Transport> WdaClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport, session: None, screen: None, lock_state_trusted: false, idle_baseline: None }
+        Self {
+            transport,
+            session: None,
+            screen: None,
+            lock_state_trusted: false,
+            idle_baseline: None,
+            idle_current: None,
+            low_latency: false,
+            profile_applied: false,
+        }
+    }
+    /// Dedicated browser-control session. Ordinary MCP clients retain their defaults.
+    pub fn with_low_latency(mut self, enabled: bool) -> Self {
+        self.low_latency = enabled;
+        self
     }
 
     async fn call(&self, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
@@ -166,6 +183,27 @@ impl<T: Transport> WdaClient<T> {
             })?
             .to_owned();
         self.session = Some(id.clone());
+        if self.low_latency {
+            let settings =
+                json!({"settings":{"screenshotQuality":1,"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.0}});
+            match self.call("POST", &format!("/session/{id}/appium/settings"), Some(settings), DEFAULT_TIMEOUT).await {
+                Ok(value)
+                    if value["value"]["screenshotQuality"].as_f64() == Some(1.0)
+                        && value["value"]["waitForIdleTimeout"].as_f64() == Some(1.0)
+                        && value["value"]["animationCoolOffTimeout"].as_f64() == Some(0.0) =>
+                {
+                    self.profile_applied = true;
+                    self.idle_baseline = Some(IdleSettings::NO_COOL_OFF);
+                    self.idle_current = Some(IdleSettings::NO_COOL_OFF);
+                }
+                _ => {
+                    // Unknown/older WDA settings fail soft. Do not assume an unacknowledged profile.
+                    self.profile_applied = false;
+                    self.idle_current = None;
+                    tracing::warn!("WDA low-latency settings were not acknowledged; using normal gesture settings");
+                }
+            }
+        }
         Ok(id)
     }
 
@@ -180,7 +218,13 @@ impl<T: Transport> WdaClient<T> {
         for attempt in 0..2 {
             let sid = self.session_id().await?;
             match self.call(method, &format!("/session/{sid}{path}"), body.clone(), timeout).await {
-                Err(WdaError::Remote { kind, .. }) if attempt == 0 && kind.contains("session") => self.session = None,
+                Err(WdaError::Remote { kind, .. }) if attempt == 0 && kind.contains("session") => {
+                    self.session = None;
+                    self.idle_baseline = None;
+                    self.idle_current = None;
+                    self.profile_applied = false;
+                    self.lock_state_trusted = false;
+                }
                 other => return other.map(|mut v| v["value"].take()),
             }
         }
@@ -326,7 +370,11 @@ impl<T: Transport> WdaClient<T> {
         Ok(self.get("/wda/activeAppInfo").await?["bundleId"].as_str().unwrap_or_default().to_owned())
     }
 
-    pub async fn screenshot_png(&self) -> Result<Vec<u8>> {
+    /// Encoded screenshot bytes. The legacy method name is retained; low-latency sessions may return JPEG.
+    pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
+        if self.low_latency {
+            self.session_id().await?;
+        }
         // base64 约 11MB：从 JSON 里直接拿走字符串，原地去掉换行，不再另外复制
         let Value::String(mut b64) = self.get("/screenshot").await? else {
             return Err(WdaError::Unavailable(
@@ -353,6 +401,10 @@ impl<T: Transport> WdaClient<T> {
     /// 元素树，带上「谁盖住谁」「有没有加载圈」等信息
     pub async fn tree(&mut self) -> Result<elements::Tree> {
         let view = self.view().await?;
+        self.tree_in_view(view).await
+    }
+    /// Reuse orientation measured for the image in the same locked observation.
+    pub async fn tree_in_view(&self, view: elements::View) -> Result<elements::Tree> {
         Ok(elements::parse_tree(&self.source_xml().await?, view))
     }
 
@@ -394,6 +446,9 @@ impl<T: Transport> WdaClient<T> {
 
     /// 平时的等待设置（第一次用时读一次）。临时调小、改回之前都按它恢复
     pub async fn baseline(&mut self) -> Result<IdleSettings> {
+        if self.low_latency {
+            self.session_id().await?;
+        }
         if let Some(b) = self.idle_baseline {
             return Ok(b);
         }
@@ -409,6 +464,15 @@ impl<T: Transport> WdaClient<T> {
     /// 发一个手势，期间把等待设置临时换成 `during`（见 [`Self::tap`]），做完恢复
     async fn quick_gesture(&mut self, steps: &[PointerStep], during: IdleSettings) -> Result<()> {
         let baseline = self.baseline().await?;
+        if self.profile_applied {
+            self.set_idle_settings(IdleSettings::NO_COOL_OFF).await?;
+            self.actions(steps).await?;
+            // Keep a render window for taps/long presses without two settings round trips.
+            if during == IdleSettings::QUICK {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            return Ok(());
+        }
         self.set_idle_settings(during).await?;
         let r = self.actions(steps).await;
         if let Err(e) = self.set_idle_settings(baseline).await {
@@ -574,15 +638,23 @@ impl<T: Transport> WdaClient<T> {
 
     pub async fn idle_settings(&mut self) -> Result<IdleSettings> {
         let v = self.in_session("GET", "/appium/settings", None, DEFAULT_TIMEOUT).await?;
-        Ok(IdleSettings {
+        let settings = IdleSettings {
             wait_for_idle_timeout: v["waitForIdleTimeout"].as_f64().unwrap_or(10.0),
             animation_cool_off_timeout: v["animationCoolOffTimeout"].as_f64().unwrap_or(2.0),
-        })
+        };
+        self.idle_current = Some(settings);
+        Ok(settings)
     }
 
     pub async fn set_idle_settings(&mut self, s: IdleSettings) -> Result<()> {
+        if self.profile_applied && self.idle_current == Some(s) {
+            return Ok(());
+        }
         let body = json!({"settings": {"waitForIdleTimeout": s.wait_for_idle_timeout, "animationCoolOffTimeout": s.animation_cool_off_timeout}});
-        self.post("/appium/settings", body).await.map(drop)
+        self.idle_current = None;
+        self.post("/appium/settings", body).await?;
+        self.idle_current = Some(s);
+        Ok(())
     }
 
     /// 锁屏密码栏的 (总位数, 已输入位数)；找不到密码栏返回 None
@@ -703,6 +775,60 @@ mod tests {
         let a = body(3);
         let steps = a["actions"][0]["actions"].as_array().unwrap();
         assert_eq!(steps.iter().filter(|s| s["type"] == "pointerDown").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_profile_requests_source_jpeg_once_and_reuses_gesture_settings() {
+        let m = Mock::with(&[
+            (200, r#"{"sessionId":"A"}"#),
+            (200, r#"{"value":{"screenshotQuality":1,"waitForIdleTimeout":1,"animationCoolOffTimeout":0}}"#),
+            (200, r#"{"value":"/9j/"}"#),
+            (200, r#"{"value":null}"#),
+            (200, r#"{"value":null}"#),
+        ]);
+        let mut client = WdaClient::new(&m).with_low_latency(true);
+        assert_eq!(client.screenshot_png().await.unwrap(), [255, 216, 255]);
+        client.tap(10.0, 20.0).await.unwrap();
+        client.tap(30.0, 40.0).await.unwrap();
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            ["/session", "/session/A/appium/settings", "/screenshot", "/session/A/actions", "/session/A/actions"]
+        );
+        let profile: Value = serde_json::from_str(seen[1].2.as_deref().unwrap()).unwrap();
+        assert_eq!(profile["settings"]["screenshotQuality"], 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_browser_profile_preserves_normal_gesture_restoration() {
+        let m = Mock::with(&[
+            (200, r#"{"sessionId":"A"}"#),
+            (400, r#"{"value":{"error":"invalid argument","message":"unsupported setting"}}"#),
+            (200, r#"{"value":{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}}"#),
+            (200, r#"{"value":null}"#),
+            (200, r#"{"value":null}"#),
+            (200, r#"{"value":null}"#),
+        ]);
+        let mut client = WdaClient::new(&m).with_low_latency(true);
+        client.tap(10.0, 20.0).await.unwrap();
+        assert!(!client.profile_applied);
+        let seen = m.seen.lock().unwrap();
+        let restore: Value = serde_json::from_str(seen.last().unwrap().2.as_deref().unwrap()).unwrap();
+        assert_eq!(restore["settings"]["animationCoolOffTimeout"], 2.0);
+    }
+
+    #[tokio::test]
+    async fn a_shared_image_view_avoids_a_second_orientation_request() {
+        let m = Mock::with(&[(200, r#"{"value":"<AppiumAUT/>"}"#)]);
+        let client = WdaClient::new(&m);
+        let view = elements::View {
+            screen: ScreenSize { width: 844.0, height: 390.0 },
+            orientation: Some(elements::Orientation::LandscapeLeft),
+        };
+        client.tree_in_view(view).await.unwrap();
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].1.starts_with("/source?"));
     }
 
     #[tokio::test]

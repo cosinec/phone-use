@@ -4,7 +4,12 @@ use crate::{
 };
 use base64::Engine;
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -13,6 +18,13 @@ pub struct Model {
     endpoint: Option<reqwest::Url>,
     pub name: Option<String>,
     key: String,
+    catalog: Arc<Mutex<Catalog>>,
+}
+#[derive(Default)]
+struct Catalog {
+    fetched: Option<Instant>,
+    names: Vec<String>,
+    failed: bool,
 }
 impl Model {
     pub fn new(env: &HashMap<String, String>) -> anyhow::Result<Self> {
@@ -30,8 +42,7 @@ impl Model {
                     && url.password().is_none()
                     && url.query().is_none()
                     && url.fragment().is_none()
-                    && name.len() <= 128
-                    && !name.contains(['\r', '\n', '\0'])
+                    && valid_model_id(&name)
                     && !key.contains(['\r', '\n', '\0']),
                 "Invalid model configuration"
             );
@@ -43,10 +54,89 @@ impl Model {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { client, endpoint, name: ready.then_some(name), key })
+        Ok(Self { client, endpoint, name: ready.then_some(name), key, catalog: Arc::default() })
     }
     pub fn ready(&self) -> bool {
         self.endpoint.is_some()
+    }
+    async fn model_names(&self) -> (Vec<String>, bool) {
+        let mut catalog = self.catalog.lock().await;
+        let ttl = if catalog.failed { 15 } else { 60 };
+        if catalog.fetched.is_none_or(|at| at.elapsed() >= Duration::from_secs(ttl)) {
+            let fetch = async {
+                let endpoint = self.endpoint.as_ref()?.as_str().strip_suffix("chat/completions")?;
+                let mut response =
+                    self.client.get(format!("{endpoint}models")).bearer_auth(&self.key).send().await.ok()?;
+                if !response.status().is_success() || response.content_length().is_some_and(|n| n > 512 * 1024) {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await.ok()? {
+                    if bytes.len() + chunk.len() > 512 * 1024 {
+                        return None;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let value: Value = serde_json::from_slice(&bytes).ok()?;
+                let data = value["data"].as_array()?;
+                if data.len() > 4096 {
+                    return None;
+                }
+                let mut names: Vec<_> = data
+                    .iter()
+                    .filter_map(|v| v["id"].as_str())
+                    .filter(|id| valid_model_id(id))
+                    .map(str::to_owned)
+                    .collect();
+                names.sort();
+                names.dedup();
+                Some(names)
+            };
+            match tokio::time::timeout(Duration::from_secs(5), fetch).await {
+                Ok(Some(names)) => {
+                    catalog.names = names;
+                    catalog.failed = false;
+                }
+                _ => catalog.failed = true,
+            }
+            catalog.fetched = Some(Instant::now());
+        }
+        let mut names = catalog.names.clone();
+        if let Some(default) = &self.name
+            && !names.contains(default)
+        {
+            names.insert(0, default.clone());
+        }
+        (names, catalog.failed)
+    }
+    pub async fn configuration(&self) -> Value {
+        if !self.ready() {
+            return json!({"aiReady":false,"model":null});
+        }
+        let (models, failed) = self.model_names().await;
+        let mut config = json!({"aiReady":true,"model":self.name,"models":models});
+        if failed {
+            config["modelsError"] = json!("模型列表暂时无法更新，显示默认模型或上次列表。");
+        }
+        config
+    }
+    pub async fn select(&self, requested: Option<&Value>) -> Result<Self> {
+        if !self.ready() {
+            return Err(ApiError::unavailable("AI is not configured"));
+        }
+        let Some(requested) = requested else {
+            return Ok(self.clone());
+        };
+        let name = requested
+            .as_str()
+            .filter(|s| valid_model_id(s))
+            .ok_or_else(|| ApiError::new(400, "Invalid model selection"))?;
+        if self.name.as_deref() != Some(name) && !self.model_names().await.0.iter().any(|s| s == name) {
+            return Err(ApiError::new(400, "Model is unavailable; refresh the model list"));
+        }
+        let mut selected = self.clone();
+        selected.name = Some(name.to_owned());
+        Ok(selected)
     }
     pub async fn generate(
         &self,
@@ -59,15 +149,11 @@ impl Model {
         let mut content = vec![
             json!({"type":"text","text":json!({"instruction":instruction,"recentHistory":history,"observation":{
             "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),"elementsText":truncate(observation["elementsText"].as_str().unwrap_or(""),16384),
+            "queryOnly":observation["queryOnly"] == true,
             "elementsError":observation.get("elementsError").map(|_|"UI elements unavailable")}}).to_string()}),
         ];
         if let Some(image) = observation["imageBase64"].as_str() {
-            if image.len() > 8 * 1024 * 1024
-                || base64::engine::general_purpose::STANDARD.decode(image).map_or(true, |b| b.len() > 6 * 1024 * 1024)
-            {
-                return Err(ApiError::unavailable("Phone image exceeds model limit"));
-            }
-            content.push(json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}));
+            content.push(image_content(image)?);
         }
         let operation = async {
             let payload = json!({
@@ -88,7 +174,10 @@ impl Model {
                 .await
                 .map_err(|_| ApiError::unavailable("Model provider request failed"))?;
             if !response.status().is_success() {
-                return Err(ApiError::unavailable("Model provider request failed"));
+                return Err(ApiError::unavailable(format!(
+                    "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
+                    response.status().as_u16()
+                )));
             }
             if response.content_length().is_some_and(|n| n > 65536) {
                 return Err(ApiError::unavailable("Model response too large"));
@@ -116,6 +205,17 @@ impl Model {
             }
         }
     }
+}
+fn valid_model_id(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 256 && name.trim() == name && !name.chars().any(char::is_control)
+}
+fn image_content(image: &str) -> Result<Value> {
+    if image.len() > 8 * 1024 * 1024
+        || base64::engine::general_purpose::STANDARD.decode(image).map_or(true, |b| b.len() > 6 * 1024 * 1024)
+    {
+        return Err(ApiError::unavailable("Phone image exceeds model limit"));
+    }
+    Ok(json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}))
 }
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()

@@ -1,4 +1,6 @@
+pub mod android;
 pub mod commands;
+pub mod controller;
 pub mod error;
 pub mod gateway;
 pub mod identity;

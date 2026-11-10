@@ -7,7 +7,8 @@ interface Props {
   canRun: boolean;
   busy: boolean;
   stopBusy?: boolean;
-  onStart: (instruction: string) => void;
+  onStart: (instruction: string, model?: string) => void;
+  onRefreshModels?: () => void;
   onConfirm: (approved: boolean) => void;
   onStop: () => void;
 }
@@ -30,17 +31,21 @@ export function TaskPanel({
   busy,
   stopBusy = false,
   onStart,
+  onRefreshModels,
   onConfirm,
   onStop,
 }: Props) {
   const [instruction, setInstruction] = useState("");
+  const [model, setModel] = useState("");
+  const models = ai?.models?.length ? ai.models : ai?.model ? [ai.model] : [];
+  const selectedModel = models.includes(model) ? model : ai?.model || models[0] || "";
   const running = activeTask(task);
   return (
     <section className="task-card card">
       <div className="card-header">
         <div>
           <span className="section-label">自然语言控制</span>
-          <h2>告诉 iPhone，你想做什么</h2>
+          <h2>告诉手机，你想做什么</h2>
         </div>
         <span className="spark-icon">✧</span>
       </div>
@@ -51,9 +56,24 @@ export function TaskPanel({
         onSubmit={(e) => {
           e.preventDefault();
           if (canRun && !busy && !running && instruction.trim())
-            onStart(instruction);
+            onStart(instruction, selectedModel || undefined);
         }}
       >
+        <div className="model-picker">
+          <label htmlFor="task-model">任务模型</label>
+          <div className="model-picker-row">
+            <select id="task-model" value={selectedModel}
+              disabled={!ai?.aiReady || !models.length || running || busy}
+              onChange={(e) => setModel(e.target.value)}>
+              {!models.length && <option value="">{ai === null ? "正在读取模型列表…" : "暂无模型"}</option>}
+              {models.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+            {onRefreshModels && <button className="button secondary small" type="button"
+              disabled={running || busy || ai === null} onClick={onRefreshModels}>刷新列表</button>}
+          </div>
+          <p className="field-hint">选择用于下一次任务的模型。查看屏幕需要模型支持图片输入。</p>
+          {ai?.modelsError && <p className="inline-error" role="status">{ai.modelsError}</p>}
+        </div>
         <label className="sr-only" htmlFor="task-instruction">
           任务描述
         </label>
@@ -63,7 +83,7 @@ export function TaskPanel({
           maxLength={4000}
           disabled={running}
           onChange={(e) => setInstruction(e.target.value)}
-          placeholder="例如：打开设置，查看当前的 iOS 版本"
+          placeholder="例如：打开设置，查看当前的系统版本"
           rows={4}
         />
         <div className="task-input-footer">
@@ -80,7 +100,7 @@ export function TaskPanel({
       <div className="suggestions">
         <span>试试这些任务</span>
         {[
-          "打开设置，查看 iOS 版本",
+          "打开设置，查看系统版本",
           "打开时钟，查看已有闹钟",
           "回到主屏幕",
         ].map((s) => (
@@ -97,7 +117,7 @@ export function TaskPanel({
             {ai === null
               ? "正在检查 AI 配置"
               : ai.aiReady
-                ? `已配置 ${ai.model || "视觉模型"}`
+                ? `已选择 ${selectedModel || "视觉模型"}`
                 : "AI 尚未配置"}
           </strong>
           <p>
@@ -136,6 +156,17 @@ export function TaskPanel({
               <span className="step-count">{task.steps.length} 步</span>
             </div>
             <p className="current-instruction">{task.instruction}</p>
+            {task.model && <p className="field-hint">本次任务模型：{task.model}</p>}
+            {task.timings && (
+              <p className="card-description" aria-label="最近一轮耗时">
+                {([
+                  ["观察", task.timings.observationMs],
+                  ["模型", task.timings.modelMs],
+                  ["操作", task.timings.actionMs],
+                ] as const).filter(([, ms]) => ms !== undefined)
+                  .map(([label, ms]) => `${label} ${((ms ?? 0) / 1000).toFixed(2)} 秒`).join(" · ")}
+              </p>
+            )}
             <ol className="step-list">
               {task.steps.map((step, i) => (
                 <li key={step.id}>

@@ -17,18 +17,18 @@ export class BrowserClient {
   );
   snapshot(): ClientState;
   subscribe(listener: () => void): () => void;
-  connect(options: { apiBase: string; accessToken: string }): Promise<void>;
+  connect(options: { apiBase: string; accessToken: string; platform?: "ios" | "android" }): Promise<void>;
   disconnect(): Promise<void>;
   config(apiBase?: string): Promise<AIConfig>;
   refresh(): Promise<Session>;
-  screen(): Promise<Screen>;
+  screen(): Promise<Screen | null>;
   command(
     tool: string,
     args: Args,
   ): Promise<{ kind?: string; message?: string; text?: string }>;
   startSetup(): Promise<unknown>;
   setupInput(line: string): Promise<unknown>;
-  startTask(instruction: string): Promise<Task>;
+  startTask(instruction: string, model?: string): Promise<Task>;
   confirmTask(id: string, actionId: string, approved: boolean): Promise<Task>;
   stopTask(id: string): Promise<Task>;
 }

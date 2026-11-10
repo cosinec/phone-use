@@ -34,8 +34,7 @@ export function SetupPanel({ setup, busy, onStart, onInput }: Props) {
         </span>
       </div>
       <p className="card-description">
-        先解锁手机并信任电脑，再按提示开启开发者模式。Apple 账号与 WDA
-        签名在当前服务器处理。
+        先解锁手机并信任电脑，再按提示开启开发者模式。Apple ID 用于申请开发证书并给 WDA 控制组件签名，让 iOS 允许它运行；验证和签名由当前服务器处理，后续连接会复用有效签名。
       </p>
       <pre
         className="setup-transcript"

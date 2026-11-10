@@ -63,6 +63,171 @@ async function ready(app, session) {
 }
 const contract = (name, fn) => test(name, { skip: !binary }, fn);
 
+contract('provider model catalog is cached and each task keeps its own validated model selection', async t => {
+  let catalogCalls = 0; const generated = [];
+  const provider = http.createServer(async (req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer fixture-catalog-key');
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/models') {
+      catalogCalls++;
+      return res.end(JSON.stringify({ data: [
+        { id: 'codex/default' }, { id: 'other/vision' }, { id: 'other/vision' },
+        { id: 'other/text' }, { id: '' }, { id: 'bad\nmodel' }, { id: 'x'.repeat(257) },
+      ] }));
+    }
+    assert.equal(req.url, '/v1/chat/completions');
+    let body = ''; for await (const chunk of req) body += chunk;
+    const input = JSON.parse(body); generated.push(input.model);
+    await pause(50);
+    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ type: 'done', message: 'fixture completed' }) } }] }));
+  });
+  await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
+  t.after(() => { provider.closeAllConnections(); provider.close(); });
+  const app = await harness(t, { LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`, LLM_MODEL: 'codex/default', LLM_API_KEY: 'fixture-catalog-key' });
+  const configs = await Promise.all(Array.from({ length: 6 }, async () => (await app.api('/api/config')).json()));
+  for (const config of configs) assert.deepEqual(config, { aiReady: true, model: 'codex/default', models: ['codex/default', 'other/text', 'other/vision'] });
+  assert.equal(catalogCalls, 1); assert.ok(!JSON.stringify(configs).includes('fixture-catalog-key'));
+  const first = await app.session(); await peer(t, first); await ready(app, first);
+  const second = await app.session({ device: { ...device, serialNumber: '00008110-001234567890001F' } });
+  await peer(t, second, { ...device, serialNumber: second.deviceId }); await ready(app, second);
+  for (const model of ['not-listed', null, 42, '', 'bad\nmodel']) {
+    const response = await app.api(`/api/sessions/${first.id}/tasks`, first.token, { instruction: 'observe fixture', model });
+    assert.equal(response.status, 400);
+  }
+  const started = await app.api(`/api/sessions/${first.id}/tasks`, first.token, { instruction: 'observe fixture', model: 'other/vision' });
+  assert.equal(started.status, 201); assert.equal((await started.json()).model, 'other/vision');
+  assert.equal((await app.api(`/api/sessions/${second.id}/tasks`, second.token, { instruction: 'observe fixture' })).status, 201);
+  await until(async () => (await (await app.api(`/api/sessions/${first.id}`, first.token)).json()).task?.state === 'completed');
+  await until(async () => (await (await app.api(`/api/sessions/${second.id}`, second.token)).json()).task?.state === 'completed');
+  assert.deepEqual(generated.sort(), ['codex/default', 'other/vision']);
+  assert.equal((await (await app.api('/api/config')).json()).model, 'codex/default');
+});
+
+contract('failed or redirected model discovery preserves default use without leaking provider errors or credentials', async t => {
+  let catalogs = 0, redirected = 0;
+  const sink = http.createServer((_req, res) => { redirected++; res.end('{}'); });
+  await new Promise(resolve => sink.listen(0, '127.0.0.1', resolve));
+  const provider = http.createServer((req, res) => {
+    if (req.url.endsWith('/models')) {
+      catalogs++; res.writeHead(302, { Location: `http://127.0.0.1:${sink.address().port}/secret` });
+      return res.end('private provider error and fixture-secret');
+    }
+    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ type: 'done', message: 'fixture completed' }) } }] }));
+  });
+  await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
+  t.after(() => { provider.closeAllConnections(); provider.close(); sink.closeAllConnections(); sink.close(); });
+  const app = await harness(t, { LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`, LLM_MODEL: 'default', LLM_API_KEY: 'fixture-secret' });
+  for (let i = 0; i < 2; i++) {
+    const config = await (await app.api('/api/config')).json();
+    assert.deepEqual(config.models, ['default']); assert.ok(config.modelsError);
+    assert.ok(!JSON.stringify(config).includes('fixture-secret')); assert.ok(!JSON.stringify(config).includes('private provider'));
+  }
+  assert.equal(catalogs, 1); assert.equal(redirected, 0);
+  const s = await app.session(); await peer(t, s); await ready(app, s);
+  const started = await app.api(`/api/sessions/${s.id}/tasks`, s.token, { instruction: 'observe fixture', model: 'default' });
+  assert.equal(started.status, 201);
+  await until(async () => (await (await app.api(`/api/sessions/${s.id}`, s.token)).json()).task?.state === 'completed');
+});
+
+contract('preview avoids accessibility snapshots and observation bounds slow element reads', async t => {
+  const app = await harness(t, { FIXTURE_ELEMENTS_DELAY_MS: '4000' });
+  const s = await app.session(); await peer(t, s); await ready(app, s);
+  const route = `/api/sessions/${s.id}`;
+  const preview = await app.api(route + '/preview', s.token);
+  assert.equal(preview.status, 200);
+  const frame = await preview.json(); assert.equal(frame.imageBase64, 'aW1hZ2U=');
+  const stats = await (await app.api(route + '/command', s.token, { requestId: 'counts', deviceId: s.deviceId, tool: 'iphone_status' })).json();
+  assert.deepEqual(JSON.parse(stats.text).counts, { screenshot: 1, list_elements: 0 });
+  const observation = await (await app.api(route + '/screen', s.token)).json();
+  assert.equal(observation.imageBase64, 'aW1hZ2U='); assert.ok(observation.elementsError);
+  assert.ok(observation.timings.elementsMs >= 1000 && observation.timings.elementsMs < 3000, JSON.stringify(observation.timings));
+  t.diagnostic(`slow 4000 ms element fixture returned after ${observation.timings.elementsMs} ms; preview used zero element reads`);
+});
+
+contract('AI previews reuse its observation and query text plus screenshot crops reach the next model call', async t => {
+  let calls = 0, release;
+  const bodies = [];
+  const provider = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    bodies.push(JSON.parse(body)); calls++;
+    const reply = calls === 1
+      ? { type: 'action', tool: 'iphone_list_apps', args: {}, reason: 'Find fixture app' }
+      : calls === 2 ? { type: 'action', tool: 'iphone_screenshot', args: { x: 0, y: 0, width: 100, height: 100 }, reason: 'Read crop' }
+      : { type: 'done', message: 'Fixture completed' };
+    const send = () => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(reply) } }] })); };
+    if (calls === 1) release = send; else send();
+  });
+  await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
+  t.after(() => { provider.closeAllConnections(); provider.close(); });
+  const app = await harness(t, { LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`, LLM_MODEL: 'fixture', LLM_API_KEY: 'fixture-only' });
+  const s = await app.session(); await peer(t, s); await ready(app, s);
+  const route = `/api/sessions/${s.id}`;
+  await app.api(route + '/tasks', s.token, { instruction: 'Inspect fixture app' });
+  await until(() => !!release);
+  const count = async requestId => JSON.parse((await (await app.api(route + '/command', s.token, { requestId, deviceId: s.deviceId, tool: 'iphone_status' })).json()).text).counts;
+  const before = await count('before-preview');
+  const previews = await Promise.all(Array.from({ length: 12 }, () => app.api(route + '/preview', s.token).then(r => r.json())));
+  assert.ok(previews.every(p => p.imageBase64 === 'aW1hZ2U='));
+  assert.deepEqual(await count('after-preview'), before, 'active AI previews must not issue screenshot or element requests');
+  release();
+  let state;
+  await until(async () => { state = await (await app.api(route, s.token)).json(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task)); assert.equal(calls, 3);
+  const firstObservation = JSON.parse(bodies[0].messages[1].content[0].text).observation;
+  assert.equal(JSON.parse(firstObservation.elementsText).request.snapshot_timeout_ms, 1000);
+  const second = JSON.parse(bodies[1].messages[1].content[0].text);
+  assert.match(second.recentHistory[0].result.text, /com.example.fixture/);
+  assert.equal(bodies[1].messages[1].content.filter(p => p.type === 'image_url').length, 0, 'read-only text lookup needs no new image');
+  assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length, 1, 'crop replaces redundant full-screen recapture');
+  assert.deepEqual(await count('final-counts'), { screenshot: 2, list_elements: 1 });
+  assert.ok(!JSON.stringify(state.task).includes('com.example.fixture'), 'tool contents stay out of polled UI snapshots');
+  assert.ok(state.task.timings.modelMs >= 0);
+  assert.ok(state.task.steps[0].timings.actionMs >= 0);
+  t.diagnostic('12 preview requests during model thinking added 0 device screenshot/element reads');
+});
+
+contract('exact home command skips initial model planning but still observes and verifies its result', async t => {
+  const bodies = [];
+  const provider = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk; bodies.push(JSON.parse(body));
+    res.setHeader('Content-Type','application/json'); res.end(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ type:'done',message:'Fixture verified home' }) } }] }));
+  });
+  await new Promise(resolve => provider.listen(0,'127.0.0.1',resolve));
+  t.after(() => { provider.closeAllConnections(); provider.close(); });
+  const app = await harness(t, { LLM_BASE_URL:`http://127.0.0.1:${provider.address().port}/v1`, LLM_MODEL:'fixture', LLM_API_KEY:'fixture' });
+  const s = await app.session(); await peer(t,s); await ready(app,s); const route = `/api/sessions/${s.id}`;
+  await app.api(route + '/tasks',s.token,{ instruction:'回到主屏幕' });
+  let state; await until(async () => { state = await (await app.api(route,s.token)).json(); return ['completed','failed'].includes(state.task?.state); });
+  assert.equal(state.task.state,'completed',JSON.stringify(state.task)); assert.equal(bodies.length,1);
+  const input = JSON.parse(bodies[0].messages[1].content[0].text);
+  assert.equal(input.recentHistory[0].tool,'iphone_press_button'); assert.equal(input.recentHistory[0].args.button,'home');
+  assert.equal(state.task.steps[0].timings.direct,true);
+  assert.equal(bodies[0].messages[1].content.filter(p => p.type === 'image_url').length,1);
+});
+
+contract('query-only evidence cannot dispatch coordinate taps until a fresh image is obtained', async t => {
+  const bodies = [];
+  const replies = [
+    { type:'action',tool:'iphone_list_apps',args:{},reason:'Read apps' },
+    { type:'action',tool:'iphone_tap',args:{ x:999,y:999 },reason:'Unverified coordinates' },
+    { type:'action',tool:'iphone_tap',args:{ x:5,y:7 },reason:'Coordinates from fresh observation' },
+    { type:'done',message:'Fixture completed' },
+  ];
+  const provider = http.createServer(async (req,res) => {
+    let body = ''; for await (const chunk of req) body += chunk; bodies.push(JSON.parse(body));
+    res.setHeader('Content-Type','application/json'); res.end(JSON.stringify({ choices:[{ message:{ content:JSON.stringify(replies[bodies.length-1] || { type:'done',message:'Unexpected extra call' }) } }] }));
+  });
+  await new Promise(resolve => provider.listen(0,'127.0.0.1',resolve)); t.after(() => { provider.closeAllConnections(); provider.close(); });
+  const app = await harness(t,{ LLM_BASE_URL:`http://127.0.0.1:${provider.address().port}/v1`,LLM_MODEL:'fixture',LLM_API_KEY:'fixture' });
+  const s = await app.session(); await peer(t,s); await ready(app,s); const route = `/api/sessions/${s.id}`;
+  await app.api(route + '/tasks',s.token,{ instruction:'Inspect fixture and tap' });
+  let state; await until(async () => { state = await (await app.api(route,s.token)).json(); return ['completed','failed'].includes(state.task?.state); });
+  assert.equal(state.task.state,'completed',JSON.stringify(state.task)); assert.equal(bodies.length,4);
+  assert.equal(bodies[1].messages[1].content.filter(p => p.type === 'image_url').length,0);
+  assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length,1);
+  assert.deepEqual(state.task.steps.filter(p => p.tool === 'iphone_tap').map(p => p.args),[{x:5,y:7}]);
+});
+
 contract('Rust entry point preserves auth, normalized identities, setup, screenshots and command deduplication', async t => {
   const app = await harness(t);
   assert.deepEqual(await (await app.api('/api/config')).json(), { aiReady: false, model: null });
@@ -214,4 +379,76 @@ contract('Rust closes stalled headers and returns a bounded body timeout', async
   ]);
   assert.ok(!header || header.includes('408'));
   assert.match(body, /408/); assert.match(body, /Request body timeout/);
+});
+
+contract('Android uses browser ADB RPC with session isolation, compressed observations, deduplication and disconnect cleanup', async t => {
+  const { AndroidRelay } = await import('../web/android/relay.mjs');
+  const { AndroidCommands } = await import('../web/android/core.mjs');
+  const app = await harness(t);
+  const android = { platform:'android', serialNumber:'R5C_ABC-123',vendorId:1256,productId:1234,productName:'Android fixture' };
+  const s = await app.session({ device: android });
+  assert.equal(s.deviceId,'android:R5C_ABC-123'); assert.match(s.relayUrl,/\/device\/ws\?/);
+  const duplicate = await app.api('/api/sessions',token,{device:android}); assert.equal(duplicate.status,409);
+  const calls=[];
+  const commands = new AndroidCommands({deviceId:s.deviceId,delay:async()=>{},
+    shell:async command=>{calls.push(command);if(command.startsWith('uiautomator'))return '<hierarchy><node text="设置" enabled="true" bounds="[0,0][100,100]"/></hierarchy>';return '';},
+    capture:async()=>({imageBase64:'anBlZw==',caption:'Android full screen 576x1280',view:{width:576,height:1280,nativeWidth:1080,nativeHeight:2400},sourceBytes:1000000,uploadedBytes:90000}),
+    controller:{setClipboard:async value=>calls.push(value.content)},
+  });
+  const ws = new WebSocket(s.relayUrl,{origin});
+  const relay = new AndroidRelay(ws,s.deviceId,(request,signal)=>commands.execute(request,signal));
+  t.after(()=>relay.close());
+  await once(ws,'open');
+  ws.send(encodeFrame({type:1,payload:jsonPayload({...android,serialNumber:s.deviceId})}));await relay.ready;
+  const state = await ready(app,s);assert.equal(state.platform,'android');assert.equal(state.daemon.state.state,'ready');assert.equal(state.setup.state,'complete');
+  const route=`/api/sessions/${s.id}`;
+  const screen=await (await app.api(route+'/screen',s.token)).json();
+  assert.equal(screen.imageBase64,'anBlZw==');assert.match(screen.elementsText,/设置/);assert.equal(screen.deviceId,s.deviceId);
+  const body={requestId:'unicode',deviceId:s.deviceId,tool:'iphone_type_text',args:{text:'你好安卓',submit:false}};
+  const response=await app.api(route+'/command',s.token,body);assert.equal(response.status,200);assert.equal((await response.json()).kind,'text');
+  assert.equal((await app.api(route+'/command',s.token,body)).status,200);assert.equal(calls.filter(c=>c==='你好安卓').length,1,'duplicate HTTP request must not type twice');
+  assert.equal((await app.api(route+'/command',s.token,{...body,requestId:'wrong-device',deviceId:'android:OTHER'})).status,409);
+  assert.equal((await app.api(route+'/command',token,body)).status,401,'controller token cannot control a session');
+  const disconnected=once(ws,'close');relay.close();await disconnected;
+  await until(async()=>[404,410].includes((await app.api(route,s.token)).status));
+  const replacement=await app.session({device:android});assert.notEqual(replacement.id,s.id);
+});
+
+contract('Android AI tasks observe the Android device and require confirmation before Unicode submit', async t => {
+  const { AndroidRelay } = await import('../web/android/relay.mjs');
+  const { AndroidCommands } = await import('../web/android/core.mjs');
+  const bodies=[];
+  const provider=http.createServer(async (request,response)=>{
+    let body='';for await(const chunk of request) body+=chunk;
+    bodies.push(JSON.parse(body));
+    const action=bodies.length===1 ? {type:'action',tool:'iphone_type_text',args:{text:'你好，安卓 👋',submit:true},reason:'输入用户指定的中文并提交'} : {type:'done',message:'已观察提交后的 Android 页面'};
+    response.setHeader('Content-Type','application/json');response.end(JSON.stringify({choices:[{message:{content:JSON.stringify(action)}}]}));
+  });
+  await new Promise(resolve=>provider.listen(0,'127.0.0.1',resolve));
+  t.after(()=>{provider.closeAllConnections();provider.close();});
+  const app=await harness(t,{LLM_BASE_URL:`http://127.0.0.1:${provider.address().port}/v1`,LLM_MODEL:'fixture',LLM_API_KEY:'fixture-only'});
+  const selected={platform:'android',serialNumber:'AI_TEST',vendorId:1256,productId:1234};
+  const s=await app.session({device:selected});
+  const typed=[],keys=[];let captures=0;
+  const commands=new AndroidCommands({deviceId:s.deviceId,delay:async()=>{},
+    controller:{setClipboard:async message=>typed.push(message.content)},
+    shell:async command=>{if(command.startsWith('input keyevent')) keys.push(command);return '<hierarchy><node text="结果" bounds="[0,0][100,100]"/></hierarchy>';},
+    capture:async()=>{captures++;return {imageBase64:'anBlZw==',caption:'Android full screen 576x1280',view:{width:576,height:1280,nativeWidth:1080,nativeHeight:2400},sourceBytes:1000000,uploadedBytes:90000};},
+  });
+  const ws=new WebSocket(s.relayUrl,{origin});
+  const relay=new AndroidRelay(ws,s.deviceId,(request,signal)=>commands.execute(request,signal));
+  t.after(()=>relay.close());await once(ws,'open');
+  ws.send(encodeFrame({type:1,payload:jsonPayload(selected)}));await relay.ready;await ready(app,s);
+  const route=`/api/sessions/${s.id}`;
+  assert.equal((await app.api(route+'/tasks',s.token,{instruction:'输入你好，安卓并提交'})).status,201);
+  let state;
+  await until(async()=>{state=await(await app.api(route,s.token)).json();return state.task?.state==='awaiting_confirmation';});
+  assert.deepEqual(typed,[]);assert.deepEqual(keys,[]);
+  const task=state.task;
+  assert.equal((await app.api(route+`/tasks/${task.id}/confirm`,s.token,{actionId:task.confirmation.actionId,approved:true})).status,200);
+  await until(async()=>{state=await(await app.api(route,s.token)).json();return ['completed','failed'].includes(state.task?.state);});
+  assert.equal(state.task.state,'completed',JSON.stringify(state.task));
+  assert.deepEqual(typed,['你好，安卓 👋']);assert.deepEqual(keys,['input keyevent 66']);assert.equal(captures,2);
+  assert.equal(bodies.length,2);assert.match(JSON.parse(bodies[0].messages[1].content[0].text).observation.caption,/Android/);
+  assert.equal(state.deviceId,'android:AI_TEST');assert.equal(state.setup.state,'complete');
 });

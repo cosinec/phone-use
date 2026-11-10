@@ -50,6 +50,11 @@ pub enum Request {
     Screenshot {
         region: Option<(f64, f64, f64, f64)>,
     },
+    /// One device-locked observation: unlock once, reuse image orientation for its element tree.
+    Observe {
+        limit: usize,
+        snapshot_timeout_ms: u64,
+    },
     ListElements {
         filter: String,
         limit: usize,
@@ -57,6 +62,10 @@ pub enum Request {
         /// 用于「等界面稳定」之后紧接着列元素：Settle 刚读过
         #[serde(default)]
         max_age_ms: u64,
+        /// Optional budget for the read-only accessibility snapshot, after unlock checks.
+        /// Zero preserves the normal WDA timeout for existing clients.
+        #[serde(default)]
+        snapshot_timeout_ms: u64,
     },
     Tap {
         x: f64,
@@ -284,6 +293,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         let e: Response = serde_json::from_str(r#"{"kind":"error","message":"x"}"#).unwrap();
         assert_eq!(e, Response::error("x"));
+    }
+
+    #[test]
+    fn old_element_requests_keep_the_default_snapshot_budget() {
+        let old: Request = serde_json::from_str(r#"{"op":"list_elements","filter":"","limit":80}"#).unwrap();
+        assert!(matches!(old, Request::ListElements { snapshot_timeout_ms: 0, .. }));
+        let bounded: Request =
+            serde_json::from_str(r#"{"op":"list_elements","filter":"","limit":80,"snapshot_timeout_ms":1000}"#)
+                .unwrap();
+        assert!(matches!(bounded, Request::ListElements { snapshot_timeout_ms: 1000, .. }));
     }
 
     /// Outcome travels as fields; flags that are off and a missing outcome (older daemons) stay off the wire,

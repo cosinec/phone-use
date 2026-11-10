@@ -5,7 +5,10 @@ use crate::{
     model::{Model, validate_reply},
 };
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +38,9 @@ impl TaskManager {
     pub async fn snapshot(&self) -> Value {
         self.task.lock().await.as_ref().map(|t| t.snapshot.clone()).unwrap_or(Value::Null)
     }
+    pub async fn active(&self) -> bool {
+        self.task.lock().await.as_ref().is_some_and(|t| !terminal(&t.snapshot["state"]))
+    }
     pub async fn start(&self, session: Arc<Session>, instruction: &str, model: Model) -> Result<Value> {
         if instruction.trim().is_empty() || instruction.chars().count() > 4000 || instruction.contains('\0') {
             return Err(ApiError::new(400, "Invalid task instruction"));
@@ -49,8 +55,8 @@ impl TaskManager {
         let id = uuid::Uuid::new_v4().to_string();
         let cancel = session.cancel.child_token();
         let snapshot = json!({
-            "id": id, "instruction": instruction.trim(), "state": "observing", "steps": [],
-            "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null
+            "id": id, "instruction": instruction.trim(), "model": model.name, "state": "observing", "steps": [],
+            "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {}
         });
         *guard = Some(Task { snapshot: snapshot.clone(), cancel: cancel.clone(), confirmation: None });
         drop(guard);
@@ -167,32 +173,53 @@ fn confirmation_required(action: &Value, request: &Value) -> bool {
             )))
 }
 async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken) -> Result<String> {
+    // Keep bounded tool content private to the inference loop, out of polled UI snapshots.
+    let mut history: Vec<Value> = Vec::new();
+    let mut next_observation: Option<Value> = None;
     loop {
         let snapshot = s.tasks.update(id, |t| t.snapshot["state"] = json!("observing")).await?;
-        let observation = s.screen(cancel.clone()).await?;
+        let observing = Instant::now();
+        let direct = if history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
+            direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
+        } else {
+            None
+        };
+        let observation = if direct.is_some() {
+            json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"})
+        } else if let Some(observation) = next_observation.take() {
+            observation
+        } else {
+            s.screen(cancel.clone()).await?
+        };
+        let query_only = observation["queryOnly"] == true;
         if observation["deviceId"] != s.device.serial_number {
             return Err(ApiError::new(409, "Observation device identity mismatch"));
         }
-        s.tasks.update(id, |t| t.snapshot["state"] = json!("thinking")).await?;
-        let steps = snapshot["steps"].as_array().unwrap();
-        let mut history: Vec<Value> = steps
-            .iter()
-            .rev()
-            .take(8)
-            .map(|step| {
-                json!({
-                    "tool": step["tool"], "args": step["args"], "reason": step["reason"],
-                    "state": step["state"], "result": step["result"]
-                })
+        let mut timings =
+            json!({"observationMs":observing.elapsed().as_millis() as u64,"capture":observation["timings"]});
+        s.tasks
+            .update(id, |t| {
+                t.snapshot["state"] = json!("thinking");
+                t.snapshot["timings"] = timings.clone();
             })
-            .collect();
-        history.reverse();
-        while history.iter().map(|v| v.to_string().len()).sum::<usize>() > 24000 {
+            .await?;
+        let steps = snapshot["steps"].as_array().unwrap();
+        while history.len() > 8 || history.iter().map(|v| v.to_string().len()).sum::<usize>() > 24000 {
             history.remove(0);
         }
-        let action = validate_reply(
-            model.generate(snapshot["instruction"].as_str().unwrap(), observation, history, cancel.clone()).await?,
-        )?;
+        let thinking = Instant::now();
+        let action = if let Some(direct) = direct {
+            timings["direct"] = json!(true);
+            direct
+        } else {
+            validate_reply(
+                model
+                    .generate(snapshot["instruction"].as_str().unwrap(), observation, history.clone(), cancel.clone())
+                    .await?,
+            )?
+        };
+        timings["modelMs"] = json!(thinking.elapsed().as_millis() as u64);
+        s.tasks.update(id, |t| t.snapshot["timings"] = timings.clone()).await?;
         if cancel.is_cancelled() {
             return Err(ApiError::new(409, "Task cancelled"));
         }
@@ -201,6 +228,11 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
         }
         if steps.len() >= 20 {
             return Err(ApiError::new(409, "Task step limit reached"));
+        }
+        // A text-only query result is sufficient for app lookup/completion, but
+        // never authorizes invented screen coordinates. Re-observe and re-plan first.
+        if query_only && matches!(action["tool"].as_str(), Some("iphone_tap" | "iphone_swipe" | "iphone_long_press")) {
+            continue;
         }
         let request = command_request(action["tool"].as_str().unwrap(), &action["args"])?;
         let step_id = uuid::Uuid::new_v4().to_string();
@@ -237,7 +269,9 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
             "requestId": format!("task:{id}:{step_id}"), "deviceId": s.device.serial_number,
             "tool": action["tool"], "args": action["args"]
         });
+        let executing = Instant::now();
         let result = s.run_command(command, cancel.clone()).await?;
+        timings["actionMs"] = json!(executing.elapsed().as_millis() as u64);
         let missed = if result.get("outcome").is_some() {
             result["outcome"]["tapped_nothing"] == true
         } else {
@@ -247,18 +281,37 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
         };
         let failed = result["kind"] == "error";
         let missed = action["tool"] == "iphone_tap_element" && missed;
+        let state = if failed {
+            "failed"
+        } else if missed {
+            "missed"
+        } else {
+            "succeeded"
+        };
+        history.push(json!({"tool":action["tool"],"args":action["args"],"reason":action["reason"],"state":state,"result":inference_result(&result)}));
+        if result["kind"] == "image" {
+            // The just-captured full frame/crop IS the next observation; do not
+            // fetch another full image and send two pictures for the same query.
+            next_observation = Some(
+                json!({"deviceId":s.device.serial_number,"imageBase64":result["jpeg_base64"],"caption":result["caption"],"elementsText":""}),
+            );
+        } else if matches!(
+            action["tool"].as_str(),
+            Some("iphone_status" | "iphone_list_apps" | "iphone_list_devices" | "iphone_list_elements")
+        ) && !failed
+        {
+            next_observation = Some(json!({"deviceId":s.device.serial_number,"queryOnly":true,
+                "caption":"Fresh read-only tool result in recentHistory; no current image or coordinate evidence.",
+                "elementsText":if action["tool"] == "iphone_list_elements" { result["text"].clone() } else { Value::Null }}));
+        }
         s.tasks
             .update(id, |t| {
+                t.snapshot["timings"] = timings.clone();
                 let step = t.snapshot["steps"].as_array_mut().unwrap().last_mut().unwrap();
                 step["result"] = json!({"kind":result["kind"]});
+                step["timings"] = timings;
                 step["finishedAt"] = json!(now());
-                step["state"] = json!(if failed {
-                    "failed"
-                } else if missed {
-                    "missed"
-                } else {
-                    "succeeded"
-                });
+                step["state"] = json!(state);
             })
             .await?;
         if failed {
@@ -267,5 +320,76 @@ async fn run(s: Arc<Session>, id: &str, model: Model, cancel: CancellationToken)
         if missed {
             return Err(ApiError::new(409, "Element tap missed; task halted"));
         }
+    }
+}
+fn direct_command_for(instruction: &str, platform: crate::identity::Platform) -> Option<Value> {
+    let mut action = direct_command(instruction)?;
+    if platform == crate::identity::Platform::Android {
+        match action["args"]["app"].as_str() {
+            Some("com.apple.Preferences") => action["args"]["app"] = json!("com.android.settings"),
+            Some(_) => return None, // Clock package IDs vary between Android vendors; let the model look up apps.
+            None => {}
+        }
+    }
+    Some(action)
+}
+fn direct_command(instruction: &str) -> Option<Value> {
+    let text = instruction.trim().trim_end_matches(['。', '.', '!', '！']).to_lowercase();
+    let (tool, args) = match text.as_str() {
+        "回到主屏幕" | "返回主屏幕" | "回到桌面" | "go home" | "go to home screen" => {
+            ("iphone_press_button", json!({"button":"home"}))
+        }
+        "打开设置" | "open settings" => ("iphone_launch_app", json!({"app":"com.apple.Preferences"})),
+        "打开时钟" | "open clock" => ("iphone_launch_app", json!({"app":"com.apple.mobiletimer"})),
+        _ => return None,
+    };
+    Some(
+        json!({"type":"action","tool":tool,"args":args,"reason":"执行用户明确指定的单步操作，随后观察并验证结果","requiresConfirmation":false}),
+    )
+}
+fn inference_result(result: &Value) -> Value {
+    let mut summary = json!({"kind":result["kind"]});
+    for key in ["text", "caption"] {
+        if let Some(text) = result[key].as_str() {
+            let bounded: String = text.chars().take(6000).collect();
+            summary[key] = json!(bounded);
+            if text.chars().count() > 6000 {
+                summary["truncated"] = json!(true);
+            }
+        }
+    }
+    summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn direct_commands_are_exact_allowlisted_and_do_not_match_compound_or_negative_requests() {
+        assert_eq!(direct_command(" 回到主屏幕。 ").unwrap()["args"]["button"], "home");
+        assert_eq!(direct_command("OPEN SETTINGS").unwrap()["args"]["app"], "com.apple.Preferences");
+        for instruction in
+            ["不要回到主屏幕", "打开设置并关闭密码", "打开时钟并删除闹钟", "pay", "send message", "回到主屏幕然后支付"]
+        {
+            assert!(direct_command(instruction).is_none(), "{instruction}");
+        }
+    }
+    #[test]
+    fn android_shortcuts_use_android_packages_and_clock_falls_back_to_lookup() {
+        use crate::identity::Platform;
+        assert_eq!(direct_command_for("打开设置", Platform::Android).unwrap()["args"]["app"], "com.android.settings");
+        assert!(direct_command_for("打开时钟", Platform::Android).is_none());
+        assert_eq!(direct_command_for("打开设置", Platform::Ios).unwrap()["args"]["app"], "com.apple.Preferences");
+    }
+    #[test]
+    fn inference_preserves_query_text_without_copying_image_data() {
+        let result = json!({"kind":"text","text":"App: com.example.fixture"});
+        assert_eq!(inference_result(&result)["text"], result["text"]);
+        let result = json!({"kind":"image","caption":"crop at x=10 y=20","jpeg_base64":"private-image"});
+        assert_eq!(inference_result(&result)["caption"], result["caption"]);
+        assert!(inference_result(&result).get("jpeg_base64").is_none());
+        let result = inference_result(&json!({"kind":"text","text":"中".repeat(7000)}));
+        assert_eq!(result["text"].as_str().unwrap().chars().count(), 6000);
+        assert_eq!(result["truncated"], true);
     }
 }

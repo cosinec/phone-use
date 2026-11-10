@@ -21,6 +21,7 @@ if (process.argv[2] === 'descendant') {
   input.once('line', () => { process.stdout.write('Input received; setup complete\n'); input.close(); process.exit(0); });
 } else if (process.argv[2] === 'daemon') {
   let taps = 0;
+  const counts = { screenshot: 0, list_elements: 0 };
   const sockets = new Set();
   const server = net.createServer(socket => {
     sockets.add(socket);
@@ -31,18 +32,26 @@ if (process.argv[2] === 'descendant') {
       buffer += chunk;
       if (!buffer.includes('\n')) return;
       const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
+      if (request.op in counts) counts[request.op]++;
+      if (request.op === 'observe') { counts.screenshot++; counts.list_elements++; }
       if (request.op === 'tap') taps++;
       if (request.op === 'tap' && request.x === 999) return;
-      const response = request.op === 'screenshot'
+      const elementDelay = Number(process.env.FIXTURE_ELEMENTS_DELAY_MS || 0);
+      const budget = request.snapshot_timeout_ms ?? 1000;
+      const response = request.op === 'observe'
+        ? { kind: 'text', text: JSON.stringify({ deviceId: process.env.IPHONE_UDID, imageBase64: 'aW1hZ2U=', caption: 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
+        : request.op === 'screenshot'
         ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }
-        : { kind: 'text', text: JSON.stringify({ request, taps, env: {
+        : request.op === 'list_apps' ? { kind: 'text', text: 'Fixture App: com.example.fixture' }
+        : { kind: 'text', text: JSON.stringify({ request, taps, counts, env: {
           ICTL_ANISETTE_URL: process.env.ICTL_ANISETTE_URL, IPHONE_UDID: process.env.IPHONE_UDID, ICTL_SOCKET: process.env.ICTL_SOCKET,
           ICTL_DATA_DIR: process.env.ICTL_DATA_DIR, ICTL_MANAGE_USBMUXD: process.env.ICTL_MANAGE_USBMUXD,
           USBMUXD_SOCKET_ADDRESS: process.env.USBMUXD_SOCKET_ADDRESS,
         } }) };
       const line = JSON.stringify(response) + '\n';
       socket.write(line.slice(0, 3));
-      setTimeout(() => { if (!socket.destroyed) socket.write(line.slice(3)); }, 5);
+      const delay = request.op === 'observe' ? Math.min(elementDelay, budget) : request.op === 'list_elements' ? elementDelay : 0;
+      setTimeout(() => { if (!socket.destroyed) socket.write(line.slice(3)); }, 5 + delay);
     });
   });
   server.listen(process.env.ICTL_SOCKET, () => chmodSync(process.env.ICTL_SOCKET, 0o600));

@@ -7,6 +7,7 @@ import {
 } from "react";
 import { createTaskActions } from "./task-actions.mjs";
 import { BrowserClient } from "./client.mjs";
+import { startSessionPolling } from "./polling.mjs";
 import { ConnectionPanel } from "./components/ConnectionPanel";
 import { PhonePreview } from "./components/PhonePreview";
 import { TaskPanel } from "./components/TaskPanel";
@@ -25,6 +26,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
   const [apiBase, setApiBase] = useState("");
   const [ai, setAI] = useState<AIConfig | null>(null);
   const [configError, setConfigError] = useState("");
+  const [configRevision, setConfigRevision] = useState(0);
   const [screen, setScreen] = useState<Screen | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -40,6 +42,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
   );
   const session = state.session;
   const task = session?.task || null;
+  const android = session?.platform === "android" || state.device?.platform === "android";
   const wdaReady = !!session?.ready && session.daemon?.state?.state === "ready";
   const running = activeTask(task);
   const canControl = wdaReady && !running && state.phase === "connected";
@@ -60,7 +63,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
             : !session.ready
               ? "原生服务启动中"
               : !wdaReady
-                ? "WDA 准备中"
+                ? android ? "Android 控制准备中" : "WDA 准备中"
                 : "可以控制";
   useEffect(() => {
     let cancelled = false;
@@ -81,36 +84,13 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [client, apiBase]);
+  }, [client, apiBase, configRevision]);
   useEffect(() => {
     if (!session) {
       setScreen(null);
       return;
     }
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const value = await client.refresh();
-        if (disposed) return;
-        if (value.ready && value.daemon?.state?.state === "ready") {
-          const image = await client.screen();
-          if (!disposed && image.deviceId === value.deviceId) setScreen(image);
-        } else setScreen(null);
-      } catch (e) {
-        if (!disposed) {
-          setScreen(null);
-          setError(e instanceof Error ? e.message : "无法读取设备状态");
-        }
-      } finally {
-        if (!disposed) timer = setTimeout(poll, 1800);
-      }
-    };
-    void poll();
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
-    };
+    return startSessionPolling(client, { onScreen: setScreen, onError: setError });
   }, [client, session?.id]);
   useEffect(() => {
     const close = () => {
@@ -138,15 +118,15 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
           result.message || "设备操作失败。已经发出的操作不会自动重试。",
         );
       const image = await client.screen();
-      if (client.snapshot().session?.deviceId === image.deviceId)
+      if (image && client.snapshot().session?.deviceId === image.deviceId)
         setScreen(image);
     });
   };
-  const connect = (token: string) => {
+  const connect = (token: string, platform: "ios" | "android") => {
     setError("");
     setScreen(null);
     void client
-      .connect({ apiBase, accessToken: token })
+      .connect({ apiBase, accessToken: token, platform })
       .catch((e) => setError(e instanceof Error ? e.message : "连接失败"));
   };
   const disconnect = () => {
@@ -177,18 +157,18 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
         <div className="sidebar-guide">
           <div className="section-label">开始之前</div>
           <ol>
-            <li>用 USB 连接 iPhone</li>
+            <li>用 USB 连接手机</li>
             <li>解锁手机，允许浏览器访问</li>
             <li>按向导完成信任与授权</li>
           </ol>
           <p>
             Safari 与 Firefox 暂不支持。
             <br />
-            签名和模型均在服务器运行。
+            模型在服务器运行；Android 调试密钥保存在浏览器。
           </p>
         </div>
         <div className="sidebar-footer">
-          <span className="tiny-dot" /> Browser → Cloud → iPhone
+          <span className="tiny-dot" /> Browser ↔ Cloud ↔ Phone
         </div>
       </aside>
       <main className="workspace">
@@ -206,7 +186,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
             <div>
               <div className="eyebrow">YOUR DEVICE, YOUR WORKFLOW</div>
               <h1>
-                让 iPhone 帮你做事<span className="heading-dot">.</span>
+                让手机帮你做事<span className="heading-dot">.</span>
               </h1>
               <p>接上设备，描述任务。每一步都看得见。</p>
             </div>
@@ -226,7 +206,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
                 {/claim|exclusive USB/i.test(state.error || error) && (
                   <p>
                     请保持手机解锁，关闭占用设备的其他浏览器标签页，然后重新连接。USB
-                    接口访问成功后，仍需要验证配对和 WDA 准备。
+                    接口访问成功后，请按对应系统完成手机授权。
                   </p>
                 )}
               </div>
@@ -250,8 +230,9 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
                 canRun={canControl && !!ai?.aiReady}
                 busy={busy}
                 stopBusy={stoppingTask === `${session?.id}/${task?.id}`}
-                onStart={(instruction) =>
-                  void run(() => client.startTask(instruction))
+                onRefreshModels={() => setConfigRevision((value) => value + 1)}
+                onStart={(instruction, model) =>
+                  void run(() => client.startTask(instruction, model))
                 }
                 onConfirm={(approved) => {
                   if (task?.confirmation)
@@ -267,7 +248,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
                   if (session && task) void actions.stop(session.id, task.id);
                 }}
               />
-              {session && (!wdaReady || session.setup.transcript) && (
+              {session && !android && (!wdaReady || session.setup.transcript) && (
                 <SetupPanel
                   setup={session.setup}
                   busy={busy || running}
@@ -285,6 +266,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
               </div>
             </div>
             <PhonePreview
+              android={android}
               screen={screen}
               status={status}
               canControl={canControl}
@@ -293,7 +275,7 @@ export function App({ client: suppliedClient }: { client?: BrowserClient }) {
               onRefresh={() =>
                 void run(async () => {
                   const image = await client.screen();
-                  if (client.snapshot().session?.deviceId === image.deviceId)
+                  if (image && client.snapshot().session?.deviceId === image.deviceId)
                     setScreen(image);
                 })
               }

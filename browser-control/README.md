@@ -1,4 +1,4 @@
-# Mac Chrome iPhone 控制台
+# Chrome 手机控制台（iPhone / Android）
 
 在自己的 Mac 上插入 iPhone，用 Chrome 授权 USB，再从网页发起手动操作或自然语言任务。浏览器负责真实 USB 数据转发，服务器运行 Rust 网关 `iphone-control-gateway`、现有 Rust 控制引擎 `iphone-control`、WDA 准备和可选 AI。生产环境由同一 HTTPS origin 提供网页、REST API 和 WebSocket。
 
@@ -12,6 +12,26 @@ flowchart LR
 ```
 
 网页必须保持打开。所选 iPhone 拔出 USB 时，页面会立即显示断开并关闭对应 WebSocket 与会话；其他设备的拔出事件不会影响当前会话。部署后的用户 Mac 无需额外安装原生 helper；服务器必须安装原生引擎。仅部署静态网页不能提供手机控制。把服务器在本机启动，是开发时模拟云端角色，不能据此称为已部署云服务。
+
+## Android（浏览器 WebADB，实验性）
+
+连接面板选择 **Android**，使用 Android 8+、支持 WebUSB 的 Chrome 及可传数据的 USB 线。先在手机「开发者选项」开启 USB 调试，再在手机上允许当前浏览器的 RSA 授权。退出本地 `adb`、Android Studio、scrcpy 和占用同一设备的其他标签页，释放 USB 接口。Android 不使用 Apple ID、Apple 配对记录、开发者签名或 WDA；iPhone 连接流程保持独立。Windows 还可能需要设备厂商提供的 USB 调试驱动，未做 Windows 真机认证。
+
+浏览器使用固定版本的 Tango WebADB SDK，与设备直接认证。每个浏览器独立生成并保存调试私钥，私钥不会上传服务器；撤销授权可在手机的 USB 调试设置中完成。临时推送并启动官方 scrcpy 3.3.3 server（约 90 KB、Apache-2.0、SHA-256 校验），建立输入和画面通道，不安装 APK、不传音频、不自动同步手机剪贴板。中文输入使用「设置剪贴板并粘贴」，会覆盖手机剪贴板，部分安全输入框或厂商系统可能拒绝粘贴。官方来源和许可证位于 `web/android/vendor/NOTICE`，构建产物的 `licenses/` 也包含许可证。
+
+手动与 AI 操作共用同一会话队列：截图、点按、长按、滑动、中文输入、主屏幕/返回/锁屏/音量、列出/启动/结束应用、打开 URL、查询和等待界面元素。兼容 API 仍使用 `iphone_*` 工具名；Android 应用参数必须是 `list_apps` 返回的 Android package ID。时钟等厂商可变包名不走 iOS 快捷指令。旋转或显示尺寸无法核实时，坐标动作会报错，要求刷新截图。多显示器暂不支持。受保护的画面可能无法截图。
+
+`/device/ws` 沿用现有 origin 校验、短期会话令牌、1 MiB 帧上限与单连接所有权。Android 设备 ID 使用区分大小写的 `android:` 命名空间，同一设备不能被多个服务端会话同时占用。动作不自动重试，取消会丢弃尚未派发的动作。支持 WebCodecs 时优先由设备编码 H.264（最长边 1280 像素、上限 10 fps / 2 Mbps），浏览器解码后取新画面转为 JPEG 上传；通道不可用时退回系统 PNG 截图并在浏览器缩放。连续视频只在设备和浏览器之间传输。采图核对原生显示方向，方向或尺寸变化后等待新的编码配置和画面；坐标与元素边框统一换算。识别阶段并行采图和限时查询元素树，界面树不可用时保留截图。截图与元素查询耗时分别记录；模型上下文省略空布局节点，保留无标签但可聚焦的输入控件。
+
+适配器、取消/去重和真实 Rust 网关 WebSocket 集成测试使用明确标注的 ADB/截图 fixture；它们与下述 Xiaomi 平板实测分开记录，不代表所有机型的 USB 兼容性或任务成功率。Windows、多显示器和其他 Android 版本仍待验证。
+
+### 已完成的平板实测（2026-11-10）
+
+Xiaomi Pad 6S Pro 12.4 / Android 14，通过 Mac Chrome 的 WebUSB 连接本地 Rust 网关，已验证真实截图、桌面双向滑动、截图坐标打开设置、长按设置图标菜单、主屏幕和返回键、包名启动设置，以及在设置搜索框中粘贴中文。横屏和竖屏均验证了画面及坐标操作；竖屏视频截图为 856×1280，稳定采图为 115–116 ms。旋转过渡期间曾出现约 3.3 秒排队，稳定采图时延不包含这段过渡。纯控制模式显式关闭设备名称头，并为关闭剪贴板自动同步的 SDK 注册独立 ACK 协议处理，避免粘贴失败及控制流提前关闭。
+
+Chrome Network 中 5 次空闲设置页面 `/preview` 请求为 494、501、470、482、512 ms，中位数 494 ms；每次传输约 73–74 kB（含 base64/JSON）。这是本机 USB 采图、压缩及网关往返测量，不含视觉模型推理，也不代表所有安卓设备、画面或网络环境的表现。iPhone 真机测速由用户安排后续进行。
+
+随后在同一平板桌面发现系统 PNG 原图约 4.9 MB，采图约 2920 ms。改用 H.264 后，5 次真实 `/screen` 请求的 `timings.screenshotMs` 为 112、119、120、134、110 ms，中位数 119 ms，较这次 PNG 基线缩短约 96%。截图已验证为实际桌面，坐标点击能打开设置。该比较是单次 PNG 基线与 5 次视频采图样本，不能视为跨设备统计。`/screen` 总耗时仍约 1 秒，因为元素树查询达到 1 秒预算；这些数字均不含模型推理，`sourceBytes` 在视频模式下表示两次采图间接收的编码字节数。
 
 ## 本地开发
 
@@ -28,7 +48,7 @@ GATEWAY_BIN="$(cd ../target/release && pwd)/iphone-control-gateway" npm start
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，在页面粘贴服务器访问令牌并点击「连接 iPhone」。令牌仅在本页内存中使用。首次连接需要解锁手机、信任电脑，并根据原生向导完成开发者模式、Apple 账号与 WDA 签名。
 
-前端热更新可另开终端运行 `npm run web:dev`，访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 `/api` 与 `/ios` 代理至 `127.0.0.1:8787`；页面服务器地址留空即可。`.env.example` 包含这两个开发 origin。`npm start` 和 `npm run dev` 通过脚本启动 Rust 网关，默认由 Cargo 构建运行，也可在 shell 中设置 `GATEWAY_BIN` 指向预编译网关。Rust 启动时读取当前目录的 `.env`，shell 环境变量优先，原生子进程继承这些配置。安装多个工具链时可指定 `RUSTUP_TOOLCHAIN=1.90.0`。更改前端后，生产入口需要重新 `npm run build`。
+前端热更新可另开终端运行 `npm run web:dev`，访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 `/api`、`/device` 与 `/ios` 代理至 `127.0.0.1:8787`；页面服务器地址留空即可。`.env.example` 包含这两个开发 origin。`npm start` 和 `npm run dev` 通过脚本启动 Rust 网关，默认由 Cargo 构建运行，也可在 shell 中设置 `GATEWAY_BIN` 指向预编译网关。Rust 启动时读取当前目录的 `.env`，shell 环境变量优先，原生子进程继承这些配置。安装多个工具链时可指定 `RUSTUP_TOOLCHAIN=1.90.0`。更改前端后，生产入口需要重新 `npm run build`。
 
 ```bash
 cargo test --locked --manifest-path ../Cargo.toml -p ictl-gateway
@@ -40,7 +60,7 @@ npm run build
 
 Rust 入口测试通过独立服务进程验证 HTTP/WebSocket/TCP/Unix Socket 和原生 CLI fixture。`npm run test:rust` 自动构建网关，也可使用 `RUST_GATEWAY_BIN` 指定已构建的绝对路径。迁移前的 Node 实现移至 `tests/reference`，供原测试作为兼容性参照。测试也包含发布版 SDK 的 `requestUSBAccess → pairDevice` 集成：一个明确标注的假 USB peer 回应 usbmux 版本握手，用假原生控制器与真实网关验证接口回退、恢复配对、关闭和删除会话。它没有模拟物理 iPhone、Apple 登录、Lockdown 授权或 WDA 控制成功。
 
-## 页面行为
+## 页面行为（iPhone 流程）
 
 空白设备框表示尚无真实截图。Chrome 点击事件会立即调用 SDK 的 USB chooser，再读取 IndexedDB 配对记录、创建服务端会话并配对。原始现代 USB serial 统一转成 8-16 UDID，命令使用创建接口返回的 `deviceId`。发布版 SDK 负责候选配置遍历、接口申请、usbmux 通信和配对。接入层增加两处传输适配，服务器按 USB 单包发送上限拆分 StreamData，浏览器按长度头组装完整接收包并保留后续包。原生 WebUSB getter 和方法绑定回真实 USBDevice，USB 断开监听保留原始设备引用。
 
@@ -51,6 +71,20 @@ Rust 入口测试通过独立服务进程验证 HTTP/WebSocket/TCP/Unix Socket �
 取消连接会立即显示离线并禁用设备控制。若 SDK 配对或 USB 释放尚未结束，页面显示「等待 USB 释放」并暂时禁用重连，避免旧配对清理关闭新连接的同一 USB 设备。请等待处理结束；长时间未结束时，可刷新页面后重试。服务端 DELETE 等待最多 5 秒，但这个时限不会解除仍在进行的 SDK 配对或 USB 释放。
 
 AI 任务执行期间暂停手动操作。确认框显示具体操作、参数和原因；拒绝即停止任务。停止会阻止后续步骤，停止前已送出的操作可能仍已执行。动作、任务创建、确认和准备输入都不自动重试，超时后应查看手机再决定下一次操作。
+
+### 画面与识别性能
+
+网页通过 `/api/sessions/:id/preview` 获取纯图片，预览不会读取元素树。AI 运行期间该接口直接返回任务最近采集的真实画面；首张观察尚未完成时返回 `null`，页面保留现有画面。任务状态每秒独立刷新，不再等待截图完成。设备空闲时短时间内的并发预览合并，设备命令执行后会使预览缓存失效。
+
+AI 的 `/screen` 通过一个原生 `observe` 请求在同一设备锁内取得截图和元素树。只检查一次解锁状态，图片方向供元素树解析复用。原生引擎将只读元素快照限制为 1 秒，超时后模型按截图继续判断；已有 MCP 客户端默认保持原来的快照超时。升级必须同时构建网关和原生引擎，旧引擎不支持 `observe`。
+
+浏览器会话默认启用 `ICTL_LOW_LATENCY=1`：创建 WDA 会话时请求源端高质量 JPEG，并复用低延迟等待设置。设置未被 WDA 明确确认时恢复普通手势路径。确认成功的会话中，点击保留 200 毫秒绘制窗口，滑动仍保留原有稳定检测。图片点尺寸、横竖屏及区域坐标换算保持一致；`ICTL_LOW_LATENCY=0` 可关闭设备端 JPEG/等待配置，重新连接后生效。
+
+WDA HTTP 连接按完整响应边界复用。超时、取消、不完整响应会丢弃连接；空闲连接失效时仅 GET 最多重连一次，发出的 POST/动作不重放。`Connection: close` 或无明确消息边界的响应不入连接池。
+
+查询工具的有界文字结果直接作为下一轮只读证据，区域截图本身作为下一轮图像，避免重新采集整屏。没有当前图像的查询结果不能直接触发坐标动作，模型必须重新观察并规划。完全匹配“回到主屏幕 / go home”、“打开设置 / open settings”、“打开时钟 / open clock”的单步请求省略首次模型规划，动作后仍观察并调用模型验证；复合或否定指令走普通流程。查询内容不写入轮询的任务快照。
+
+任务面板显示最近一轮的观察、模型和操作耗时；API 的 `timings.capture` 进一步区分队列、截图和元素耗时，并提供 `sourceFormat` 和 `sourceBytes`（源图像二进制大小，不含 base64/HTTP 开销）。自动化覆盖模拟 WDA/USB/模型，实际公网耗时、手机文字清晰度及任务成功率仍需真机测量。
 
 ## 环境变量
 
@@ -63,12 +97,15 @@ AI 任务执行期间暂停手动操作。确认框显示具体操作、参数�
 | `RUNTIME_DIR` | 每会话原生数据和配对恢复索引目录，默认 `.runtime` |
 | `PUBLIC_BASE_URL` | 反向代理外部 HTTP(S) origin，决定返回的 ws/wss relay 地址 |
 | `ICTL_BIN` | 从当前源码构建的 `iphone-control` 可执行路径 |
+| `ICTL_LOW_LATENCY` | 浏览器启动的原生引擎默认 `1`；`0` 关闭设备端 JPEG/持久等待配置，重连生效 |
 | `WEB_DIST_DIR` | 前端构建目录，默认 `dist`，从仓库根目录运行时自动识别 `browser-control/dist` |
 | `LLM_BASE_URL` | 可选模型兼容 API 根地址，如 `https://provider.example/v1`，不含账号、query 或 fragment |
-| `LLM_MODEL` | 可选支持截图输入的模型名称 |
+| `LLM_MODEL` | 默认模型名称，页面可从服务商模型列表中另选 |
 | `LLM_API_KEY` | 可选模型 key，仅配置于服务器环境 |
 
 模型三个变量缺一即为未配置。当前客户端向 `/chat/completions` 发送视觉 Chat Completions 请求，使用 `temperature: 0`、`max_tokens: 1024`，要求模型返回校验后的纯 JSON 操作或完成消息。它不使用 function tools。服务商必须兼容图片输入、这些请求参数与响应格式；已配置只表示配置完整，不能证明服务商健康。o-series 等需要不同 token/temperature 参数的模型仍需后续适配，当前没有宣称通用模型兼容性或真实模型评测。
+
+任务模型下拉框来自同一 `LLM_BASE_URL` 的 `/models`，API key 仅由服务器发送。列表成功缓存 60 秒，失败缓存 15 秒，失败时提示并保留默认模型或上次列表。可点「刷新列表」重新读取服务器当前列表。所有返回的合法模型 ID 均可选择，是否支持图片、账号是否有权限及模型是否可用取决于服务商。任务创建可携带 `model`，服务器校验它属于模型列表或默认模型；省略则使用 `LLM_MODEL`。每个任务固定自己的模型，运行期间下拉框禁用，执行记录展示本次模型。切换不会修改其他设备或任务的默认模型。
 
 ## Linux 部署
 
@@ -89,11 +126,11 @@ phone.example.com {
 }
 ```
 
-把示例域名换成实际域名并配置 DNS；Caddy 自动处理 HTTPS 与 WebSocket upgrade。此示例不启用访问日志。若使用其他代理或启用日志，必须移除 `/ios/device/ws` 的 query：SDK 按协议在 URL 中携带短期会话 token。不要将 Authorization、准备输入或带 token 的 URL 写入代理/请求日志。单独的前端 origin 需要配置 CORS 与 WebSocket origin，首版部署建议同 origin。
+把示例域名换成实际域名并配置 DNS；Caddy 自动处理 HTTPS 与 WebSocket upgrade。此示例不启用访问日志。若使用其他代理或启用日志，必须移除 `/ios/device/ws` 和 `/device/ws` 的 query：SDK 按协议在 URL 中携带短期会话 token。不要将 Authorization、准备输入或带 token 的 URL 写入代理/请求日志。单独的前端 origin 需要配置 CORS 与 WebSocket origin，首版部署建议同 origin。
 
 `signing-state` 卷保留原生账号和签名材料，应按敏感数据管理访问和备份；运行目录与索引使用 owner-only 权限。关闭会话会终止其拥有的原生进程组并释放临时 socket，保留签名恢复资料。一个运行目录由一个网关进程独占；多实例共享卷前需要额外分布式租约。删除卷会丢失恢复资料，轮换控制令牌也会改变恢复索引键。
 
-Dockerfile 默认使用一个 Cargo 构建任务，适配小内存 VPS，可通过 `--build-arg CARGO_BUILD_JOBS=2` 调整。许可证生成复用 cargo-about 0.9.3 官方 Linux 发布包，下载后校验官方 SHA256。`--build-arg WEB_BASE=/iphone/` 可指定静态资源前缀，默认 `/`。子路径部署时，代理需去除网页路径前缀，并将同 origin 的 `/api/` 与 `/ios/` 转发给网关，`PUBLIC_BASE_URL` 仍填写 origin。
+Dockerfile 默认使用一个 Cargo 构建任务，适配小内存 VPS，可通过 `--build-arg CARGO_BUILD_JOBS=2` 调整。许可证生成复用 cargo-about 0.9.3 官方 Linux 发布包，下载后校验官方 SHA256。`--build-arg WEB_BASE=/iphone/` 可指定静态资源前缀，默认 `/`。子路径部署时，代理需去除网页路径前缀，并将同 origin 的 `/api/`、`/device/` 与 `/ios/` 转发给网关，`PUBLIC_BASE_URL` 仍填写 origin。
 
 2026-11-09 已在 Linux VPS 实际构建并运行容器，入口为 [云端工作台](https://amazingly.top/iphone/)。公网 HTTPS、静态资源、REST 鉴权、WebSocket 来源校验和升级均已验证。模型通过 VPS 上的 Magpie 网关接入 `codex/gpt-6.1-sol`，独立视觉 API 测试成功。用户选择本次先完成部署，VPS 与真实手机的联调尚未执行。详细范围见 [验证记录](VERIFICATION.md)。原生依赖的说明和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md) 与仓库原有 [第三方声明](../THIRD_PARTY.md)。
 

@@ -4,6 +4,18 @@ import { createServer } from "vite";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 const mod = await import("../web/interaction.mjs").catch(() => ({}));
+test('model picker lists provider models and locks selection during an active task', async t => {
+  const server = await createServer({ optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true }, appType: 'custom' });
+  t.after(() => server.close());
+  const { TaskPanel } = await server.ssrLoadModule('/web/components/TaskPanel.tsx');
+  const props = { ai: { aiReady: true, model: 'codex/default', models: ['codex/default', 'other/vision'] }, task: null, canRun: true, busy: false,
+    onStart() {}, onConfirm() {}, onStop() {}, onRefreshModels() {} };
+  const idle = renderToStaticMarkup(createElement(TaskPanel, props));
+  assert.match(idle, /<select id="task-model"/); assert.match(idle, /value="other\/vision"/);
+  assert.match(idle, /option value="codex\/default" selected/);
+  const running = renderToStaticMarkup(createElement(TaskPanel, { ...props, task: { state: 'thinking', model: 'other/vision', instruction: 'fixture', steps: [] } }));
+  assert.match(running, /<select id="task-model" disabled/); assert.match(running, /本次任务模型：other\/vision/);
+});
 test("pointer math uses JPEG native point dimensions with object-fit letterboxing and gesture bounds", () => {
   assert.equal(typeof mod.toPhonePoint, "function");
   const rect = { left: 20, top: 10, width: 200, height: 200 };
@@ -250,4 +262,17 @@ test("native setup complete state renders the localized finished label", async (
   );
   assert.match(html, /向导已结束/);
   assert.ok(!html.includes(">complete<"));
+});
+
+
+test("Android ready state enables control with a back key and never renders Apple credential setup", async t => {
+  const server = await createServer({ optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true }, appType: "custom" });
+  t.after(() => server.close());
+  const { App } = await server.ssrLoadModule("/web/App.tsx");
+  const state = { phase:"connected",device:{platform:"android",productName:"Android fixture"},error:null,warning:null,
+    session:{id:"fixture",deviceId:"android:ABC",platform:"android",state:"connected",ready:true,daemon:{state:{state:"ready"}},task:null,setup:{state:"complete",transcript:"Android authorized",exitCode:0}} };
+  const client = { snapshot:()=>state,subscribe:()=>()=>{} };
+  const html=renderToStaticMarkup(createElement(App,{client}));
+  assert.match(html,/可以控制/);assert.match(html,/返回/);
+  assert.ok(!html.includes('setup-transcript'));assert.ok(!html.includes('setup-input'));assert.ok(!html.includes('WDA 准备'));
 });

@@ -81,3 +81,23 @@ Rust 网关迁移后，容器 Dockerfile 已改为从当前源码编译两个 Ru
 AI 沿用当前 Rust TaskManager 的观察与操作循环，通过 VPS 现有 Magpie 模型 API 发起视觉 Chat Completions。独立模型探测使用红蓝测试图片，HTTP 200，耗时 3.82 秒，返回正确的 JSON 完成消息。该项验证的是模型 API，未将其计为真实手机任务验收。
 
 用户选择先完成部署、暂不连接手机，本次未进行 VPS → 浏览器 → 真实 iPhone 的操作验收。原有 Mac localhost 真机证据仍见上文。Apple 登录资料、私钥和本地签名目录未迁移到 VPS，首次云端连接需要按网页向导完成配对及 WDA 准备。后续需验证真实手机截图、手动操作、自然语言任务、重连与公网时延。
+
+## 性能、Android 与模型选择更新（2026-11-10）
+
+北京时间 09:51 已切换 VPS 镜像 `iphone-control-webusb:vps-20261110-models`，地址仍为 `https://amazingly.top/iphone/`。镜像清单摘要为 `sha256:7cdcfa0964c46f137cb3c6cdbf530fb7d3e23c29ad22ec9faa36280534fe8553`，源码归档 SHA256 为 `0d8587b7b6fdb26f3a252a0366d63667d504ee03156362c864076afa3d094b93`。该源码包含 Mac 识别性能优化、Android WebADB/H.264 采图与控制，以及任务模型选择。沿用现有服务器配置及持久化目录，旧镜像和 Compose 备份可用于回滚。
+
+服务端从 Magpie `/models` 读取模型目录；本次公网 `/api/config` 返回的 21 个模型 ID 与 Magpie 完全一致。页面可在「任务模型」选择，任务创建校验所选 ID 并固定在任务记录中，默认模型仍由 `LLM_MODEL` 指定。列表失败有提示并保留默认或缓存目录，模型 key 不发送给浏览器。上游失败会显示 HTTP 状态；独立探测观察到 `antigravity/gemini-3.5-flash` 返回 403，因此列入选择框不代表所有模型的权限、额度、图片能力或健康状态均已通过认证。
+
+新增 Nginx `/device/` 的 WSS 转发，沿用中继路径禁止访问日志的配置；`nginx -t` 和平滑重载通过。切换前，临时容器实际验证模型目录、前端资源及官方 scrcpy server SHA256 后退出。切换后工作台、JS、CSS、模型目录和原网站主页均返回 200，TLS 验证正常。
+
+公网验收使用明确标记的合成 Android peer，经 HTTPS 创建临时会话、WSS `/device/ws` 握手和 RPC 接收测试图片。缺少或错误凭据返回 401，非法 origin 返回 403，未列出的模型返回 400。以下三个所选模型经已部署的真实 TaskManager 和 Magpie 完成视觉任务，均正确返回「左红右蓝」，设备动作均为 0，随后临时会话删除并释放中继：
+
+| 模型 | 单次任务耗时 | 结果 |
+|---|---:|---|
+| `codex/gpt-6-luna` | 4135 ms | completed |
+| `antigravity/gemini-3.8-flash` | 9166 ms | completed |
+| `antigravity/claude-sonnet-4-6` | 2117 ms | completed |
+
+这是人工生成测试图片的单次接口验收，不是模型速度排名或公网真机任务基准。真实 Xiaomi 平板的本机截图、点击、长按、滑动、中文输入、返回和横竖屏证据与耗时见 README 的平板实测段落；本次未增加公网真机操控证据。Mac 锁屏使人工 Chrome 页面检查未能执行，界面由 SSR 回归、类型检查、生产构建及实际静态资源请求验证。
+
+本次 137 项浏览器/协议测试和 19 项 Rust 网关单元测试通过，0 失败、0 跳过；TypeScript、Vite `/iphone/` 构建、Clippy `-D warnings` 和 Linux Docker 构建通过。新增回归覆盖模型目录合并缓存、非法模型、跨会话模型隔离、目录重定向与凭据保护、默认模型回退及模型选择框的运行状态。

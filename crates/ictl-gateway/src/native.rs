@@ -92,6 +92,7 @@ impl NativeController {
             .env("ICTL_DATA_DIR", &self.0.data_dir)
             .env("ICTL_SOCKET", &self.0.socket_path)
             .env("ICTL_MANAGE_USBMUXD", "0")
+            .env("ICTL_LOW_LATENCY", std::env::var("ICTL_LOW_LATENCY").unwrap_or_else(|_| "1".into()))
             .env("USBMUXD_SOCKET_ADDRESS", &self.0.mux_address)
             .stdin(if mode == "setup" { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
@@ -423,7 +424,13 @@ mod tests {
     fn controller(socket: PathBuf, cancel: CancellationToken) -> NativeController {
         NativeController::new(
             "/bin/false".into(),
-            Device { serial_number: "a".repeat(40), vendor_id: 1452, product_id: 4776, product_name: None },
+            Device {
+                platform: crate::identity::Platform::Ios,
+                serial_number: "a".repeat(40),
+                vendor_id: 1452,
+                product_id: 4776,
+                product_name: None,
+            },
             "/tmp/unused".into(),
             socket,
             "127.0.0.1:1".into(),
@@ -475,7 +482,13 @@ mod tests {
         tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).await.unwrap();
         let ctl = NativeController::new(
             script,
-            Device { serial_number: "a".repeat(40), vendor_id: 1452, product_id: 4776, product_name: None },
+            Device {
+                platform: crate::identity::Platform::Ios,
+                serial_number: "a".repeat(40),
+                vendor_id: 1452,
+                product_id: 4776,
+                product_name: None,
+            },
             dir.path().join("data"),
             dir.path().join("ctl.sock"),
             "127.0.0.1:1".into(),

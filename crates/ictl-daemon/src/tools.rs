@@ -37,6 +37,13 @@ const HOME_SETTLE: Duration = Duration::from_secs(2);
 /// 按电源键后最多等这么久，等 WDA 报锁屏（iPhone 12 mini 实测约 1 秒）
 const LOCK_WAIT: Duration = Duration::from_secs(3);
 
+struct CapturedFrame {
+    image: Response,
+    view: Option<elements::View>,
+    source_bytes: usize,
+    source_format: &'static str,
+}
+
 impl Daemon {
     /// 配置了密码就在锁屏时自动解锁；没配置而手机锁着则报错（与 toolkit 一致）
     pub(crate) async fn ensure_unlocked(&self, g: &mut Inner) -> Result<(), String> {
@@ -252,6 +259,14 @@ impl Daemon {
         region: Option<(f64, f64, f64, f64)>,
     ) -> Result<Response, String> {
         self.ensure_unlocked(g).await?;
+        self.capture_frame(g, region).await.map(|frame| frame.image)
+    }
+
+    async fn capture_frame(
+        &self,
+        g: &mut Inner,
+        region: Option<(f64, f64, f64, f64)>,
+    ) -> Result<CapturedFrame, String> {
         let wda_png = match self.wda(g) {
             Some(w) => w.screenshot_png().await.ok(),
             None => None,
@@ -274,7 +289,22 @@ impl Daemon {
                 )
             }
         };
-        let screen = self.screen(g).await?;
+        let view = match self.wda(g) {
+            Some(w) => w.view().await.ok(),
+            None => None,
+        };
+        let screen = match view {
+            Some(v) => v.screen,
+            None => self.screen(g).await?,
+        };
+        let source_bytes = png.len();
+        let source_format = if png.starts_with(&[255, 216, 255]) {
+            "jpeg"
+        } else if png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "png"
+        } else {
+            "other"
+        };
         // 解码、缩放、JPEG 编码是 CPU 活（1290×2796），放到阻塞线程，不卡住主循环
         // 说明文字在阻塞线程里生成：带上这个请求的语言
         let lang = ictl_l10n::lang();
@@ -286,7 +316,45 @@ impl Daemon {
         })
         .await
         .map_err(|e| ictl_l10n::trf!("图像处理任务异常：{e}", "Image processing task failed: {e}"))??;
-        Ok(Response::Image { jpeg_base64: base64::engine::general_purpose::STANDARD.encode(jpeg), caption })
+        Ok(CapturedFrame {
+            image: Response::Image { jpeg_base64: base64::engine::general_purpose::STANDARD.encode(jpeg), caption },
+            view,
+            source_bytes,
+            source_format,
+        })
+    }
+
+    pub(crate) async fn observe(&self, g: &mut Inner, limit: usize, budget: Duration) -> Result<Response, String> {
+        let started = Instant::now();
+        self.ensure_unlocked(g).await?;
+        let CapturedFrame { image: frame, view, source_bytes, source_format } = self.capture_frame(g, None).await?;
+        let Response::Image { jpeg_base64, caption } = frame else { return Ok(frame) };
+        let mut observation = serde_json::json!({
+            "deviceId": g.device.as_ref().map(|d| d.udid.as_str()),
+            "imageBase64":jpeg_base64,"caption":caption,"elementsText":"",
+            "capturedAt":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+            "timings":{"screenshotMs":started.elapsed().as_millis() as u64,"sourceBytes":source_bytes,"sourceFormat":source_format}
+        });
+        let reading = Instant::now();
+        if limit > 0 && !budget.is_zero() {
+            let read = async {
+                let wda = self.require_wda(g)?;
+                let view = match view {
+                    Some(view) => view,
+                    None => wda.view().await.map_err(|e| e.to_string())?,
+                };
+                let tree = wda.tree_in_view(view).await.map_err(|e| e.to_string())?;
+                let text = tree.elements.iter().take(limit).map(|e| e.describe()).collect::<Vec<_>>().join("\n");
+                g.elements_cache = Some((Instant::now(), tree));
+                Ok::<_, String>(text)
+            };
+            match tokio::time::timeout(budget, read).await {
+                Ok(Ok(text)) => observation["elementsText"] = serde_json::json!(text),
+                _ => observation["elementsError"] = serde_json::json!("UI elements unavailable"),
+            }
+        }
+        observation["timings"]["elementsMs"] = serde_json::json!(reading.elapsed().as_millis() as u64);
+        Ok(Response::text(observation.to_string()))
     }
 
     /// 当前界面的元素树。缓存不超过 `max_age` 就直接用（0 = 总是重读）；重读的结果写回缓存
@@ -308,9 +376,19 @@ impl Daemon {
         filter: &str,
         limit: usize,
         max_age: Duration,
+        snapshot_timeout: Duration,
     ) -> Result<String, String> {
         self.ensure_unlocked(g).await?;
-        let els = self.tree(g, max_age).await?.elements;
+        let tree = if snapshot_timeout.is_zero() {
+            self.tree(g, max_age).await?
+        } else {
+            // Bound the device read itself; closing a caller socket only cancels queued
+            // daemon work and would otherwise leave this read holding the device lock.
+            tokio::time::timeout(snapshot_timeout, self.tree(g, max_age))
+                .await
+                .map_err(|_| "UI element snapshot budget exceeded".to_owned())??
+        };
+        let els = tree.elements;
         let shown: Vec<&elements::Element> =
             if filter.is_empty() { els.iter().collect() } else { elements::filter(&els, filter) };
         let lines: Vec<_> = shown.iter().take(limit).map(|e| e.describe()).collect();

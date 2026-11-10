@@ -8,6 +8,8 @@ export type TaskState =
   | "failed"
   | "stopped";
 export interface Task {
+  model?: string;
+  timings?: { observationMs?: number; modelMs?: number; actionMs?: number };
   id: string;
   instruction: string;
   state: TaskState;
@@ -39,6 +41,7 @@ export interface Setup {
   error?: string;
 }
 export interface Session {
+  platform?: "ios" | "android";
   id: string;
   deviceId: string;
   state: string;
@@ -51,12 +54,13 @@ export interface ClientState {
   phase: string;
   transportStatus?: string;
   cleanupPending?: boolean;
-  device: { productName?: string; serialNumber?: string } | null;
+  device: { platform?: "ios" | "android"; productName?: string; serialNumber?: string } | null;
   session: Session | null;
   error: string | null;
   warning: string | null;
 }
 export interface Screen {
+  timings?: { screenshotMs?: number; elementsMs?: number; sourceFormat?: string; sourceBytes?: number; uploadedBytes?: number; queueMs?: number };
   imageBase64: string;
   caption: string;
   deviceId: string;
@@ -66,6 +70,8 @@ export interface Screen {
 export interface AIConfig {
   aiReady: boolean;
   model: string | null;
+  models?: string[];
+  modelsError?: string;
 }
 export type Command = (tool: string, args: Args) => void;
 export const activeTask = (task: Task | null | undefined) =>
