@@ -203,6 +203,18 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_jpeg_keeps_point_dimensions_and_region_coordinates() {
+        let source = jpeg(&DynamicImage::new_rgb8(90, 180), 90).unwrap();
+        let screen = ScreenSize { width: 30.0, height: 60.0 };
+        let (frame, _) = full_screen(&source, screen, "WDA").unwrap();
+        let decoded = image::load_from_memory(&frame).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (30, 60));
+        let (crop, caption) = region(&source, screen, (5.0, 10.0, 10.0, 20.0), "WDA").unwrap();
+        let decoded = image::load_from_memory(&crop).unwrap();
+        assert_eq!(decoded.height(), 600);
+        assert!(caption.contains('5') && caption.contains("10"), "{caption}");
+    }
 
     const SCREEN: ScreenSize = ScreenSize { width: 430.0, height: 932.0 };
 

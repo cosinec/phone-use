@@ -2,11 +2,12 @@
 //!
 //! WDA 直接经 usbmuxd 连手机上的端口，本机不监听任何端口（docs/decisions.md D3）。
 //! idevice 自带的 `WdaClient` 不支持 `excluded_attributes`、appium settings、W3C actions 等，
-//! 所以这里自己发请求：每个请求一条新连接，读够一个完整响应（Content-Length / chunked 结束块）就关掉。
+//! 所以这里自己发请求，按响应边界复用连接；取消、超时或不完整响应会丢弃连接。
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use idevice::provider::IdeviceProvider;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,11 +32,17 @@ pub trait Transport: Send + Sync {
 pub struct DeviceTransport {
     provider: Arc<dyn IdeviceProvider>,
     port: u16,
+    idle: Arc<Mutex<Option<IdleConnection>>>,
+}
+
+struct IdleConnection {
+    socket: Box<dyn idevice::ReadWrite>,
+    at: Instant,
 }
 
 impl DeviceTransport {
     pub fn new(provider: Arc<dyn IdeviceProvider>, port: u16) -> Self {
-        Self { provider, port }
+        Self { provider, port, idle: Arc::new(Mutex::new(None)) }
     }
 }
 
@@ -58,73 +65,115 @@ impl Transport for DeviceTransport {
         body: Option<Vec<u8>>,
         timeout: Duration,
     ) -> std::io::Result<(u16, Vec<u8>)> {
-        let t0 = std::time::Instant::now();
+        let started = Instant::now();
         let req = build_request(method, path, body.as_deref());
-        let idevice = tokio::time::timeout(CONNECT_TIMEOUT, self.provider.connect(self.port))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    ictl_l10n::tr!("连接 WDA 端口超时", "connecting to the WDA port timed out"),
-                )
-            })?
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string()))?;
-        let mut sock = idevice.get_socket().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                ictl_l10n::tr!("连接没有套接字", "the connection has no socket"),
-            )
-        })?;
-        let fut = async {
-            // 没写完 WDA 不会处理（HTTP 请求不完整），算没送到
-            let not_sent = |e: std::io::Error| std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string());
-            sock.write_all(&req).await.map_err(not_sent)?;
-            sock.flush().await.map_err(not_sent)?;
-            // WDA 收到 `Connection: close` 也不关连接，不能读到 EOF：读够一个完整响应就停。
-            // 头部只解析一次；正文按 Content-Length 判断，chunked 只在收到结束块后才完整解一次
-            let mut buf = Vec::new();
-            let mut chunk = vec![0u8; 64 * 1024];
-            let mut head: Option<(usize, Framing)> = None;
-            loop {
-                if head.is_none() {
-                    head = parse_head(&buf);
-                    if let Some((split, Framing::Length(n))) = head {
-                        buf.reserve((split + n).saturating_sub(buf.len()));
-                    }
+        let operation = async {
+            let mut idle = self.idle.lock().await;
+            // Take the socket OUT of the pool before awaiting. Dropping this future
+            // after cancellation cannot return a half-consumed response to the pool.
+            let mut connection = idle.take().filter(|c| c.at.elapsed() < Duration::from_secs(15));
+            if let Some(c) = connection.as_mut() {
+                let mut probe = [0u8; 1];
+                // Detect an already-closed idle socket before sending a mutation.
+                // An uncertain failure after writing still never replays a mutation.
+                if tokio::time::timeout(Duration::from_millis(1), c.socket.read(&mut probe)).await.is_ok() {
+                    connection = None;
                 }
-                if let Some((split, framing)) = head
-                    && framing.complete(&buf[split..])
-                {
-                    break;
-                }
-                let n = sock.read(&mut chunk).await.map_err(after_sent)?;
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
             }
-            parse_response(buf).map_err(after_sent)
+            let reused = connection.is_some();
+            for attempt in 0..2 {
+                let mut socket = match connection.take() {
+                    Some(c) => c.socket,
+                    None => tokio::time::timeout(CONNECT_TIMEOUT, self.provider.connect(self.port))
+                        .await
+                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotConnected, "WDA connection timed out"))?
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string()))?
+                        .get_socket()
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::NotConnected, "WDA socket unavailable")
+                        })?,
+                };
+                let response = exchange(&mut *socket, &req).await;
+                match response {
+                    Ok((status, body, reusable)) => {
+                        if reusable {
+                            *idle = Some(IdleConnection { socket, at: Instant::now() });
+                        }
+                        return Ok((status, body));
+                    }
+                    // A stale persistent connection may be retried ONLY for GET,
+                    // under the original deadline. POST/actions are never replayed.
+                    Err(_) if reused && attempt == 0 && method == "GET" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!()
         };
-        let r = tokio::time::timeout(timeout, fut).await.map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                ictl_l10n::trf!("请求超时（{} 秒）", "request timed out ({} s)", timeout.as_secs()),
-            )
-        })?;
-        // 路径截掉查询串（/source 的排除属性很长）
+        let result = tokio::time::timeout(timeout, operation)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "WDA request timed out"))?;
         let short = path.split('?').next().unwrap_or(path);
-        match &r {
-            Ok((status, _)) => tracing::debug!("wda {method} {short} → {status}（{:.2}s）", t0.elapsed().as_secs_f64()),
-            Err(e) => tracing::debug!("wda {method} {short} 失败（{:.2}s）：{e}", t0.elapsed().as_secs_f64()),
-        }
-        r
+        tracing::debug!("wda {method} {short} ({:.2}s), ok={}", started.elapsed().as_secs_f64(), result.is_ok());
+        result
     }
+}
+
+async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
+    socket: &mut S,
+    request: &[u8],
+) -> std::io::Result<(u16, Vec<u8>, bool)> {
+    // Once writing starts, classify failure as uncertain, including flush errors.
+    // The native engine must not fall back to HID and duplicate a sent action.
+    socket.write_all(request).await.map_err(after_sent)?;
+    socket.flush().await.map_err(after_sent)?;
+    let mut buffer = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut head = None;
+    loop {
+        if head.is_none() {
+            head = parse_head(&buffer);
+            if head.is_none() && buffer.len() >= 64 * 1024 {
+                return Err(after_sent(std::io::Error::other("WDA response headers too large")));
+            }
+        }
+        if let Some((split, framing)) = head
+            && framing.complete(&buffer[split..])
+        {
+            break;
+        }
+        let n = socket.read(&mut chunk).await.map_err(after_sent)?;
+        if n == 0 {
+            break;
+        }
+        if buffer.len() + n > 32 * 1024 * 1024 {
+            return Err(after_sent(std::io::Error::other("WDA response too large")));
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+    let reusable = head.is_some_and(|(split, framing)| {
+        let headers = String::from_utf8_lossy(&buffer[..split]).to_ascii_lowercase();
+        let exact = match framing {
+            Framing::Length(n) => buffer.len() == split + n,
+            Framing::Chunked => framing.complete(&buffer[split..]),
+            Framing::UntilEof => false,
+        };
+        exact
+            && headers.starts_with("http/1.1 ")
+            && !headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(key, value)| {
+                    key.trim() == "connection" && value.split(',').any(|token| token.trim() == "close")
+                })
+            })
+    });
+    let (status, body) = parse_response(buffer).map_err(after_sent)?;
+    Ok((status, body, reusable))
 }
 
 pub(crate) fn build_request(method: &str, path: &str, body: Option<&[u8]>) -> Vec<u8> {
     let body = body.unwrap_or_default();
-    let mut req =
-        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nAccept: application/json\r\n"
+    );
     if method != "GET" || !body.is_empty() {
         req.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", body.len()));
     }
@@ -236,6 +285,137 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use idevice::{Idevice, IdeviceError, pairing_file::PairingFile};
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        pin::Pin,
+        sync::{
+            Mutex as SyncMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug)]
+    struct Provider {
+        sockets: SyncMutex<VecDeque<tokio::io::DuplexStream>>,
+        connects: AtomicUsize,
+    }
+    impl IdeviceProvider for Provider {
+        fn connect(&self, _: u16) -> Pin<Box<dyn Future<Output = Result<Idevice, IdeviceError>> + Send>> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let socket = self.sockets.lock().unwrap().pop_front();
+            Box::pin(async move {
+                socket
+                    .map(|s| Idevice::new(Box::new(s), "fixture"))
+                    .ok_or_else(|| IdeviceError::UnexpectedResponse("no fixture socket".into()))
+            })
+        }
+        fn label(&self) -> &str {
+            "fixture"
+        }
+        fn get_pairing_file(&self) -> Pin<Box<dyn Future<Output = Result<PairingFile, IdeviceError>> + Send>> {
+            Box::pin(async { Err(IdeviceError::UnexpectedResponse("not used by HTTP fixture".into())) })
+        }
+    }
+    fn transport(count: usize) -> (DeviceTransport, Arc<Provider>, Vec<tokio::io::DuplexStream>) {
+        let (clients, peers): (VecDeque<_>, Vec<_>) = (0..count).map(|_| tokio::io::duplex(65536)).unzip();
+        let provider = Arc::new(Provider { sockets: SyncMutex::new(clients), connects: AtomicUsize::new(0) });
+        (DeviceTransport::new(provider.clone(), 8100), provider, peers)
+    }
+    async fn request(socket: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            bytes.push(socket.read_u8().await.unwrap());
+        }
+        let text = String::from_utf8_lossy(&bytes).to_lowercase();
+        let length = text
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map(|n| n.trim().parse::<usize>().unwrap())
+            .unwrap_or(0);
+        let at = bytes.len();
+        bytes.resize(at + length, 0);
+        socket.read_exact(&mut bytes[at..]).await.unwrap();
+        bytes
+    }
+    async fn ok(socket: &mut tokio::io::DuplexStream) {
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_requests_reuse_one_connection() {
+        let (transport, provider, mut peers) = transport(1);
+        let mut peer = peers.pop().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                request(&mut peer).await;
+                ok(&mut peer).await;
+            }
+        });
+        for _ in 0..4 {
+            assert_eq!(transport.send("GET", "/status", None, Duration::from_secs(1)).await.unwrap().0, 200);
+        }
+        server.await.unwrap();
+        assert_eq!(provider.connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_get_reconnects_once_but_a_sent_post_never_replays() {
+        for method in ["GET", "POST"] {
+            let (transport, provider, mut peers) = transport(2);
+            let mut second = peers.pop().unwrap();
+            let mut first = peers.pop().unwrap();
+            let server = tokio::spawn(async move {
+                request(&mut first).await;
+                ok(&mut first).await;
+                request(&mut first).await;
+            });
+            let retry = tokio::spawn(async move {
+                request(&mut second).await;
+                ok(&mut second).await;
+            });
+            transport.send("GET", "/status", None, Duration::from_secs(1)).await.unwrap();
+            let result = transport.send(method, "/actions", Some(b"{}".to_vec()), Duration::from_secs(1)).await;
+            if method == "GET" {
+                assert!(result.is_ok());
+                assert_eq!(provider.connects.load(Ordering::SeqCst), 2);
+                retry.await.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().kind(), AFTER_SENT);
+                assert_eq!(provider.connects.load(Ordering::SeqCst), 1);
+                retry.abort();
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_discards_its_connection_and_late_body() {
+        let (transport, provider, mut peers) = transport(2);
+        let mut second = peers.pop().unwrap();
+        let mut first = peers.pop().unwrap();
+        let server = tokio::spawn(async move {
+            request(&mut first).await;
+            ok(&mut first).await;
+            request(&mut first).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate").await;
+        });
+        let next = tokio::spawn(async move {
+            request(&mut second).await;
+            ok(&mut second).await;
+        });
+        transport.send("GET", "/status", None, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(
+            transport.send("GET", "/source", None, Duration::from_millis(20)).await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(transport.send("GET", "/status", None, Duration::from_secs(1)).await.unwrap().1, b"{}");
+        assert_eq!(provider.connects.load(Ordering::SeqCst), 2);
+        next.await.unwrap();
+        server.await.unwrap();
+    }
 
     #[test]
     fn request_has_length_only_with_body() {

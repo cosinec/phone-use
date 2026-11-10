@@ -4,6 +4,7 @@
 !LICENSE
 !docker/
 !docker/about.toml
+!docker/web-about.toml
 !docker/about.hbs
 !crates/
 !crates/**
@@ -19,3 +20,6 @@ browser-control/.runtime/
 browser-control/.env
 browser-control/.env.*
 !browser-control/.env.example
+
+browser-control/pkg/
+browser-control/pkg-node/
