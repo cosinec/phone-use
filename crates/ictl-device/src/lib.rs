@@ -89,6 +89,8 @@ impl From<IdeviceError> for DeviceError {
             IdeviceError::PairingDialogResponsePending => Self::PairingPending,
             IdeviceError::UserDeniedPairing => Self::PairingDenied,
             IdeviceError::DeveloperModeNotEnabled => Self::DeveloperModeOff,
+            // 带上底层 io::Error，否则只剩「device socket io failed」，看不出是断开、超时还是被重置
+            IdeviceError::Socket(io) => Self::Idevice(format!("device socket io failed ({:?}: {io})", io.kind())),
             other => Self::Idevice(other.to_string()),
         }
     }
