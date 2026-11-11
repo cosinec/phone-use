@@ -42,7 +42,9 @@ pub struct UdpDatagram {
 const MAX_RETRIES: u32 = 5;
 
 /// Initial retransmission timeout in milliseconds. Doubles on each retry.
-const INITIAL_RTO_MS: u64 = 200;
+// RFC 6298 section 2.1: WAN relays must not assume a sub-200ms RTT.
+const INITIAL_RTO_MS: u64 = 1000;
+const MAX_RTO_MS: u64 = 64_000;
 
 const OUR_WSCALE: u8 = 8;
 
@@ -58,19 +60,6 @@ const DEFAULT_SEND_WINDOW: usize = 1 << 20; // 1 MiB
 struct UnackedSegment {
     seq: u32,
     data: Arc<[u8]>,
-    sent_at: Instant,
-    retries: u32,
-}
-
-impl UnackedSegment {
-    fn rto(&self) -> std::time::Duration {
-        // 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms (capped)
-        std::time::Duration::from_millis(INITIAL_RTO_MS << self.retries.min(6))
-    }
-
-    fn is_timed_out(&self) -> bool {
-        self.sent_at.elapsed() >= self.rto()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +80,11 @@ struct ConnectionState {
     /// Segments we have sent but not yet received an ACK for, in send order.
     unacked: VecDeque<UnackedSegment>,
     bytes_in_flight: usize,
+    /// One retransmission timer per connection (RFC 6298 section 5). Advancing
+    /// ACKs restart it; queued segments do not retain independent stale timers.
+    retransmit_started: Option<Instant>,
+    rto_ms: u64,
+    retries_without_progress: u32,
     peer_window: u32,
     peer_wscale: Option<u8>,
 }
@@ -114,6 +108,9 @@ impl ConnectionState {
             status: ConnectionStatus::WaitingForSyn,
             unacked: VecDeque::new(),
             bytes_in_flight: 0,
+            retransmit_started: None,
+            rto_ms: INITIAL_RTO_MS,
+            retries_without_progress: 0,
             peer_window: 0,
             peer_wscale: None,
         }
@@ -508,8 +505,12 @@ impl Adapter {
 
             let action = match self.states.get(&hp) {
                 Some(state) => match state.unacked.front() {
-                    Some(seg) if seg.is_timed_out() => {
-                        if seg.retries >= MAX_RETRIES {
+                    Some(seg)
+                        if state.retransmit_started.is_some_and(|started| {
+                            started.elapsed() >= std::time::Duration::from_millis(state.rto_ms)
+                        }) =>
+                    {
+                        if state.retries_without_progress >= MAX_RETRIES {
                             Action::Kill
                         } else {
                             Action::Retransmit { seq: seg.seq, data: seg.data.clone() }
@@ -542,6 +543,7 @@ impl Adapter {
                         // segments queued would kill it again on every check and keep
                         // reporting pending work forever.
                         state.unacked.clear();
+                        state.retransmit_started = None;
                         state.bytes_in_flight = 0;
                         state.write_buffer.clear();
                     }
@@ -549,12 +551,11 @@ impl Adapter {
                 Action::Retransmit { seq, data } => {
                     debug!("retransmitting {} bytes for hp={hp}", data.len());
 
-                    // Bump retry counter before the await so it's visible even if we're cancelled.
-                    if let Some(state) = self.states.get_mut(&hp)
-                        && let Some(seg) = state.unacked.front_mut()
-                    {
-                        seg.retries += 1;
-                        seg.sent_at = Instant::now();
+                    // Commit timer/backoff before cancellable transport I/O.
+                    if let Some(state) = self.states.get_mut(&hp) {
+                        state.retries_without_progress += 1;
+                        state.retransmit_started = Some(Instant::now());
+                        state.rto_ms = state.rto_ms.saturating_mul(2).min(MAX_RTO_MS);
                     }
 
                     let ip = {
@@ -696,14 +697,33 @@ impl Adapter {
             // ------------------------------------------------------------------
             if res.flags.ack {
                 let ack_num = res.acknowledgment_number;
-                while let Some(seg) = state.unacked.front() {
-                    let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
-                    if seq_lte(seg_end, ack_num) {
-                        let popped = state.unacked.pop_front().unwrap();
-                        state.bytes_in_flight = state.bytes_in_flight.saturating_sub(popped.data.len());
-                    } else {
-                        break;
+                // Only SND.UNA < ACK <= SND.NXT confirms new transmitted bytes.
+                // Duplicate, stale and future ACKs must not extend retry lifetime.
+                let advances =
+                    state.unacked.front().is_some_and(|seg| seq_lt(seg.seq, ack_num) && seq_lte(ack_num, state.seq));
+                if advances {
+                    while let Some(seg) = state.unacked.front_mut() {
+                        let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
+                        if seq_lte(seg_end, ack_num) {
+                            let popped = state.unacked.pop_front().unwrap();
+                            state.bytes_in_flight = state.bytes_in_flight.saturating_sub(popped.data.len());
+                        } else {
+                            // A cumulative ACK may advance within an MSS-sized
+                            // segment. Retransmit only its unacknowledged suffix.
+                            let consumed = ack_num.wrapping_sub(seg.seq) as usize;
+                            if consumed > 0 {
+                                seg.data = Arc::from(&seg.data[consumed..]);
+                                seg.seq = ack_num;
+                                state.bytes_in_flight = state.bytes_in_flight.saturating_sub(consumed);
+                            }
+                            break;
+                        }
                     }
+                    state.retries_without_progress = 0;
+                    state.retransmit_started = (!state.unacked.is_empty()).then(Instant::now);
+                    // Retain the current backed-off RTO. No RTT estimator is
+                    // used, so retransmission ACKs cannot contaminate an RTT
+                    // sample (Karn's rule) or prematurely collapse the backoff.
                 }
             }
 
@@ -892,7 +912,11 @@ impl Adapter {
             let len = data.len();
             state.write_buffer.drain(..len);
             state.bytes_in_flight += len;
-            state.unacked.push_back(UnackedSegment { seq, data, sent_at: Instant::now(), retries: 0 });
+            if state.unacked.is_empty() {
+                state.retransmit_started = Some(Instant::now());
+                state.retries_without_progress = 0;
+            }
+            state.unacked.push_back(UnackedSegment { seq, data });
             state.seq = state.seq.wrapping_add(len as u32);
         }
 
@@ -1566,5 +1590,197 @@ mod tests {
         // Data must NOT have been buffered again.
         let second_read = adapter.uncache_all(hp).unwrap();
         assert!(second_read.is_empty(), "duplicate payload must not be re-buffered");
+    }
+    // WAN regression tests: ACK progress drives a connection timer, not each
+    // segment's original send age. Paused time keeps the 63s failure budget fast.
+    const RTO_TEST_HP: u16 = 4444;
+    async fn rto_test_adapter(seq: u32, data: &[u8], mss: usize) -> (Adapter, DuplexStream) {
+        let (client, mut wire) = tokio::io::duplex(65536);
+        let mut adapter = Adapter::new(Box::new(TestTransport(client)), IpAddr::V6(HOST_IP), IpAddr::V6(PEER_IP));
+        adapter.set_mss(mss);
+        let mut state = ConnectionState::new(RTO_TEST_HP, PEER_PORT);
+        state.status = ConnectionStatus::Connected;
+        state.seq = seq;
+        state.ack = PEER_ISN;
+        state.peer_window = 65535;
+        adapter.states.insert(RTO_TEST_HP, state);
+        adapter.queue_send(data, RTO_TEST_HP).unwrap();
+        adapter.write_buffer_flush().await.unwrap();
+        for _ in data.chunks(mss) {
+            rto_test_read(&mut wire).await;
+        }
+        (adapter, wire)
+    }
+    async fn rto_test_ack(adapter: &mut Adapter, ack: u32) {
+        adapter
+            .process_tcp_packet_from_payload(&tcp_seg(
+                RTO_TEST_HP,
+                PEER_ISN,
+                ack,
+                TcpFlags { ack: true, ..Default::default() },
+                &[],
+            ))
+            .await
+            .unwrap();
+    }
+    async fn rto_test_read(wire: &mut DuplexStream) -> TcpPacket {
+        tokio::time::timeout(Duration::from_millis(10), read_pkt(wire))
+            .await
+            .expect("expected retransmission did not reach the transport")
+    }
+    fn rto_test_wire_empty(wire: &mut DuplexStream) {
+        use futures::FutureExt;
+        assert!(
+            wire.read(&mut [0u8; 1]).now_or_never().is_none(),
+            "unexpected retransmission on an advancing-ACK connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn wan_initial_rto_is_at_least_one_second() {
+        tokio::time::pause();
+        let (mut adapter, mut wire) = rto_test_adapter(100, b"ABCD", 4).await;
+        tokio::time::advance(Duration::from_millis(999)).await;
+        adapter.check_retransmissions().await.unwrap();
+        rto_test_wire_empty(&mut wire);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        adapter.check_retransmissions().await.unwrap();
+        let packet = rto_test_read(&mut wire).await;
+        assert_eq!(packet.sequence_number, 100);
+        assert_eq!(packet.payload, b"ABCD");
+    }
+
+    #[tokio::test]
+    async fn wan_new_ack_restarts_timer_for_the_remaining_segment() {
+        tokio::time::pause();
+        let (mut adapter, mut wire) = rto_test_adapter(100, b"ABCDEFGH", 4).await;
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS * 4 / 5)).await;
+        rto_test_ack(&mut adapter, 104).await;
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS / 5 + 1)).await;
+        adapter.check_retransmissions().await.unwrap();
+        rto_test_wire_empty(&mut wire);
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS * 4 / 5)).await;
+        adapter.check_retransmissions().await.unwrap();
+        let packet = rto_test_read(&mut wire).await;
+        assert_eq!(packet.sequence_number, 104);
+        assert_eq!(packet.payload, b"EFGH");
+    }
+
+    /// VPS trace: a batch of advancing 48-byte ACKs used to trigger a burst
+    /// of retransmissions because every newly exposed head was already old.
+    #[tokio::test]
+    async fn wan_batched_ack_progress_does_not_retransmit_each_old_head() {
+        tokio::time::pause();
+        let data = vec![b'x'; 20 * 48];
+        let (mut adapter, mut wire) = rto_test_adapter(100, &data, 48).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        for delivered in 1..20 {
+            rto_test_ack(&mut adapter, 100 + delivered * 48).await;
+            // Match AdapterHandle: each received ACK immediately drives flush.
+            adapter.write_buffer_flush().await.unwrap();
+            rto_test_wire_empty(&mut wire);
+        }
+        // The last unacknowledged segment still retries if progress stops.
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS + 1)).await;
+        adapter.write_buffer_flush().await.unwrap();
+        let packet = rto_test_read(&mut wire).await;
+        assert_eq!(packet.sequence_number, 100 + 19 * 48);
+        assert_eq!(packet.payload, vec![b'x'; 48]);
+        rto_test_ack(&mut adapter, 100 + data.len() as u32).await;
+        tokio::time::advance(Duration::from_secs(120)).await;
+        adapter.write_buffer_flush().await.unwrap();
+        rto_test_wire_empty(&mut wire);
+        assert!(!adapter.has_pending_work());
+    }
+
+    #[tokio::test]
+    async fn wan_partial_ack_trims_confirmed_bytes_and_restarts_timer() {
+        tokio::time::pause();
+        let (mut adapter, mut wire) = rto_test_adapter(100, b"ABCDEFGH", 8).await;
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS * 4 / 5)).await;
+        rto_test_ack(&mut adapter, 103).await;
+        assert_eq!(adapter.states[&RTO_TEST_HP].bytes_in_flight, 5);
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS / 5 + 1)).await;
+        adapter.check_retransmissions().await.unwrap();
+        rto_test_wire_empty(&mut wire);
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS * 4 / 5)).await;
+        adapter.check_retransmissions().await.unwrap();
+        let packet = rto_test_read(&mut wire).await;
+        assert_eq!(packet.sequence_number, 103);
+        assert_eq!(packet.payload, b"DEFGH");
+    }
+
+    #[tokio::test]
+    async fn wan_duplicate_old_and_future_acks_cannot_extend_retry_lifetime() {
+        tokio::time::pause();
+        let (mut adapter, mut wire) = rto_test_adapter(100, b"ABCD", 4).await;
+        for retry in 0..=MAX_RETRIES {
+            let interval = INITIAL_RTO_MS << retry.min(6);
+            tokio::time::advance(Duration::from_millis(interval * 4 / 5)).await;
+            for ack in [100, 99, 105] {
+                rto_test_ack(&mut adapter, ack).await;
+            }
+            assert_eq!(adapter.states[&RTO_TEST_HP].bytes_in_flight, 4, "invalid ACK cleared pending data");
+            tokio::time::advance(Duration::from_millis(interval / 5 + 1)).await;
+            adapter.check_retransmissions().await.unwrap();
+            if retry < MAX_RETRIES {
+                let packet = rto_test_read(&mut wire).await;
+                assert_eq!(packet.sequence_number, 100);
+                assert_eq!(packet.payload, b"ABCD");
+            }
+        }
+        assert_eq!(adapter.get_status(RTO_TEST_HP).unwrap(), ConnectionStatus::Error(ErrorKind::TimedOut));
+        assert!(adapter.states[&RTO_TEST_HP].unacked.is_empty());
+        assert!(!adapter.has_pending_work());
+    }
+
+    #[tokio::test]
+    async fn wan_forward_ack_preserves_backoff_but_renews_no_progress_budget() {
+        tokio::time::pause();
+        let (mut adapter, mut wire) = rto_test_adapter(100, b"ABCDEFGH", 4).await;
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS + 1)).await;
+        adapter.check_retransmissions().await.unwrap();
+        assert_eq!(rto_test_read(&mut wire).await.sequence_number, 100);
+        rto_test_ack(&mut adapter, 104).await;
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS + 1)).await;
+        adapter.check_retransmissions().await.unwrap();
+        rto_test_wire_empty(&mut wire);
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS)).await;
+        adapter.check_retransmissions().await.unwrap();
+        assert_eq!(rto_test_read(&mut wire).await.sequence_number, 104);
+        // One retransmission occurred after the advancing ACK. Four more retries
+        // must remain, even though the previous head had already been retried.
+        for retry in 2..=MAX_RETRIES {
+            tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS << retry.min(6))).await;
+            adapter.check_retransmissions().await.unwrap();
+            assert_eq!(rto_test_read(&mut wire).await.sequence_number, 104);
+            assert_eq!(adapter.get_status(RTO_TEST_HP).unwrap(), ConnectionStatus::Connected);
+        }
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS << 6)).await;
+        adapter.check_retransmissions().await.unwrap();
+        assert_eq!(adapter.get_status(RTO_TEST_HP).unwrap(), ConnectionStatus::Error(ErrorKind::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn wan_partial_ack_validation_handles_sequence_wrap() {
+        tokio::time::pause();
+        let start = u32::MAX - 3;
+        let (mut adapter, mut wire) = rto_test_adapter(start, b"ABCDEFGH", 8).await;
+        // Send end wraps to 4; ACK 5 claims an unsent byte and must be ignored.
+        rto_test_ack(&mut adapter, 5).await;
+        assert_eq!(adapter.states[&RTO_TEST_HP].bytes_in_flight, 8);
+        rto_test_ack(&mut adapter, 1).await;
+        assert_eq!(adapter.states[&RTO_TEST_HP].bytes_in_flight, 3);
+        tokio::time::advance(Duration::from_millis(INITIAL_RTO_MS + 1)).await;
+        adapter.check_retransmissions().await.unwrap();
+        let packet = rto_test_read(&mut wire).await;
+        assert_eq!(packet.sequence_number, 1);
+        assert_eq!(packet.payload, b"FGH");
+        rto_test_ack(&mut adapter, 4).await;
+        assert_eq!(adapter.states[&RTO_TEST_HP].bytes_in_flight, 0);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        adapter.check_retransmissions().await.unwrap();
+        rto_test_wire_empty(&mut wire);
+        assert_eq!(adapter.get_status(RTO_TEST_HP).unwrap(), ConnectionStatus::Connected);
     }
 }
