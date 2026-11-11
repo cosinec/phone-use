@@ -3,10 +3,11 @@
 FROM ghcr.io/derrors/iphone-control:0.1.4 AS native
 FROM node:22-trixie-slim AS build
 WORKDIR /app
+ARG WEB_BASE=/
 COPY browser-control/package.json browser-control/package-lock.json ./
 RUN npm ci
 COPY browser-control/ ./
-RUN npm run typecheck && npm run build && npm prune --omit=dev
+RUN npm run typecheck && npm run build -- --base="${WEB_BASE}" && npm prune --omit=dev
 
 # The published native binary uses Debian Trixie/glibc; use a compatible Node runtime.
 FROM node:22-trixie-slim
