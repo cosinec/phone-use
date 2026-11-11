@@ -85,11 +85,13 @@ pub(crate) struct Frame {
     at: Instant,
     sequence: u64,
 }
+type FrameSender = watch::Sender<Option<Arc<Frame>>>;
+
 #[derive(Default)]
 pub struct Preview {
     // Only the reader task owns the sender. Its exit must close HTTP responses
     // immediately, including when the source settings cannot be acknowledged.
-    sender: Mutex<Option<Weak<watch::Sender<Option<Arc<Frame>>>>>>,
+    sender: Mutex<Option<Weak<FrameSender>>>,
 }
 
 impl Preview {
