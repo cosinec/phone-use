@@ -393,7 +393,10 @@ async fn append_daemon_log(path: &std::path::Path, bytes: &[u8]) -> io::Result<(
         tokio::fs::rename(path, path.with_extension("log.1")).await?;
     }
     let mut file = tokio::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).await?;
-    file.write_all(bytes).await
+    file.write_all(bytes).await?;
+    // Tokio may still have a blocking write in flight after write_all returns.
+    // Finish it before dropping the handle or reading/rotating this path again.
+    file.flush().await
 }
 
 fn signal_group(pid: i32, signal: i32) -> Result<()> {
