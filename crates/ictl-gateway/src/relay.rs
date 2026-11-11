@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_USB_DATA: usize = 3 * 16384 - 16 - 20;
 const STREAM_BUFFER: usize = 64 * 1024;
+/// Same budget the WebSocket writer gives a single send before it declares the socket dead.
+const CLOSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
 pub struct Frame {
@@ -97,20 +99,40 @@ impl Relay {
             entry.cancel.cancel();
             if !remote && !self.0.cancel.is_cancelled() {
                 // Closing a stream must never block cleanup behind a stalled socket.
-                if let Err(error) =
-                    self.0.outbound.try_send(Frame { kind: 5, request_id: 0, stream_id: id, payload: Vec::new() })
-                {
-                    let reason = match error {
-                        mpsc::error::TrySendError::Full(_) => "outbound_queue_full",
-                        mpsc::error::TrySendError::Closed(_) => "outbound_queue_closed",
-                    };
-                    eprintln!(
-                        "{} event=relay_cancel_requested session={} stream={id} port={} reason={reason}",
-                        chrono::Utc::now().to_rfc3339(),
-                        self.0.session_id,
-                        entry.port
-                    );
-                    self.0.cancel.cancel();
+                match self.0.outbound.try_send(Frame { kind: 5, request_id: 0, stream_id: id, payload: Vec::new() }) {
+                    Ok(()) => {}
+                    // A full queue only means the WebSocket is momentarily behind (e.g. while a
+                    // screenshot is in flight). Deliver the close in the background instead of
+                    // ending the whole device session; give up only if the socket stays stalled.
+                    Err(mpsc::error::TrySendError::Full(frame)) => {
+                        let (outbound, cancel) = (self.0.outbound.clone(), self.0.cancel.clone());
+                        let (session, port) = (self.0.session_id.clone(), entry.port);
+                        tokio::spawn(async move {
+                            let sent = tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return,
+                                sent = tokio::time::timeout(CLOSE_DELIVERY_TIMEOUT, outbound.send(frame)) => sent,
+                            };
+                            if !matches!(sent, Ok(Ok(()))) {
+                                let reason =
+                                    if sent.is_err() { "close_delivery_timeout" } else { "outbound_queue_closed" };
+                                eprintln!(
+                                    "{} event=relay_cancel_requested session={session} stream={id} port={port} reason={reason}",
+                                    chrono::Utc::now().to_rfc3339(),
+                                );
+                                cancel.cancel();
+                            }
+                        });
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        eprintln!(
+                            "{} event=relay_cancel_requested session={} stream={id} port={} reason=outbound_queue_closed",
+                            chrono::Utc::now().to_rfc3339(),
+                            self.0.session_id,
+                            entry.port
+                        );
+                        self.0.cancel.cancel();
+                    }
                 }
             }
         }
@@ -417,5 +439,46 @@ mod tests {
             assert!(buffered.len() <= STREAM_BUFFER);
             relay.close().await;
         }
+    }
+
+    #[tokio::test]
+    async fn full_outbound_queue_delays_stream_close_without_ending_session() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let relay = Relay::new(tx.clone(), cancel.clone(), "fixture".into());
+        let opening = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.open(8100).await }
+        });
+        let open = rx.recv().await.unwrap();
+        relay.handle(Frame::json(3, open.stream_id, open.stream_id, &json!({"ok":true}))).await.unwrap();
+        let stream = opening.await.unwrap().unwrap();
+        // Fill the single-slot queue, then end the stream locally.
+        tx.send(Frame::json(9, 1, 0, &Value::Null)).await.unwrap();
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!cancel.is_cancelled(), "a momentarily full queue must not end the session");
+        assert_eq!(rx.recv().await.unwrap().kind, 9);
+        let close = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        assert_eq!((close.kind, close.stream_id), (5, open.stream_id));
+        assert!(!cancel.is_cancelled());
+        relay.close().await;
+    }
+
+    #[tokio::test]
+    async fn closed_outbound_queue_ends_session_when_retiring() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let relay = Relay::new(tx, cancel.clone(), "fixture".into());
+        let opening = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.open(8100).await }
+        });
+        let open = rx.recv().await.unwrap();
+        relay.handle(Frame::json(3, open.stream_id, open.stream_id, &json!({"ok":true}))).await.unwrap();
+        let stream = opening.await.unwrap().unwrap();
+        drop(rx);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), cancel.cancelled()).await.unwrap();
     }
 }
