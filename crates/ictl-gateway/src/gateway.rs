@@ -905,7 +905,27 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
                 .as_ref()
                 .map(VirtualMux::address)
                 .ok_or_else(|| ApiError::new(409, "Device relay is not ready"))?;
-            let mut receiver = s.mjpeg.subscribe(address, s.cancel.clone()).await;
+            let session = Arc::downgrade(&s);
+            let mut receiver = s
+                .mjpeg
+                .subscribe(address, s.cancel.clone(), move || {
+                    let session = session.clone();
+                    async move {
+                        let session = session.upgrade().ok_or_else(|| anyhow::anyhow!("Session closed"))?;
+                        let controller = session.ready().await?;
+                        let response = controller
+                            .request(json!({"op":"preview_prepare"}), Duration::from_secs(30), session.cancel.clone())
+                            .await?;
+                        let prepared =
+                            response["text"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
+                        anyhow::ensure!(
+                            response["kind"] == "text" && prepared.is_some_and(|value| value["mjpegPrepared"] == true),
+                            "MJPEG limits were not acknowledged"
+                        );
+                        Ok(())
+                    }
+                })
+                .await;
             let first = tokio::select! {
                 biased;
                 _ = s.cancel.cancelled() => return Err(ApiError::new(410, "Session closed")),
