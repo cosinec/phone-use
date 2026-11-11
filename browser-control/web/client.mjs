@@ -1,7 +1,8 @@
 import wasm from './wasm.mjs';
 import * as sdk from '@limrun/device-install';
 import * as androidSdk from './android/bridge.mjs';
-export const browserOptions = () => ({sdk, androidSdk});
+import {attachTransportDiagnostics} from './transport-diagnostics.mjs';
+export const browserOptions = () => ({sdk: {...sdk, attachTransportDiagnostics}, androidSdk});
 export class BrowserClient extends wasm.BrowserClient {
   constructor(options = {}) {
     super({...browserOptions(), ...options});

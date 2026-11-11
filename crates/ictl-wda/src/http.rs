@@ -4,10 +4,103 @@
 //! idevice 自带的 `WdaClient` 不支持 `excluded_attributes`、appium settings、W3C actions 等，
 //! 所以这里自己发请求，按响应边界复用连接；取消、超时或不完整响应会丢弃连接。
 
+use crate::timing::StepTimer;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+static NEXT_HTTP: AtomicU64 = AtomicU64::new(1);
+
+struct HttpTrace {
+    started: Instant,
+    phase: Option<StepTimer>,
+    phase_name: &'static str,
+    outcome: &'static str,
+    attempt: usize,
+    first_byte_ms: Option<u64>,
+    response_bytes: usize,
+    header_bytes: usize,
+    read_count: usize,
+    max_read_wait_ms: u64,
+    status: Option<u16>,
+    read_started: Option<Instant>,
+    dispatch: tracing::Dispatch,
+    span: tracing::Span,
+}
+
+impl HttpTrace {
+    fn new(request_bytes: usize) -> Self {
+        tracing::info!(event = "http_started", request_bytes);
+        Self {
+            started: Instant::now(),
+            phase: Some(StepTimer::new("http_pool_wait")),
+            phase_name: "http_pool_wait",
+            outcome: "cancelled",
+            attempt: 0,
+            first_byte_ms: None,
+            response_bytes: 0,
+            header_bytes: 0,
+            read_count: 0,
+            max_read_wait_ms: 0,
+            status: None,
+            read_started: None,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+            span: tracing::Span::current(),
+        }
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if let Some(previous) = self.phase.take() {
+            previous.finish(true);
+        }
+        self.phase_name = name;
+        self.phase = Some(StepTimer::new(name));
+    }
+
+    fn read(&mut self, bytes: usize, wait_ms: u64) {
+        self.max_read_wait_ms = self.max_read_wait_ms.max(wait_ms);
+        self.read_count += 1;
+        self.response_bytes += bytes;
+        if bytes > 0 && self.first_byte_ms.is_none() {
+            let elapsed = self.started.elapsed().as_millis() as u64;
+            self.first_byte_ms = Some(elapsed);
+            tracing::info!(event = "http_first_byte", attempt = self.attempt, first_byte_ms = elapsed);
+            self.phase("http_headers_read");
+        }
+        tracing::debug!(
+            event = "http_read",
+            attempt = self.attempt,
+            bytes,
+            wait_ms,
+            received_bytes = self.response_bytes,
+            read_count = self.read_count
+        );
+    }
+}
+
+impl Drop for HttpTrace {
+    fn drop(&mut self) {
+        let dispatch = self.dispatch.clone();
+        let span = self.span.clone();
+        tracing::dispatcher::with_default(&dispatch, || {
+            span.in_scope(|| {
+                if self.outcome != "cancelled" {
+                    if let Some(phase) = self.phase.take() {
+                        phase.finish(self.outcome == "ok");
+                    }
+                }
+                tracing::info!(event = "http_complete", outcome = self.outcome, attempt = self.attempt,
+            elapsed_ms = self.started.elapsed().as_millis() as u64, phase = self.phase_name,
+            first_byte_ms = ?self.first_byte_ms, wire_response_bytes = self.response_bytes,
+            response_body_bytes = self.response_bytes.saturating_sub(self.header_bytes),
+            read_count = self.read_count, max_read_wait_ms = self.max_read_wait_ms,
+            pending_read_ms = ?self.read_started.map(|at| at.elapsed().as_millis() as u64), status = ?self.status);
+            })
+        });
+    }
+}
 
 use idevice::provider::IdeviceProvider;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,6 +151,7 @@ fn after_sent(e: std::io::Error) -> std::io::Error {
 }
 
 impl Transport for DeviceTransport {
+    #[tracing::instrument(name = "wda_http", skip_all, fields(http_id = NEXT_HTTP.fetch_add(1, Ordering::Relaxed), native_pid = std::process::id(), method = method, route = path.split('?').next().unwrap_or(path)))]
     async fn send(
         &self,
         method: &str,
@@ -67,6 +161,7 @@ impl Transport for DeviceTransport {
     ) -> std::io::Result<(u16, Vec<u8>)> {
         let started = Instant::now();
         let req = build_request(method, path, body.as_deref());
+        let mut trace = HttpTrace::new(req.len());
         let mut stage = "pool";
         let mut write_started = false;
         let mut reused_connection = false;
@@ -78,6 +173,7 @@ impl Transport for DeviceTransport {
             let mut connection = idle.take().filter(|c| c.at.elapsed() < Duration::from_secs(15));
             if let Some(c) = connection.as_mut() {
                 stage = "probe";
+                trace.phase("http_reuse_probe");
                 let mut probe = [0u8; 1];
                 // Detect an already-closed idle socket before sending a mutation.
                 // An uncertain failure after writing still never replays a mutation.
@@ -88,10 +184,21 @@ impl Transport for DeviceTransport {
             let reused = connection.is_some();
             reused_connection = reused;
             for attempt in 0..2 {
+                trace.attempt = attempt + 1;
+                trace.first_byte_ms = None;
+                trace.response_bytes = 0;
+                trace.header_bytes = 0;
+                trace.read_count = 0;
+                tracing::info!(
+                    event = "http_attempt",
+                    attempt = trace.attempt,
+                    reused = reused_connection && attempt == 0
+                );
                 let mut socket = match connection.take() {
                     Some(c) => c.socket,
                     None => {
                         stage = "connect";
+                        trace.phase("http_connect");
                         tokio::time::timeout(CONNECT_TIMEOUT, self.provider.connect(self.port))
                             .await
                             .map_err(|_| {
@@ -108,7 +215,7 @@ impl Transport for DeviceTransport {
                 // From the first write onward a mutation may have reached WDA.
                 // Keep this true even if a GET retries its stale connection.
                 write_started = true;
-                let response = exchange(&mut *socket, &req, &mut stage).await;
+                let response = exchange(&mut *socket, &req, &mut stage, &mut trace).await;
                 match response {
                     Ok((status, body, reusable)) => {
                         if reusable {
@@ -146,6 +253,13 @@ impl Transport for DeviceTransport {
             started.elapsed().as_secs_f64(),
             result.is_ok()
         );
+        trace.outcome = if result.is_ok() {
+            "ok"
+        } else if timed_out {
+            "timeout"
+        } else {
+            "error"
+        };
         result
     }
 }
@@ -154,20 +268,29 @@ async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
     socket: &mut S,
     request: &[u8],
     stage: &mut &'static str,
+    trace: &mut HttpTrace,
 ) -> std::io::Result<(u16, Vec<u8>, bool)> {
     // Once writing starts, classify failure as uncertain, including flush errors.
     // The native engine must not fall back to HID and duplicate a sent action.
     *stage = "write";
+    trace.phase("http_write");
     socket.write_all(request).await.map_err(after_sent)?;
     *stage = "flush";
+    trace.phase("http_flush");
     socket.flush().await.map_err(after_sent)?;
     *stage = "read";
+    trace.phase("http_first_byte_wait");
     let mut buffer = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     let mut head = None;
     loop {
         if head.is_none() {
             head = parse_head(&buffer);
+            if let Some((split, framing)) = head {
+                trace.header_bytes = split;
+                tracing::info!(event = "http_headers", header_bytes = split, framing = ?framing);
+                trace.phase("http_body_read");
+            }
             if head.is_none() && buffer.len() >= 64 * 1024 {
                 return Err(after_sent(std::io::Error::other("WDA response headers too large")));
             }
@@ -177,7 +300,11 @@ async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
         {
             break;
         }
-        let n = socket.read(&mut chunk).await.map_err(after_sent)?;
+        trace.read_started = Some(Instant::now());
+        let read = socket.read(&mut chunk).await;
+        let wait_ms = trace.read_started.take().unwrap().elapsed().as_millis() as u64;
+        let n = read.map_err(after_sent)?;
+        trace.read(n, wait_ms);
         if n == 0 {
             break;
         }
@@ -201,7 +328,10 @@ async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
                 })
             })
     });
+    trace.phase("http_response_parse");
     let (status, body) = parse_response(buffer).map_err(after_sent)?;
+    trace.status = Some(status);
+    tracing::info!(event = "http_body_decoded", response_body_bytes = body.len());
     Ok((status, body, reusable))
 }
 
@@ -384,6 +514,65 @@ mod tests {
     }
     async fn ok(socket: &mut tokio::io::DuplexStream) {
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<SyncMutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_split_first_byte_body_and_cancelled_reads_without_payloads() {
+        let logs = Arc::new(SyncMutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        // A process-wide subscriber keeps callsite filters stable while other
+        // HTTP tests exercise the same tracing sites on parallel threads.
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .unwrap();
+        for cancelled in [false, true] {
+            let offset = logs.lock().unwrap().len();
+            let (transport, _, mut peers) = transport(1);
+            let mut peer = peers.pop().unwrap();
+            let server = tokio::spawn(async move {
+                request(&mut peer).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 23\r\n\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = peer.write_all(b"very-private-image-data").await;
+            });
+            let operation =
+                transport.send("GET", "/diagnostics-regression?token=private-token", None, Duration::from_secs(1));
+            if cancelled {
+                assert!(tokio::time::timeout(Duration::from_millis(30), operation).await.is_err());
+            } else {
+                assert_eq!(operation.await.unwrap().0, 200);
+            }
+            server.await.unwrap();
+            let text = String::from_utf8(logs.lock().unwrap()[offset..].to_vec()).unwrap();
+            let text =
+                text.lines().filter(|line| line.contains("/diagnostics-regression")).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("http_first_byte"), "{text}");
+            assert!(text.contains("http_headers"), "{text}");
+            assert!(text.contains("http_complete"), "{text}");
+            assert!(text.contains("first_byte_ms="), "{text}");
+            assert!(text.contains("max_read_wait_ms="), "{text}");
+            assert!(text.contains(if cancelled { "cancelled" } else { "response_body_bytes=23" }), "{text}");
+            assert!(!text.contains("private-token") && !text.contains("very-private-image-data"), "{text}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

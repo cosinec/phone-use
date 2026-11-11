@@ -19,6 +19,7 @@ struct Attempt {
     relay: JsValue,
     log: JsValue,
     detach: JsValue,
+    diagnostics: JsValue,
 }
 struct Inner {
     sdk: JsValue,
@@ -634,6 +635,24 @@ impl BrowserClient {
         if a.borrow().cancelled {
             return Ok(());
         }
+        if get(&sdk, "attachTransportDiagnostics").is_function() {
+            let this = self.clone();
+            let base = a.borrow().base.clone();
+            let route = format!("/api/sessions/{}/diagnostics", text(&session, "id"));
+            let token = text(&session, "token");
+            let report = callback2(move |metrics, signal| {
+                let this = this.clone();
+                let base = base.clone();
+                let route = route.clone();
+                let token = token.clone();
+                future_to_promise(async move { this.request(&base, &route, &token, "POST", metrics, signal).await })
+                    .into()
+            });
+            let target = a.borrow().target.clone();
+            let diagnostics =
+                call(&sdk, "attachTransportDiagnostics", &[target, get(&result, "relay"), report]).unwrap_or_default();
+            a.borrow_mut().diagnostics = diagnostics;
+        }
         let record = get(&result, "pairRecord");
         if truth(&record) {
             let udid = canonical_uid(&text(&record, "udid")).map_err(error)?;
@@ -672,6 +691,10 @@ impl BrowserClient {
         let _ = self.cleanup(a);
     }
     fn cleanup(&self, a: Rc<RefCell<Attempt>>) -> Promise {
+        let diagnostics = std::mem::take(&mut a.borrow_mut().diagnostics);
+        if diagnostics.is_function() {
+            let _ = apply(&diagnostics, &JsValue::UNDEFINED, &[]);
+        }
         let (relay, session, target, detach, sdk, base) = {
             let mut a = a.borrow_mut();
             (

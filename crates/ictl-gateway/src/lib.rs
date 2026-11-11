@@ -17,3 +17,4 @@ pub mod tasks;
 mod heartbeat;
 
 mod diagnostics;
+mod transport_diagnostics;

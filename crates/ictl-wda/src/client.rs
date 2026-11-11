@@ -7,7 +7,11 @@ use ictl_device::ScreenSize;
 use serde_json::{Value, json};
 
 use crate::http::Transport;
+use crate::timing::StepTimer;
 use crate::{Result, WdaError, elements};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 普通点击按下的时长（毫秒）。太短可能不被识别成点击；解锁按键另有自己的时长
@@ -136,14 +140,20 @@ impl<T: Transport> WdaClient<T> {
         self
     }
 
+    #[tracing::instrument(name = "wda_call", skip_all, fields(call_id = NEXT_CALL.fetch_add(1, Ordering::Relaxed), method = method, route = path.split('?').next().unwrap_or(path)))]
     async fn call(&self, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
+        let encoding = StepTimer::new("request_json_encode");
         let body = body.map(|b| b.to_string().into_bytes());
+        encoding.finish(true);
         let (status, raw) = self.transport.send(method, path, body, timeout).await.map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => WdaError::Timeout(e.to_string()),
             crate::http::AFTER_SENT => WdaError::Interrupted(e.to_string()),
             _ => WdaError::Unavailable(e.to_string()),
         })?;
-        let v: Value = match serde_json::from_slice(&raw) {
+        let parsing = StepTimer::new("response_json_decode");
+        let parsed = serde_json::from_slice(&raw);
+        parsing.finish(parsed.is_ok());
+        let v: Value = match parsed {
             Ok(v) => v,
             Err(_) if status >= 400 => {
                 return Err(WdaError::Remote { kind: "http".into(), message: status.to_string() });
@@ -381,10 +391,19 @@ impl<T: Transport> WdaClient<T> {
                 ictl_l10n::tr!("截图响应不是字符串", "screenshot response is not a string").into(),
             ));
         };
+        let decoding = StepTimer::new("screenshot_base64_decode");
+        let encoded_bytes = b64.len();
         b64.retain(|c| !c.is_whitespace());
-        base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| {
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| {
             WdaError::Unavailable(ictl_l10n::trf!("截图不是有效的 base64：{e}", "screenshot is not valid base64: {e}"))
-        })
+        });
+        tracing::info!(
+            event = "screenshot_decoded",
+            encoded_bytes,
+            decoded_bytes = decoded.as_ref().map_or(0, |data| data.len())
+        );
+        decoding.finish(decoded.is_ok());
+        decoded
     }
 
     /// 元素树 XML，排除可见性等慢属性（完整树 7～8 秒，排除后约 0.3 秒）

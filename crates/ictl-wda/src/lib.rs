@@ -8,6 +8,7 @@ pub mod client;
 pub mod elements;
 pub mod http;
 pub mod runner;
+pub mod timing;
 
 pub use client::{IdleSettings, Launch, WdaClient, swipe_steps, tap_steps};
 pub use runner::WdaRunner;

@@ -229,6 +229,8 @@ pub const CANCEL_ON_CLOSE: &str = "cancel_on_close";
 /// 请求里带上这个键（值为 UDID）：守护进程正在控制的不是这台就不执行。`iphone_batch` 用它防止中途换了设备
 /// （自动选设备时拔掉正在控制的那台，会改控另一台）后，剩下的步骤落到另一台上
 pub const EXPECT_UDID: &str = "expect_udid";
+/// Optional numeric correlation ID for gateway and daemon diagnostics.
+pub const DIAGNOSTIC_ID: &str = "diagnostic_id";
 
 /// Request key carrying the client's language (`zh` / `en`). The daemon answers in it; requests without it
 /// (older clients) get Chinese, as before. Older daemons ignore the extra key

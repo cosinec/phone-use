@@ -8,6 +8,7 @@ use ictl_unlock::UnlockError;
 use ictl_wda::client::SPRINGBOARD;
 use ictl_wda::elements::{self, TapPoint, Tree};
 use ictl_wda::http::DeviceTransport;
+use ictl_wda::timing::StepTimer;
 use ictl_wda::{Launch, WdaClient, WdaError};
 
 use crate::core::{Daemon, Inner, drop_tunnel, hid_supported, wda_down};
@@ -47,12 +48,15 @@ struct CapturedFrame {
 impl Daemon {
     /// 配置了密码就在锁屏时自动解锁；没配置而手机锁着则报错（与 toolkit 一致）
     pub(crate) async fn ensure_unlocked(&self, g: &mut Inner) -> Result<(), String> {
+        let checking = StepTimer::new("unlock_check");
         let cfg = self.unlock_cfg(g.device.as_ref().map(|d| d.udid.as_str()));
         if let Some(left) = g.last_lock.and_then(|t| LOCK_SETTLE.checked_sub(t.elapsed())) {
             tokio::time::sleep(left).await;
         }
         let Some(wda) = self.wda(g) else { return Ok(()) };
-        match ictl_unlock::ensure_unlocked(wda, &cfg).await {
+        let outcome = ictl_unlock::ensure_unlocked(wda, &cfg).await;
+        checking.finish(outcome.is_ok());
+        match outcome {
             Ok(_) => Ok(()),
             Err(e @ (UnlockError::WrongPasscode | UnlockError::Uncertain(_))) => {
                 self.notify(g, Event::UnlockDisabled);
@@ -267,13 +271,17 @@ impl Daemon {
         g: &mut Inner,
         region: Option<(f64, f64, f64, f64)>,
     ) -> Result<CapturedFrame, String> {
+        let fetching = StepTimer::new("screenshot_fetch");
         let wda_png = match self.wda(g) {
             Some(w) => w.screenshot_png().await.ok(),
             None => None,
         };
+        fetching.finish(wda_png.is_some());
         // 给短暂 WDA 掉线时的 HID 留一份近期方向；不把方向永久缓存到磁盘。
         if wda_png.is_some() {
+            let rotation = StepTimer::new("screenshot_rotation");
             self.refresh_hid_rotation(g).await;
+            rotation.finish(true);
         }
         let (png, via) = match wda_png {
             Some(p) => (p, "WDA"),
@@ -289,6 +297,7 @@ impl Daemon {
                 )
             }
         };
+        let measuring = StepTimer::new("screenshot_view");
         let view = match self.wda(g) {
             Some(w) => w.view().await.ok(),
             None => None,
@@ -297,6 +306,7 @@ impl Daemon {
             Some(v) => v.screen,
             None => self.screen(g).await?,
         };
+        measuring.finish(view.is_some());
         let source_bytes = png.len();
         let source_format = if png.starts_with(&[255, 216, 255]) {
             "jpeg"
@@ -308,20 +318,32 @@ impl Daemon {
         // 解码、缩放、JPEG 编码是 CPU 活（1290×2796），放到阻塞线程，不卡住主循环
         // 说明文字在阻塞线程里生成：带上这个请求的语言
         let lang = ictl_l10n::lang();
+        let processing = StepTimer::new("image_process_and_encode");
+        let processing_span = tracing::Span::current();
         let (jpeg, caption) = tokio::task::spawn_blocking(move || {
-            ictl_l10n::with_lang(lang, || match region {
+            let _span = processing_span.enter();
+            let work = StepTimer::new("image_decode_resize_jpeg");
+            let output = ictl_l10n::with_lang(lang, || match region {
                 None => imaging::full_screen(&png, screen, via),
                 Some(r) => imaging::region(&png, screen, r, via),
-            })
+            });
+            work.finish(output.is_ok());
+            output
         })
         .await
         .map_err(|e| ictl_l10n::trf!("图像处理任务异常：{e}", "Image processing task failed: {e}"))??;
-        Ok(CapturedFrame {
-            image: Response::Image { jpeg_base64: base64::engine::general_purpose::STANDARD.encode(jpeg), caption },
-            view,
+        processing.finish(true);
+        let encoding = StepTimer::new("image_response_base64_encode");
+        let jpeg_base64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+        tracing::info!(
+            event = "capture_complete",
             source_bytes,
             source_format,
-        })
+            jpeg_bytes = jpeg.len(),
+            base64_bytes = jpeg_base64.len()
+        );
+        encoding.finish(true);
+        Ok(CapturedFrame { image: Response::Image { jpeg_base64, caption }, view, source_bytes, source_format })
     }
 
     pub(crate) async fn observe(&self, g: &mut Inner, limit: usize, budget: Duration) -> Result<Response, String> {

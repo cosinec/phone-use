@@ -896,6 +896,11 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         return Err(ApiError::new(401, "Authentication required"));
     }
     match (method, route) {
+        (Method::POST, ["diagnostics"]) => {
+            let input = body_with_limit(request, 16 * 1024).await?;
+            crate::transport_diagnostics::record(&s.id, input)?;
+            Ok(reply(200, json!({"recorded":true})))
+        }
         (Method::POST, ["attachments"]) => {
             if s.tasks.active().await {
                 return Err(ApiError::new(409, "任务运行中，请结束后再修改附件"));

@@ -4,8 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -19,6 +19,65 @@ use crate::identity::Device;
 
 const MAX_RESPONSE: usize = 12 * 1024 * 1024;
 const MAX_TRANSCRIPT: usize = 32 * 1024;
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+struct RequestTrace {
+    id: u64,
+    namespace: String,
+    started: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    outcome: &'static str,
+    response_bytes: usize,
+}
+
+impl RequestTrace {
+    fn new(namespace: String) -> Self {
+        let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "{} event=native_request_started namespace={namespace} diagnostic_id={id}",
+            chrono::Utc::now().to_rfc3339()
+        );
+        Self {
+            id,
+            namespace,
+            started: Instant::now(),
+            phase_started: Instant::now(),
+            phase: "ipc_connect",
+            outcome: "cancelled",
+            response_bytes: 0,
+        }
+    }
+
+    fn phase(&mut self, next: &'static str) {
+        eprintln!(
+            "{} event=native_request_stage namespace={} diagnostic_id={} phase={} elapsed_ms={} next={next}",
+            chrono::Utc::now().to_rfc3339(),
+            self.namespace,
+            self.id,
+            self.phase,
+            self.phase_started.elapsed().as_millis()
+        );
+        self.phase = next;
+        self.phase_started = Instant::now();
+    }
+}
+
+impl Drop for RequestTrace {
+    fn drop(&mut self) {
+        eprintln!(
+            "{} event=native_request_finished namespace={} diagnostic_id={} phase={} phase_elapsed_ms={} elapsed_ms={} response_bytes={} outcome={}",
+            chrono::Utc::now().to_rfc3339(),
+            self.namespace,
+            self.id,
+            self.phase,
+            self.phase_started.elapsed().as_millis(),
+            self.started.elapsed().as_millis(),
+            self.response_bytes,
+            self.outcome
+        );
+    }
+}
 
 struct Group {
     pid: i32,
@@ -198,15 +257,20 @@ impl NativeController {
     }
 
     pub async fn request(&self, mut request: Value, timeout: Duration, cancel: CancellationToken) -> Result<Value> {
+        let mut trace =
+            RequestTrace::new(self.0.data_dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
         let object = request.as_object_mut().ok_or_else(|| anyhow!("Invalid native request"))?;
+        object.insert(ictl_protocol::DIAGNOSTIC_ID.into(), json!(trace.id));
         object.insert("expect_udid".into(), json!(self.0.device.serial_number));
         object.insert("cancel_on_close".into(), json!(true));
         object.insert("lang".into(), json!("en"));
         let operation = async {
             let mut socket = UnixStream::connect(&self.0.socket_path).await?;
+            trace.phase("ipc_write");
             let mut request = serde_json::to_vec(&request)?;
             request.push(b'\n');
             socket.write_all(&request).await?;
+            trace.phase("ipc_first_byte_wait");
             let mut bytes = Vec::new();
             let mut chunk = [0; 16384];
             loop {
@@ -218,9 +282,14 @@ impl NativeController {
                     bail!("Native response too large");
                 }
                 let previous = bytes.len();
+                if trace.response_bytes == 0 {
+                    trace.phase("ipc_response_read");
+                }
+                trace.response_bytes += length;
                 bytes.extend_from_slice(&chunk[..length]);
                 if let Some(offset) = chunk[..length].iter().position(|byte| *byte == b'\n') {
                     let end = previous + offset;
+                    trace.phase("ipc_json_decode");
                     let value: Value = serde_json::from_slice(&bytes[..end])?;
                     if !matches!(value.get("kind").and_then(Value::as_str), Some("text" | "image" | "error")) {
                         bail!("Invalid native response");
@@ -229,12 +298,17 @@ impl NativeController {
                 }
             }
         };
-        tokio::select! {
+        let (result, outcome) = tokio::select! {
             biased;
-            _ = self.0.cancel.cancelled() => bail!("Controller closed"),
-            _ = cancel.cancelled() => bail!("Request cancelled; sent action is not retried"),
-            result = tokio::time::timeout(timeout, operation) => result.map_err(|_| anyhow!("Native request timeout; sent action is not retried"))?,
-        }
+            _ = self.0.cancel.cancelled() => (Err(anyhow!("Controller closed")), "cancelled"),
+            _ = cancel.cancelled() => (Err(anyhow!("Request cancelled; sent action is not retried")), "cancelled"),
+            result = tokio::time::timeout(timeout, operation) => match result {
+                Ok(result) => { let outcome = if result.is_ok() { "ok" } else { "error" }; (result, outcome) },
+                Err(_) => (Err(anyhow!("Native request timeout; sent action is not retried")), "timeout"),
+            },
+        };
+        trace.outcome = outcome;
+        result
     }
 
     pub async fn snapshot(&self) -> Value {
@@ -277,6 +351,7 @@ impl NativeController {
         }
         let controller = self.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
             let mut timed_out = false;
             let status = tokio::select! {
                 result = child.wait() => result.ok(),
@@ -290,6 +365,14 @@ impl NativeController {
                     child.wait().await.ok()
                 }
             };
+            eprintln!(
+                "{} event=setup_finished namespace={} pid={pid} elapsed_ms={} exit_code={:?} cancelled={} timed_out={timed_out}",
+                chrono::Utc::now().to_rfc3339(),
+                controller.0.data_dir.file_name().unwrap_or_default().to_string_lossy(),
+                started.elapsed().as_millis(),
+                status.as_ref().and_then(|status| status.code()),
+                controller.0.cancel.is_cancelled()
+            );
             {
                 let mut state = controller.0.state.lock().await;
                 if state.setup_pid == Some(pid) {

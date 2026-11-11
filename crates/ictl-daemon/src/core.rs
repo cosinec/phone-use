@@ -15,7 +15,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ictl_device::{AppInfo, Device, DeviceError, DeviceInfo, Rotation, ScreenSize, Tunnel, UsbDevice};
 use ictl_unlock::UnlockConfig;
+use ictl_wda::timing::StepTimer;
 use ictl_wda::{WdaClient, WdaRunner, http::DeviceTransport};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -133,6 +137,7 @@ pub struct CallCtx {
     pub gone: Option<tokio::sync::oneshot::Receiver<()>>,
     /// 正在控制的不是这台就不执行
     pub expect_udid: Option<String>,
+    pub diagnostic_id: Option<u64>,
 }
 
 /// 快照：`iphone-control status` 显示
@@ -475,6 +480,30 @@ impl Daemon {
 
     /// 处理一个控制请求。`queued_at`：请求到达的时间，用来放弃排队太久的操作
     pub async fn handle(self: &Arc<Self>, req: Request, queued_at: Instant, ctx: CallCtx) -> Response {
+        use tracing::Instrument;
+        let operation = serde_json::to_value(&req)
+            .ok()
+            .and_then(|value| value["op"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let span = tracing::info_span!(
+            "device_request",
+            operation_id = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed),
+            native_pid = std::process::id(),
+            operation,
+            diagnostic_id = ?ctx.diagnostic_id
+        );
+        async {
+            let timer = StepTimer::new("device_request");
+            tracing::info!(event = "device_request_received", queued_ms = queued_at.elapsed().as_millis() as u64);
+            let response = self.handle_request(req, queued_at, ctx).await;
+            timer.finish(!matches!(response, Response::Error { .. }));
+            response
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn handle_request(self: &Arc<Self>, req: Request, queued_at: Instant, ctx: CallCtx) -> Response {
         // 不需要设备锁的请求
         match req {
             Request::Daemon => {
@@ -495,6 +524,7 @@ impl Daemon {
             return Response::error(e);
         }
 
+        let waiting = StepTimer::new("device_lock_wait");
         let mut g = match ctx.gone {
             Some(mut gone) => tokio::select! {
                 biased;
@@ -503,6 +533,7 @@ impl Daemon {
             },
             None => self.inner.lock().await,
         };
+        waiting.finish(true);
         let g = &mut *g;
         if let Some(want) = &ctx.expect_udid {
             let now = g.device.as_ref().map(|d| d.udid.as_str());
@@ -663,7 +694,9 @@ mod tests {
         let busy = d.inner.lock().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(()).unwrap();
-        let r = d.handle(Request::Status, Instant::now(), CallCtx { gone: Some(rx), expect_udid: None }).await;
+        let r = d
+            .handle(Request::Status, Instant::now(), CallCtx { gone: Some(rx), expect_udid: None, diagnostic_id: None })
+            .await;
         drop(busy);
         assert!(matches!(&r, Response::Error { message } if message.contains("已取消")), "{r:?}");
         std::fs::remove_dir_all(dir).unwrap();
@@ -673,7 +706,7 @@ mod tests {
     #[tokio::test]
     async fn request_for_another_device_is_refused() {
         let (d, dir) = test_daemon("expect");
-        let ctx = CallCtx { gone: None, expect_udid: Some("00008130-AAAA".into()) };
+        let ctx = CallCtx { gone: None, expect_udid: Some("00008130-AAAA".into()), diagnostic_id: None };
         let r = d.handle(Request::Status, Instant::now(), ctx).await;
         assert!(matches!(&r, Response::Error { message } if message.contains("设备变了")), "{r:?}");
         std::fs::remove_dir_all(dir).unwrap();
