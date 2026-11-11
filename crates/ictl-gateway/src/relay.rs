@@ -51,6 +51,7 @@ impl Frame {
 }
 
 struct Entry {
+    port: u16,
     opened: bool,
     result: Option<oneshot::Sender<bool>>,
     incoming: mpsc::Sender<Vec<u8>>,
@@ -64,6 +65,7 @@ struct Streams {
 }
 
 struct Inner {
+    session_id: String,
     streams: Mutex<Streams>,
     outbound: mpsc::Sender<Frame>,
     cancel: CancellationToken,
@@ -73,8 +75,13 @@ struct Inner {
 pub struct Relay(Arc<Inner>);
 
 impl Relay {
-    pub fn new(outbound: mpsc::Sender<Frame>, cancel: CancellationToken) -> Self {
-        Self(Arc::new(Inner { streams: Mutex::new(Streams { next_id: 1, entries: HashMap::new() }), outbound, cancel }))
+    pub fn new(outbound: mpsc::Sender<Frame>, cancel: CancellationToken, session_id: String) -> Self {
+        Self(Arc::new(Inner {
+            session_id,
+            streams: Mutex::new(Streams { next_id: 1, entries: HashMap::new() }),
+            outbound,
+            cancel,
+        }))
     }
 
     async fn send(&self, frame: Frame) -> Result<()> {
@@ -90,12 +97,19 @@ impl Relay {
             entry.cancel.cancel();
             if !remote && !self.0.cancel.is_cancelled() {
                 // Closing a stream must never block cleanup behind a stalled socket.
-                if self
-                    .0
-                    .outbound
-                    .try_send(Frame { kind: 5, request_id: 0, stream_id: id, payload: Vec::new() })
-                    .is_err()
+                if let Err(error) =
+                    self.0.outbound.try_send(Frame { kind: 5, request_id: 0, stream_id: id, payload: Vec::new() })
                 {
+                    let reason = match error {
+                        mpsc::error::TrySendError::Full(_) => "outbound_queue_full",
+                        mpsc::error::TrySendError::Closed(_) => "outbound_queue_closed",
+                    };
+                    eprintln!(
+                        "{} event=relay_cancel_requested session={} stream={id} port={} reason={reason}",
+                        chrono::Utc::now().to_rfc3339(),
+                        self.0.session_id,
+                        entry.port
+                    );
                     self.0.cancel.cancel();
                 }
             }
@@ -117,6 +131,7 @@ impl Relay {
             streams.entries.insert(
                 id,
                 Entry {
+                    port,
                     opened: false,
                     result: Some(result_tx),
                     incoming: incoming_tx,
@@ -232,13 +247,29 @@ impl Relay {
                 let length = frame.payload.len();
                 let previous = entry.queued.fetch_add(length, Ordering::AcqRel);
                 // The duplex has STREAM_BUFFER bytes in addition to the queue.
-                if previous.saturating_add(length) > MAX_PAYLOAD - STREAM_BUFFER {
+                let reason = if previous.saturating_add(length) > MAX_PAYLOAD - STREAM_BUFFER {
+                    Some("receive_bytes_exceeded")
+                } else {
+                    match entry.incoming.try_send(frame.payload) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(_)) => Some("receive_frames_exceeded"),
+                        Err(mpsc::error::TrySendError::Closed(_)) => Some("consumer_closed"),
+                    }
+                };
+                if let Some(reason) = reason {
                     entry.queued.fetch_sub(length, Ordering::AcqRel);
-                    bail!("Stream receive buffer exceeded");
-                }
-                if entry.incoming.try_send(frame.payload).is_err() {
-                    entry.queued.fetch_sub(length, Ordering::AcqRel);
-                    bail!("Stream receive buffer exceeded");
+                    eprintln!(
+                        "{} event=relay_stream_closed session={} stream={} port={} reason={reason} queued_bytes={previous} incoming_bytes={length} queue_capacity={} action=close_stream",
+                        chrono::Utc::now().to_rfc3339(),
+                        self.0.session_id,
+                        frame.stream_id,
+                        entry.port,
+                        entry.incoming.capacity()
+                    );
+                    // A slow reader is local to this stream. Release the registry
+                    // before retiring it so unrelated device channels keep running.
+                    drop(streams);
+                    self.retire(frame.stream_id, false).await;
                 }
             }
             5 => {
@@ -285,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn stream_pumps_bytes_and_bounds_usb_payloads() {
         let (tx, mut rx) = mpsc::channel(8);
-        let relay = Relay::new(tx, CancellationToken::new());
+        let relay = Relay::new(tx, CancellationToken::new(), "fixture".into());
         let opening = tokio::spawn({
             let relay = relay.clone();
             async move { relay.open(8100).await }
@@ -320,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_unopened_and_unknown_streams_and_closes_waiters() {
         let (tx, mut rx) = mpsc::channel(8);
-        let relay = Relay::new(tx, CancellationToken::new());
+        let relay = Relay::new(tx, CancellationToken::new(), "fixture".into());
         let opening = tokio::spawn({
             let relay = relay.clone();
             async move { relay.open(8100).await }
@@ -332,5 +363,59 @@ mod tests {
         assert!(relay.handle(Frame { kind: 5, request_id: 0, stream_id: 100, payload: vec![] }).await.is_err());
         relay.close().await;
         assert!(opening.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn overflowing_stream_closes_without_disconnecting_other_streams() {
+        for chunk_size in [MAX_USB_DATA, 1] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let relay = Relay::new(tx, cancel.clone(), "fixture".into());
+            let mut sockets = Vec::new();
+            let mut ids = Vec::new();
+            for port in [9100, 8100] {
+                let opening = tokio::spawn({
+                    let relay = relay.clone();
+                    async move { relay.open(port).await }
+                });
+                let frame = rx.recv().await.unwrap();
+                ids.push(frame.stream_id);
+                relay.handle(Frame::json(3, frame.stream_id, frame.stream_id, &json!({"ok":true}))).await.unwrap();
+                sockets.push(opening.await.unwrap().unwrap());
+            }
+            let control = sockets.pop().unwrap();
+            let mut stalled = sockets.pop().unwrap();
+            // Fill the duplex first, leaving its inbound writer blocked.
+            for _ in 0..2 {
+                relay
+                    .handle(Frame { kind: 4, request_id: 0, stream_id: ids[0], payload: vec![0; MAX_USB_DATA] })
+                    .await
+                    .unwrap();
+            }
+            tokio::task::yield_now().await;
+            for _ in 0..300 {
+                relay
+                    .handle(Frame { kind: 4, request_id: 0, stream_id: ids[0], payload: vec![0; chunk_size] })
+                    .await
+                    .expect("one overflowing stream must not become a session protocol error");
+            }
+            assert!(!cancel.is_cancelled());
+            assert!(!relay.0.streams.lock().await.entries.contains_key(&ids[0]));
+            let closed = rx.recv().await.unwrap();
+            assert_eq!((closed.kind, closed.stream_id), (5, ids[0]));
+            assert!(rx.try_recv().is_err(), "stream close must be sent once");
+            relay
+                .handle(Frame { kind: 4, request_id: 0, stream_id: ids[1], payload: b"alive".to_vec() })
+                .await
+                .unwrap();
+            let mut control = control;
+            let mut word = [0; 5];
+            tokio::time::timeout(Duration::from_secs(1), control.read_exact(&mut word)).await.unwrap().unwrap();
+            assert_eq!(&word, b"alive");
+            let mut buffered = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), stalled.read_to_end(&mut buffered)).await.unwrap().unwrap();
+            assert!(buffered.len() <= STREAM_BUFFER);
+            relay.close().await;
+        }
     }
 }

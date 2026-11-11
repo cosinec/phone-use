@@ -309,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn lists_only_owned_device_and_returns_buid() {
         let (outbound, _) = mpsc::channel(8);
-        let relay = Relay::new(outbound, CancellationToken::new());
+        let relay = Relay::new(outbound, CancellationToken::new(), "fixture".into());
         let (pair_sender, _) = mpsc::channel(8);
         let device = Device {
             platform: crate::identity::Platform::Ios,

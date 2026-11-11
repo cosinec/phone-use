@@ -573,7 +573,7 @@ impl Session {
             return Ok(());
         }
         anyhow::ensure!(device.platform == Platform::Ios, "Device platform mismatch");
-        let relay = Relay::new(outbound.clone(), self.cancel.clone());
+        let relay = Relay::new(outbound.clone(), self.cancel.clone(), self.id.clone());
         self.relay.set(relay.clone()).map_err(|_| anyhow::anyhow!("Duplicate DeviceHello"))?;
         let (pair_sender, mut records) = mpsc::channel::<PairRecord>(8);
         let mux = VirtualMux::start(
@@ -605,6 +605,11 @@ impl Session {
                 if result.is_ok() {
                     *session.state.lock().await = "connected".into();
                 } else {
+                    eprintln!(
+                        "{} event=session_close_requested session={} reason=native_start_failed",
+                        chrono::Utc::now().to_rfc3339(),
+                        session.id
+                    );
                     session.close().await;
                 }
             }
@@ -620,6 +625,11 @@ impl Session {
                 let result = g.save_mapping(&record, &session.namespace, &registry).await;
                 drop(registry);
                 if result.is_err() {
+                    eprintln!(
+                        "{} event=session_close_requested session={} reason=pair_mapping_save_failed",
+                        chrono::Utc::now().to_rfc3339(),
+                        session.id
+                    );
                     session.close().await;
                     break;
                 }
@@ -724,7 +734,6 @@ impl Session {
                 // Only fixed categories leave this boundary: SDK/device error strings
                 // may contain caller-supplied content or access-bearing URLs.
                 let category = match error.to_string().as_str() {
-                    "Stream receive buffer exceeded" => "receive_buffer_exceeded",
                     "Unknown or unopened stream" | "Unknown relay stream" => "unknown_stream",
                     "Invalid relay header" | "Invalid relay length" => "invalid_frame",
                     "Invalid OpenResult" | "Unexpected OpenResult" => "invalid_open_result",
@@ -935,6 +944,11 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         }
         (Method::GET, []) => Ok(reply(200, s.snapshot().await)),
         (Method::DELETE, []) => {
+            eprintln!(
+                "{} event=session_close_requested session={} reason=api_delete",
+                chrono::Utc::now().to_rfc3339(),
+                s.id
+            );
             s.close().await;
             Ok(reply(200, json!({"state":"closed"})))
         }
