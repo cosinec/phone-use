@@ -31,13 +31,34 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     let position = RwSignal::new(String::new());
     let loaded = RwSignal::new(false);
     let landscape = RwSignal::new(false);
+    let preview_paused = RwSignal::new(false);
+    let stream_started = StoredValue::new_local((String::new(), 0.0));
     let image_ref = NodeRef::<leptos::html::Img>::new();
     // Chrome only emits load for the initial MJPEG image. Poll intrinsic dimensions
     // with session status so rotation of later frames also updates the phone layout.
     Effect::new(move |_| {
         let _ = ui.state.get();
-        if !ui.preview_url.get().is_empty()
-            && let Some(image) = image_ref.get()
+        let stream = ui.preview_url.get();
+        if stream.is_empty() {
+            stream_started.set_value((String::new(), 0.0));
+            return;
+        }
+        let (previous, mut started) = stream_started.get_value();
+        if previous != stream {
+            started = now();
+            stream_started.set_value((stream, started));
+            preview_paused.set(false);
+        }
+        // A multipart response may stay open across upstream retries, so Chrome
+        // need not emit error when transport protection pauses the video stream.
+        // Release that subscription and let normal screenshot polling take over.
+        if now() - started >= 5000.0 && ui.session()["preview"]["ageMs"].as_u64().is_none_or(|age| age > 5000) {
+            preview_paused.set(true);
+            ui.preview_url.set(String::new());
+            loaded.set(false);
+            return;
+        }
+        if let Some(image) = image_ref.get()
             && image.natural_width() > 0
             && image.natural_height() > 0
         {
@@ -114,6 +135,9 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                 }
                             }
                             on:error=move |_| {
+                                if !ui.preview_url.get_untracked().is_empty() {
+                                    preview_paused.set(true);
+                                }
                                 ui.preview_url.set(String::new());
                                 loaded.set(false);
                                 landscape.set(false);
@@ -165,7 +189,10 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                     {move || {
                         if !ui.preview_url.get().is_empty() {
                             let age = ui.session()["preview"]["ageMs"].as_u64();
-                            return match age { Some(age) if age <= 5000 => "MJPEG 连续画面", _ => "画面重连中" };
+                            return match age { Some(age) if age <= 5000 => "连续画面", _ => "画面重连中" };
+                        }
+                        if preview_paused.get() {
+                            return if ui.screen.get().is_null() { "连续画面已暂停，等待截图" } else { "截图预览（连续画面已暂停）" };
                         }
                         if ui.screen.get().is_null() {
                             "等待设备画面"

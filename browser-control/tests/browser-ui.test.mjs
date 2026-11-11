@@ -502,7 +502,7 @@ test('MJPEG image renders while task is running and maps native pixels back to p
   });
   await connect(page);
   await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 400);
-  await page.getByText('MJPEG 连续画面', { exact: true }).waitFor();
+  await page.getByText('连续画面', { exact: true }).waitFor();
   const image = page.locator('.phone-screen');
   const box = await image.boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
@@ -522,4 +522,27 @@ test('MJPEG image renders while task is running and maps native pixels back to p
   await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 800);
   await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'), null, { timeout: 4000 });
 
+});
+
+test('a stale continuous preview falls back to fresh screenshots and permits manual control', async t => {
+  const page = await pageFor(t);
+  t.after(() => { streamFixtureBytes = undefined; });
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => fixture.image.imageBase64), 'base64');
+  await page.evaluate(() => {
+    fixture.enableStream = true;
+    fixture.state.preview = {state: 'streaming', ageMs: 10};
+  });
+  await connect(page);
+  await page.getByText('连续画面', {exact: true}).waitFor();
+  // Upstream can keep the multipart HTTP response open while its USB video
+  // connection is paused. A browser error event is not required for fallback.
+  await page.evaluate(() => { fixture.state.preview = {state: 'waiting'}; });
+  await page.locator('.screen-meta').filter({hasText: '截图预览（连续画面已暂停）'}).waitFor({timeout: 12000});
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.src.startsWith('data:image/jpeg;base64,'));
+  const image = page.locator('.phone-screen');
+  const box = await image.boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(() => fixture.calls.some(c => c.body?.tool === 'iphone_tap'));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.body?.tool === 'iphone_tap').length), 1);
+  assert.equal(await page.getByRole('button', {name: '刷新屏幕', exact: true}).isEnabled(), true);
 });

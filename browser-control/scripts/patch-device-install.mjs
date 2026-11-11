@@ -24,7 +24,8 @@ const legacyMarker = "// phone-use: device-install stream lifecycle v1";
 const v2Marker = "// phone-use: device-install stream lifecycle v2";
 const v3Marker = "// phone-use: device-install stream lifecycle v3";
 const v4Marker = "// phone-use: device-install stream lifecycle v4";
-const marker = "// phone-use: device-install stream lifecycle v5";
+const v5Marker = "// phone-use: device-install stream lifecycle v5";
+const marker = "// phone-use: device-install stream lifecycle v6";
 const streamReplacements = [
   [
     "  async handleFrame(t) {\n    switch (t.type) {",
@@ -428,7 +429,7 @@ async function receiveDeviceData(stream, packet) {
 
 // ACKs use the existing serialized USB writer, but never hold the receive loop.
 // At most one write and one cumulative update can be pending per stream.
-const replacements = [
+const v5Replacements = [
   ...v4Replacements,
   [
     "  return e.writeChain = e.writeChain.then(async () => {",
@@ -461,8 +462,8 @@ const replacements = [
         else if (n.seq === ((r.ack - 1) >>> 0)) queueDeviceAck(r);`,
   ],
 ];
-const helpers = v4Helpers
-  .replace(v4Marker, marker)
+const v5Helpers = v4Helpers
+  .replace(v4Marker, v5Marker)
   .replace("async function receiveDeviceData(stream, packet)", "function receiveDeviceData(stream, packet)")
   .replaceAll("await w(stream, f, new Uint8Array());", "queueDeviceAck(stream);")
   .replace("await w(stream, 17, new Uint8Array());", "void w(stream, 17, new Uint8Array()).catch(() => {});") + `
@@ -486,12 +487,154 @@ function queueDeviceAck(stream) {
 }
 `;
 
+// Keep the v5 layout above intact so existing installations can be authenticated
+// and migrated. Bound the opposite (phone -> browser -> VPS) direction as well.
+const replacements = [
+  ...v5Replacements,
+  [
+    '  let n, r;\n  const a = {',
+    '  if (e.streams.size >= 64) throw new Error("USB stream limit exceeded");\n  let n, r;\n  const a = {',
+  ],
+  ['a.setUint16(14, 512)', 'a.setUint16(14, deviceReceiveWindow(e))'],
+  [
+    '    if (this.closed) return;\n    try {\n      const a = await Q(this.session, r, stream => this.streams.set(n, stream));',
+    `    if (this.closed) return;
+    if (this.streams.size >= 64) {
+      await this.send({ type: s.OpenResult, requestId: t, streamId: n,
+        payload: l({ ok: false, error: "USB stream limit exceeded" }) });
+      return;
+    }
+    if (r === 9100 && performance.now() < (this.previewSuspendedUntil ?? 0)) {
+      await this.send({ type: s.OpenResult, requestId: t, streamId: n,
+        payload: l({ ok: false, error: "Preview paused for uplink congestion" }) });
+      return;
+    }
+    try {
+      const a = await Q(this.session, r, stream => this.streams.set(n, stream));`,
+  ],
+  [
+    `        await this.send({
+          type: s.StreamData,
+          requestId: 0,
+          streamId: t,
+          payload: r
+        });`,
+    `        try {
+          await this.send({ type: s.StreamData, requestId: 0, streamId: t, payload: r });
+        } finally {
+          consumeDeviceRead(n, r.byteLength);
+        }`,
+  ],
+  [
+    '        await this.send({\n          type: s.Pong,',
+    '        void this.send({\n          type: s.Pong,',
+  ],
+  [
+    '          payload: new Uint8Array()\n        });\n        break;',
+    '          payload: new Uint8Array()\n        }).catch(error => this.log("Relay heartbeat send failed", h(error)));\n        break;',
+  ],
+  [
+    `  async send(t) {
+    if (!this.closed) {
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        this.closed = !0;
+        return;
+      }
+      this.socket.send(_(t));
+    }
+  }`,
+    `  async send(t) { await sendBoundedRelayFrame(this, t); }`,
+  ],
+];
+const helpers = v5Helpers.replace(v5Marker, marker)
+  .replace('  if (discard) stream.queue.length = 0;', `  if (discard) {
+    stream.queue.length = 0;
+    stream.readRetainedBytes = 0;
+    stream.readDiscarded = true;
+  }`)
+  .replace('  if (payload.byteLength) {\n    stream.ack =', `  if (payload.byteLength) {
+    const retained = (stream.readRetainedBytes ?? 0) + payload.byteLength;
+    if (retained > DEVICE_READ_LIMIT) {
+      // A one-byte zero-window probe is legal. Keep the cumulative ACK fixed
+      // so the peer retries this byte after the consumer releases credit.
+      if ((stream.readRetainedBytes ?? 0) === DEVICE_READ_LIMIT && payload.byteLength === 1) {
+        queueDeviceAck(stream);
+        return;
+      }
+      releaseDeviceStream(stream, { reason: "USB receive window exceeded" });
+      return;
+    }
+    stream.readRetainedBytes = retained;
+    stream.ack =`) + `
+// Credit includes the chunk held by the relay pump until WebSocket accepts it.
+// Shrinking only this stream's advertised window leaves USB demux/ACKs running.
+const DEVICE_READ_LIMIT = 128 * 1024;
+function deviceReceiveWindow(stream) {
+  return Math.floor(Math.max(0, DEVICE_READ_LIMIT - (stream.readRetainedBytes ?? 0)) / 256);
+}
+function consumeDeviceRead(stream, length) {
+  const before = deviceReceiveWindow(stream);
+  stream.readRetainedBytes = Math.max(0, (stream.readRetainedBytes ?? 0) - length);
+  // Update promptly on zero-window recovery; batch small credit changes to avoid
+  // doubling USB ACK traffic for every tiny control response.
+  const after = deviceReceiveWindow(stream);
+  if ((!before && after) || after - before >= 64) queueDeviceAck(stream);
+}
+async function sendBoundedRelayFrame(relay, frame) {
+  const data = frame.type === s.StreamData;
+  const stream = data ? relay.streams.get(frame.streamId) : null;
+  if (data && !stream) return;
+  const preview = stream?.dport === 9100;
+  // Reserve room for control responses, then a further reserve for protocol
+  // messages. All checks and socket.send are synchronous once credit is free.
+  const limit = preview ? 128 * 1024 : data ? 384 * 1024 : 512 * 1024;
+  const bytes = _(frame);
+  const started = performance.now();
+  let waiting = false;
+  try {
+    for (;;) {
+      if (relay.closed || !relay.socket || relay.socket.readyState !== WebSocket.OPEN) return;
+      if (data && (relay.streams.get(frame.streamId) !== stream || stream.readDiscarded)) return;
+      if ((relay.socket.bufferedAmount ?? 0) + bytes.byteLength <= limit) {
+        relay.socket.send(bytes);
+        return;
+      }
+      if (!waiting) {
+        waiting = true;
+        relay.uplinkWaiters = (relay.uplinkWaiters ?? 0) + 1;
+        relay.uplinkWaitCount = (relay.uplinkWaitCount ?? 0) + 1;
+      }
+      const elapsed = performance.now() - started;
+      if (preview && elapsed >= 2000) {
+        relay.previewPauses = (relay.previewPauses ?? 0) + 1;
+        relay.previewSuspendedUntil = performance.now() + 30000;
+        relay.log("Preview paused for uplink congestion", relay.socket.bufferedAmount ?? 0);
+        throw new Error("Preview paused for uplink congestion");
+      }
+      if (elapsed >= 20000) {
+        relay.log("Relay uplink stalled", relay.socket.bufferedAmount ?? 0);
+        relay.close();
+        throw new Error("Relay uplink stalled");
+      }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  } finally {
+    if (waiting) {
+      relay.uplinkWaiters--;
+      relay.uplinkWaitMaxMs = Math.max(relay.uplinkWaitMaxMs ?? 0, Math.round(performance.now() - started));
+    }
+  }
+}
+`;
+
 function digest(text) {
   return createHash("sha256").update(text).digest("hex");
 }
 // Reverse our exact edits to authenticate both fresh and previously patched files.
 const applied = source.includes(marker)
   ? { helpers, replacements }
+  : source.includes(v5Marker)
+    ? { helpers: v5Helpers, replacements: v5Replacements }
   : source.includes(v4Marker)
     ? { helpers: v4Helpers, replacements: v4Replacements }
   : source.includes(v3Marker)

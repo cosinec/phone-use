@@ -67,11 +67,14 @@ contract('transport diagnostics accept all 64 enriched streams and reject unauth
   const app = await harness(t);
   const session = await app.session();
   const route = `/api/sessions/${session.id}/diagnostics`;
-  const metrics = {schema: 1, event: 'sample', streams: Array.from({length: 64}, (_, i) => ({
+  const metrics = {schema: 1, event: 'sample', uplinkWaiters: 1, uplinkWaitCount: 3,
+    uplinkWaitMaxMs: 2001, previewPauses: 1, previewCooldownMs: 29999,
+    streams: Array.from({length: 64}, (_, i) => ({
     streamId: i + 1, port: 8100, readQueuedBytes: 1024, writeQueuedBytes: 1048576,
     peerWindowBytes: 131072, readQueuedFrames: 10, sendSeq: 0xffffffff, peerAck: 0xffffff00,
     inFlightBytes: 255, availableWindowBytes: 130817, writeWaiters: 1, ackPending: 1,
     windowBlocked: 0, windowBlockedMs: 0, peerAckUnchangedMs: 10000,
+    readRetainedBytes: 131072, receiveWindowBytes: 0,
   }))};
   assert.ok(Buffer.byteLength(JSON.stringify(metrics)) > 16 * 1024, 'fixture must exceed the previous upload limit');
   assert.equal((await app.api(route, 'wrong-token', metrics)).status, 401);
@@ -84,6 +87,10 @@ contract('transport diagnostics accept all 64 enriched streams and reject unauth
   assert.equal(stored.streams.length, 64);
   assert.equal(stored.streams[63].sendSeq, 0xffffffff);
   assert.equal(stored.streams[63].peerAckUnchangedMs, 10000);
+  assert.equal(stored.streams[63].readRetainedBytes, 131072);
+  assert.equal(stored.streams[63].receiveWindowBytes, 0);
+  assert.equal(stored.previewCooldownMs, 29999);
+  assert.equal(stored.uplinkWaitMaxMs, 2001);
   assert.equal((await app.api(route, session.token, {...metrics, payload: 'PRIVATE_DIAGNOSTIC_PAYLOAD'})).status, 400);
   assert.ok(!app.logs().includes('PRIVATE_DIAGNOSTIC_PAYLOAD'));
 });

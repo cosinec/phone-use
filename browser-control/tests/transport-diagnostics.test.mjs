@@ -136,3 +136,26 @@ test('samples distinguish exhausted credit from USB backpressure and track recov
   await tick();
   assert.equal(samples.at(-1).streams[0].peerAckUnchangedMs, 0, 'idle time must not be counted as an ACK stall');
 });
+
+test('uplink diagnostics report retained pump bytes, receive credit and preview cooldown without payloads', async t => {
+  const {attachTransportDiagnostics} = await import('../web/transport-diagnostics.mjs');
+  let tick, now = 100;
+  t.mock.method(globalThis, 'setInterval', callback => { tick = callback; return 1; });
+  t.mock.method(globalThis, 'clearInterval', () => {});
+  t.mock.method(performance, 'now', () => now);
+  const samples = [];
+  const relay = {uplinkWaiters: 1, uplinkWaitCount: 3, uplinkWaitMaxMs: 2001,
+    previewPauses: 1, previewSuspendedUntil: 30100,
+    streams: new Map([[7, {dport: 9100, queue: [new Uint8Array(32768)], readRetainedBytes: 65536}]])};
+  const stop = attachTransportDiagnostics({device: {}}, relay, async sample => samples.push(sample));
+  t.after(stop);
+  await tick();
+  assert.equal(samples[0].previewCooldownMs, 30000);
+  assert.equal(samples[0].uplinkWaitMaxMs, 2001);
+  assert.equal(samples[0].streams[0].readQueuedBytes, 32768);
+  assert.equal(samples[0].streams[0].readRetainedBytes, 65536);
+  assert.equal(samples[0].streams[0].receiveWindowBytes, 65536);
+  now += 30001;
+  await tick();
+  assert.equal(samples.at(-1).previewCooldownMs, 0);
+});

@@ -49,7 +49,7 @@ test("SDK patch is idempotent and refuses a changed package or modified chunk", 
   );
   const layouts = runInNewContext(
     definitions +
-      "\n({replacements,helpers,streamReplacements,framingReplacements,legacyHelpers,v2Helpers,v3Replacements,v3Helpers,v4Replacements,v4Helpers})",
+      "\n({replacements,helpers,streamReplacements,framingReplacements,legacyHelpers,v2Helpers,v3Replacements,v3Helpers,v4Replacements,v4Helpers,v5Replacements,v5Helpers})",
   );
   assert.ok(before.endsWith(layouts.helpers));
   let original = before.slice(0, -layouts.helpers.length);
@@ -67,6 +67,7 @@ test("SDK patch is idempotent and refuses a changed package or modified chunk", 
     ],
     [layouts.v3Replacements, layouts.v3Helpers],
     [layouts.v4Replacements, layouts.v4Helpers],
+    [layouts.v5Replacements, layouts.v5Helpers],
   ]) {
     let legacy = original;
     for (const [from, to] of replacements) legacy = legacy.replace(from, to);

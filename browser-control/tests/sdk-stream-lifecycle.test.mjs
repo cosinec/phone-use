@@ -71,6 +71,7 @@ async function fixture(t) {
           flags: view.getUint8(29),
           seq: view.getUint32(20),
           ack: view.getUint32(24),
+          window: view.getUint16(30) * 256,
           payload: bytes.slice(36),
         });
         if (view.getUint8(29) & 2 && autoOpen) packet(stream, 18, new Uint8Array(), 0);
@@ -94,6 +95,7 @@ async function fixture(t) {
       queueMicrotask(() => this.onopen?.());
     }
     send(bytes) {
+      if (this.trackBuffer) this.bufferedAmount = (this.bufferedAmount ?? 0) + bytes.byteLength;
       const view = new DataView(
         bytes.buffer,
         bytes.byteOffset,
@@ -160,8 +162,8 @@ async function fixture(t) {
     relay.enqueueFrame(bytes);
     return relay.frameQueue;
   };
-  const open = async (id) => {
-    await send(2, id, new TextEncoder().encode('{"port":8100}'));
+  const open = async (id, port = 8100) => {
+    await send(2, id, new TextEncoder().encode(JSON.stringify({port})));
     await wait(() => frames.some((f) => f.type === 3 && f.streamId === id));
     return [...target.session.streams.values()].find(
       (s) => s === relay.streams.get(id),
@@ -834,4 +836,146 @@ test("a reset flood behind a stalled USB write has a bounded output queue", asyn
   release();
   await f.target.session.writeChain.catch(() => {});
   await f.wait(() => f.target.session.pendingMuxWrites === 0);
+});
+
+test('a slow preview upload closes only its receive window; control and heartbeat continue, then bytes resume intact', async t => {
+  const f = await fixture(t);
+  const preview = await f.open(1, 9100), control = await f.open(2);
+  f.relay.socket.bufferedAmount = 128 * 1024;
+  f.relay.socket.trackBuffer = true;
+  const expected = Uint8Array.from({length: 128 * 1024}, (_, i) => i % 251);
+  for (let offset = 0; offset < expected.length; offset += 32768) {
+    f.packet(preview, 16, expected.slice(offset, offset + 32768), offset + 1);
+  }
+  await f.wait(() => f.sent.some(p => p.sport === preview.sport && p.window === 0));
+  assert.equal(preview.readRetainedBytes, expected.length);
+  assert.equal(preview.queue.reduce((sum, bytes) => sum + bytes.length, 0), 96 * 1024);
+  assert.equal(f.frames.filter(frame => frame.type === 4 && frame.streamId === 1).length, 0);
+  f.packet(preview, 16, new Uint8Array([99]), expected.length + 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(preview.closed, undefined, 'a legal zero-window probe must not reset the preview');
+  assert.equal(preview.ack, expected.length + 1, 'do not acknowledge probe data until credit recovers');
+  f.packet(control, 16, new Uint8Array([42]));
+  await f.wait(() => f.frames.some(frame => frame.type === 4 && frame.streamId === 2));
+  await f.send(8, 0);
+  assert.ok(f.frames.some(frame => frame.type === 9));
+  assert.ok(f.relay.socket.bufferedAmount < 384 * 1024);
+  // Simulate downstream progress. Do not hide a second unbounded SDK queue.
+  f.relay.socket.trackBuffer = false;
+  f.relay.socket.bufferedAmount = 0;
+  await f.wait(() => preview.readRetainedBytes === 0);
+  await f.wait(() => f.sent.some(p => p.sport === preview.sport && p.ack === expected.length + 1 && p.window === expected.length));
+  const actual = Buffer.concat(f.frames.filter(frame => frame.type === 4 && frame.streamId === 1).map(frame => frame.payload));
+  assert.deepEqual(actual, Buffer.from(expected));
+  f.packet(preview, 16, new Uint8Array([99]), expected.length + 1);
+  await f.wait(() => preview.ack === expected.length + 2 && preview.readRetainedBytes === 0);
+  assert.deepEqual([...f.frames.filter(frame => frame.type === 4 && frame.streamId === 1).at(-1).payload], [99]);
+  assert.equal(f.relay.closed, false);
+  assert.equal(f.relay.uplinkWaiters, 0);
+  assert.ok(f.relay.uplinkWaitCount >= 1);
+});
+
+test('the native WebSocket queue stays within its preview budget under continuous upload', async t => {
+  const f = await fixture(t), stream = await f.open(1, 9100);
+  f.relay.socket.trackBuffer = true;
+  f.relay.socket.bufferedAmount = 0;
+  for (let i = 0; i < 5; i++) f.packet(stream, 16, new Uint8Array(32768).fill(i), 1 + i * 32768);
+  await f.wait(() => stream.readRetainedBytes >= 64 * 1024);
+  assert.ok(f.relay.socket.bufferedAmount <= 128 * 1024);
+  assert.ok(stream.readRetainedBytes <= 128 * 1024);
+  assert.equal(f.relay.closed, false);
+});
+
+test('sustained preview congestion resets the preview, enforces cooldown, and preserves the control connection', async t => {
+  const f = await fixture(t), preview = await f.open(1, 9100), control = await f.open(2);
+  let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  f.relay.socket.bufferedAmount = 128 * 1024;
+  f.packet(preview, 16, new Uint8Array([1]));
+  await f.wait(() => f.relay.uplinkWaiters === 1);
+  now += 2001;
+  await f.wait(() => f.frames.some(frame => frame.type === 5 && frame.streamId === 1));
+  assert.equal(f.relay.previewPauses, 1);
+  assert.equal(preview.readRetainedBytes, 0);
+  assert.equal(f.relay.streams.get(2), control);
+  assert.equal(f.target.session.closed, false);
+  assert.ok(f.sent.some(p => p.sport === preview.sport && p.flags === 20));
+  const synCount = f.sent.filter(p => p.flags & 2).length;
+  assert.equal(await f.open(3, 9100), undefined);
+  assert.equal(f.sent.filter(p => p.flags & 2).length, synCount, 'cooldown must not open another USB preview');
+  assert.equal(JSON.parse(new TextDecoder().decode(f.frames.find(frame => frame.type === 3 && frame.streamId === 3).payload)).ok, false);
+  f.packet(control, 16, new Uint8Array([42]));
+  await f.wait(() => f.frames.some(frame => frame.type === 4 && frame.streamId === 2));
+  now += 30001;
+  assert.ok(await f.open(4, 9100));
+});
+
+test('a blocked control upload cannot hold incoming heartbeat or cancellation and never replays cancelled bytes', async t => {
+  const f = await fixture(t), stream = await f.open(1);
+  f.relay.socket.bufferedAmount = 384 * 1024;
+  f.packet(stream, 16, new Uint8Array([42]));
+  await f.wait(() => f.relay.uplinkWaiters === 1);
+  await f.send(8, 0);
+  await f.wait(() => f.frames.some(frame => frame.type === 9));
+  await f.send(5, 1);
+  await f.wait(() => f.relay.uplinkWaiters === 0);
+  f.relay.socket.bufferedAmount = 0;
+  assert.equal(stream.readRetainedBytes, 0);
+  assert.equal(f.frames.filter(frame => frame.type === 4).length, 0);
+  assert.equal(f.relay.closed, false);
+});
+
+test('a peer exceeding receive credit resets that stream without retaining unbounded bytes', async t => {
+  const f = await fixture(t), stream = await f.open(1);
+  f.relay.socket.bufferedAmount = 384 * 1024;
+  for (let i = 0; i < 4; i++) f.packet(stream, 16, new Uint8Array(32768), 1 + i * 32768);
+  await f.wait(() => stream.readRetainedBytes === 128 * 1024);
+  f.packet(stream, 16, new Uint8Array([42, 43]), 1 + 128 * 1024);
+  await f.wait(() => f.frames.some(frame => frame.type === 5 && frame.streamId === 1));
+  assert.equal(stream.readRetainedBytes, 0);
+  assert.equal(stream.queue.length, 0);
+  assert.equal(f.relay.closed, false);
+});
+
+test('remote FIN during upload backpressure drains its final bytes once before notifying close', async t => {
+  const f = await fixture(t), stream = await f.open(1);
+  f.relay.socket.bufferedAmount = 384 * 1024;
+  f.packet(stream, 17, new Uint8Array([1, 2, 3]), 1);
+  await f.wait(() => stream.closed);
+  assert.equal(f.frames.filter(frame => frame.type === 4 || frame.type === 5).length, 0);
+  assert.equal(stream.readRetainedBytes, 3);
+  f.relay.socket.bufferedAmount = 0;
+  await f.wait(() => f.frames.some(frame => frame.type === 5));
+  assert.deepEqual(f.frames.filter(frame => frame.type === 4).map(frame => [...frame.payload]), [[1, 2, 3]]);
+  assert.equal(stream.readRetainedBytes, 0);
+  assert.equal(f.sent.filter(packet => packet.flags & 4).length, 0);
+});
+
+test('a permanently stalled uplink closes the relay and releases all waiting uploads', async t => {
+  const f = await fixture(t), first = await f.open(1), second = await f.open(2);
+  let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  f.relay.socket.bufferedAmount = 512 * 1024;
+  f.packet(first, 16, new Uint8Array([1]));
+  f.packet(second, 16, new Uint8Array([2]));
+  await f.wait(() => f.relay.uplinkWaiters === 2);
+  await f.send(8, 0);
+  await f.wait(() => f.relay.uplinkWaiters === 3);
+  now += 20001;
+  await f.wait(() => f.relay.closed && f.relay.uplinkWaiters === 0);
+  assert.equal(f.relay.streams.size, 0);
+  assert.equal(f.target.session.streams.size, 0);
+  assert.equal(first.readRetainedBytes + second.readRetainedBytes, 0);
+  assert.equal(f.frames.filter(frame => frame.type === 4).length, 0);
+});
+
+test('the stream count bounds total receive retention and refuses excess opens explicitly', async t => {
+  const f = await fixture(t);
+  const streams = await Promise.all(Array.from({length: 64}, (_, i) => f.open(i + 1)));
+  assert.ok(streams.every(Boolean));
+  assert.equal(await f.open(65), undefined);
+  assert.equal(f.sent.filter(packet => packet.flags & 2).length, 64);
+  assert.equal(f.relay.streams.size, 64);
+  assert.equal(f.target.session.streams.size, 64);
+  assert.equal(JSON.parse(new TextDecoder().decode(f.frames.find(frame => frame.type === 3 && frame.streamId === 65).payload)).ok, false);
 });
