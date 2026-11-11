@@ -4,7 +4,7 @@
 
 | 组件 | 版本 / 提交 | 许可证 | 引入方式 | 改动 |
 |---|---|---|---|---|
-| [idevice](https://github.com/jkcoxson/idevice) | 上游 master `89702099`（0.1.68 之后、未发版） | MIT | git 依赖，`[patch.crates-io]` | 无（0.1.68 的 cryptexd install 会挂住；发版后换回 crates.io） |
+| [idevice](https://github.com/jkcoxson/idevice) | 上游 master `89702099`（0.1.68 之后、未发版） | MIT | `vendor/idevice`，`[patch.crates-io]` | 保留该提交的 cryptexd 修复；增加有界的进程启动 NSError 原始归档解析及 domain/code 诊断。原始文件哈希和改动见 `vendor/idevice/provenance.json`；不改变启动/重试/传输策略 |
 | [jktcp](https://crates.io/crates/jktcp) | 0.1.8（间接） | MIT | `vendor/jktcp`，`[patch.crates-io]` | 基于本仓库 `5bea928` 的 jktcp 子目录，保留部分写入取消安全、ACK 重传计时和并发握手修复；增加共享驱动的读写独立推进、有界输出队列、错误传播及回归用例。来源与改动见 `vendor/jktcp/provenance.json` |
 | [rmcp](https://github.com/modelcontextprotocol/rust-sdk) | 3.8.0 | Apache-2.0（部分历史代码 MIT） | crates.io | 无 |
 | [apple-codesign](https://github.com/indygreg/apple-platform-rs) | 0.29.0（取自 Impactor `3rdparty/apple-codesign-0.29.0`） | MPL-2.0 | `vendor/apple-codesign`，`[patch.crates-io]` | Impactor 的 0o755 权限补丁（上游提交 428b42f）；本仓库删掉了上游的 `tests/`、`docs/`、`src/testdata/`（单元测试的证书和密钥样例）、`Cargo.lock`、`Cargo.toml.orig`，Cargo.toml 去掉 `[[test]]` 目标、`zip` 依赖从 2.x 升到 9.4.1（修安全告警；只有公证功能用它写 zip，API 兼容），源码未改（因此 vendor 里的单元测试不能运行，本仓库也不跑它们） |

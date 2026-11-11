@@ -124,3 +124,11 @@ Appium WDA v16.15.3 的 `FBScreenshot.takeWithScreenID` 最终将图片转换为
 网页提供“暂停预览”按钮，手动或自动切换截图时同时发送鉴权的 `DELETE /preview/stream`，网关取消对应连续画面的生产任务、关闭 USB 连接和 HTTP 响应。不再仅依赖图片 src 改变后浏览器或代理及时取消 HTTP 请求。`preview_stopped` 记录该关闭；它不关闭设备会话、任务或单次截图。后续显式打开预览仍可创建新生产任务。回归覆盖鉴权、已有 HTTP 响应结束、USB StreamClose、重新打开预览，以及设备断开后的清理。读取截图的传输错误现在提示“暂时无法读取设备截图，请稍后刷新画面”，不再与已发出的控制操作结果未知共用提示；控制操作仍不自动重放。
 
 这是设备原生程序、网关和网页的联合更新；旧原生程序仍会走 PNG，旧网页不会显式停止连续预览。
+
+## 真机启动拒绝的 NSError 诊断
+
+2026-11-11 北京时间 22:56 的新连接中，XCTest 任务在 10.7 秒后退出，手机进程启动服务返回 `NSCode=2` 的 NSError，但通用归档解码器只保留了 `NSDomain`/`NSUserInfo` 的 UID 引用，最终只显示 `unexpected response`。本次没有手机 PID 或初始化回调；同期 USB/WS 在线，不能据此认定已启动的 WDA 崩溃，也不能仅凭 code=2 判定开发者信任或签名问题。
+
+现在 vendor 保留原上游 `89702099`，只在进程启动返回路径解析原始归档的 NSError：输出 domain、code、选定的本地化描述/失败原因以及 underlying error 链。新增 `phone_process_launch_failed` 包含 error_domain/error_code/error_depth，并继承 runner_id；解析出的有界错误链进入既有 `xctest_exited.reason` 和启动失败状态。不会输出整个归档、未知 userInfo、启动环境或参数。解析上限为 256 KiB 归档、4096 个对象、16 次 UID 间接引用、8 层错误链、每段文本 512 字符、最终消息 2048 字符；循环和非法引用安全停止。没有改变成功 PID 的解释、启动策略或增加重试。
+
+手动点开 WDA 后退出与服务端 XCTest 启动返回错误应分别记录；手动表现本身不足以确定拒绝启动的根因。实际原因必须重新发起一次受控启动，读到解码后的 domain/code/underlying error 后再判断。

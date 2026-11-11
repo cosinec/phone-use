@@ -126,10 +126,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
     tracing::info!(
         event = "phone_diagnostics_enabled",
-        schema = 1,
+        schema = 2,
         native_pid = std::process::id(),
         callback_events = true,
         phone_process_launch = true,
+        launch_error_details = true,
         raw_phone_debug = false
     );
 

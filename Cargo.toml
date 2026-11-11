@@ -89,8 +89,9 @@ ictl-mcp = { path = "crates/ictl-mcp" }
 # Keep the CoreDeviceProxy TCP driver duplex under transport backpressure.
 jktcp = { path = "vendor/jktcp" }
 apple-codesign = { path = "vendor/apple-codesign" }
-# idevice 0.1.68 的 cryptexd install 会挂住(persistence 字段错、隧道 MSS),修复在上游 master 但还没发版
-idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f704f93b4526756abda319ceb" }
+# Upstream 89702099 retains the cryptexd fixes; the local patch decodes launch NSError details.
+# See vendor/idevice/provenance.json for exact source hashes and the limited patch.
+idevice = { path = "vendor/idevice" }
 
 [profile.release]
 lto = "thin"
