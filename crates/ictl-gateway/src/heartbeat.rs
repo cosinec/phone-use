@@ -17,6 +17,7 @@ pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     writer_alive: Arc<AtomicBool>,
     cancel: CancellationToken,
+    session_id: String,
 ) {
     // Schedule from actual send completion, never from an interval's old ticks.
     // The timer precedes queued data so continuous traffic cannot starve Ping.
@@ -27,7 +28,7 @@ pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep_until(next_ping) => {
                 if !writer_alive.swap(false, Ordering::SeqCst) {
-                    eprintln!("USB relay closed: heartbeat pong missing");
+                    eprintln!("{} event=ws_writer_closed session={session_id} reason=heartbeat_pong_missing", chrono::Utc::now().to_rfc3339());
                     cancel.cancel();
                     break;
                 }
@@ -45,7 +46,10 @@ pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
         };
         if !matches!(sent, Ok(Ok(()))) {
             let cause = if sent.is_err() { "send timeout" } else { "socket send failed" };
-            eprintln!("USB relay closed: {cause}");
+            eprintln!(
+                "{} event=ws_writer_closed session={session_id} reason={cause:?}",
+                chrono::Utc::now().to_rfc3339()
+            );
             cancel.cancel();
             break;
         }
@@ -102,7 +106,13 @@ mod tests {
         let (messages, peer) = mpsc::unbounded_channel();
         let alive = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(write_frames(Peer { messages, delay: None }, receiver, alive.clone(), cancel.clone()));
+        let task = tokio::spawn(write_frames(
+            Peer { messages, delay: None },
+            receiver,
+            alive.clone(),
+            cancel.clone(),
+            "fixture".into(),
+        ));
         (frames, peer, alive, cancel, task)
     }
     fn frame() -> Frame {

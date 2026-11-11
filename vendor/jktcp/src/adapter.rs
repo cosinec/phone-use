@@ -187,6 +187,8 @@ pub struct Adapter {
     flush_pending: bool,
     /// The shared handle driver must keep receiving while output is backpressured.
     defer_writes: bool,
+    write_blocked_since: Option<Instant>,
+    write_blocked_reported: bool,
 }
 
 impl Adapter {
@@ -207,6 +209,8 @@ impl Adapter {
             outbox_offset: 0,
             flush_pending: false,
             defer_writes: false,
+            write_blocked_since: None,
+            write_blocked_reported: false,
         }
     }
 
@@ -428,12 +432,47 @@ impl Adapter {
         if self.defer_writes { Ok(()) } else { self.flush_outbox().await }
     }
 
+    fn note_write_blocked(&mut self) {
+        let since = self.write_blocked_since.get_or_insert_with(Instant::now);
+        if !self.write_blocked_reported && since.elapsed() >= std::time::Duration::from_secs(1) {
+            self.write_blocked_reported = true;
+            warn!(
+                event = "tunnel_write_backpressure",
+                blocked_ms = since.elapsed().as_millis() as u64,
+                queued_packets = self.outbox.len(),
+                packet_offset = self.outbox_offset,
+                active_connections = self.states.len(),
+                "tunnel output remains blocked; receive loop continues"
+            );
+        }
+    }
+
+    fn note_write_recovered(&mut self) {
+        if let Some(since) = self.write_blocked_since.take()
+            && (self.write_blocked_reported || since.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            debug!(
+                event = "tunnel_write_recovered",
+                blocked_ms = since.elapsed().as_millis() as u64,
+                active_connections = self.states.len(),
+                "tunnel output drained"
+            );
+        }
+        self.write_blocked_reported = false;
+    }
+
     /// Record every accepted byte before returning Pending. Polling again never
     /// reconstructs a partly-written IP frame or repeats application bytes.
     fn poll_outbox(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         let mut written = 0;
         while let Some(packet) = self.outbox.front() {
-            let n = std::task::ready!(Pin::new(&mut self.peer).poll_write(cx, &packet[self.outbox_offset..]))?;
+            let n = match Pin::new(&mut self.peer).poll_write(cx, &packet[self.outbox_offset..]) {
+                Poll::Pending => {
+                    self.note_write_blocked();
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result?,
+            };
             if n == 0 {
                 return Poll::Ready(Err(std::io::Error::new(ErrorKind::WriteZero, "transport accepted no bytes")));
             }
@@ -451,9 +490,16 @@ impl Adapter {
             }
         }
         if self.flush_pending {
-            std::task::ready!(Pin::new(&mut self.peer).poll_flush(cx))?;
+            match Pin::new(&mut self.peer).poll_flush(cx) {
+                Poll::Pending => {
+                    self.note_write_blocked();
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result?,
+            }
             self.flush_pending = false;
         }
+        self.note_write_recovered();
         Poll::Ready(Ok(()))
     }
 
@@ -2210,5 +2256,42 @@ mod tests {
         }
         assert_eq!(adapter.get_status(RTO_TEST_HP).unwrap(), ConnectionStatus::Error(ErrorKind::TimedOut));
         assert!(adapter.outbox.len() <= MAX_OUTBOX_PACKETS);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn long_backpressure_recovery_is_logged_without_an_intermediate_poll() {
+        #[derive(Clone)]
+        struct Events(std::sync::Arc<std::sync::Mutex<String>>);
+        impl tracing::Subscriber for Events {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push_str(&fields.0);
+            }
+        }
+        let (wire, _peer) = tokio::io::duplex(128);
+        let mut adapter = Adapter::new(Box::new(TestTransport(wire)), IpAddr::V6(HOST_IP), IpAddr::V6(PEER_IP));
+        adapter.note_write_blocked();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let events = Events(Default::default());
+        tracing::subscriber::with_default(events.clone(), || adapter.note_write_recovered());
+        let text = events.0.lock().unwrap();
+        assert!(text.contains("tunnel_write_recovered"), "missing recovery event: {text}");
+        assert!(text.contains("blocked_ms=5000"), "missing elapsed time: {text}");
     }
 }

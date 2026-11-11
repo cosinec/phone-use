@@ -110,6 +110,12 @@ impl NativeController {
             cleanup: Mutex::new(()),
             cleaned: AtomicBool::new(false),
         });
+        eprintln!(
+            "{} event=native_started namespace={} mode={mode} pid={}",
+            chrono::Utc::now().to_rfc3339(),
+            self.0.data_dir.file_name().unwrap_or_default().to_string_lossy(),
+            group.pid
+        );
         groups.insert(group.pid, group.clone());
         Ok((child, group))
     }
@@ -139,14 +145,22 @@ impl NativeController {
             }
         };
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(drain(stdout));
+            tokio::spawn(crate::diagnostics::drain(stdout, self.0.data_dir.join("logs/daemon.stdout.log")));
         }
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain(stderr));
+            tokio::spawn(crate::diagnostics::drain(stderr, self.0.data_dir.join("logs/daemon.stderr.log")));
         }
         let controller = self.clone();
         tokio::spawn(async move {
-            let _ = child.wait().await;
+            let exit = child.wait().await;
+            eprintln!(
+                "{} event=native_exited namespace={} pid={} exit_code={:?} cancelled={}",
+                chrono::Utc::now().to_rfc3339(),
+                controller.0.data_dir.file_name().unwrap_or_default().to_string_lossy(),
+                group.pid,
+                exit.ok().and_then(|s| s.code()),
+                controller.0.cancel.is_cancelled()
+            );
             {
                 let mut state = controller.0.state.lock().await;
                 state.ready = false;
@@ -366,11 +380,6 @@ impl NativeController {
         }
         Ok(())
     }
-}
-
-async fn drain(mut input: impl AsyncRead + Unpin) {
-    let mut buffer = [0; 8192];
-    while matches!(input.read(&mut buffer).await, Ok(length) if length > 0) {}
 }
 
 fn signal_group(pid: i32, signal: i32) -> Result<()> {

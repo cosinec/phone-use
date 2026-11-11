@@ -15,3 +15,5 @@ pub mod static_files;
 pub mod tasks;
 
 mod heartbeat;
+
+mod diagnostics;

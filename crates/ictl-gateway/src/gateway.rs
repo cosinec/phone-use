@@ -637,12 +637,30 @@ impl Session {
         let alive = Arc::new(AtomicBool::new(true));
         let writer_alive = alive.clone();
         let cancel = self.cancel.clone();
-        let writer = tokio::spawn(crate::heartbeat::write_frames(sink, frames, writer_alive, cancel));
+        let writer = tokio::spawn(crate::heartbeat::write_frames(sink, frames, writer_alive, cancel, self.id.clone()));
         let deadline = tokio::time::sleep(Duration::from_secs(10));
         tokio::pin!(deadline);
         let mut hello = false;
-        loop {
-            let next = tokio::select! {biased;_=self.cancel.cancelled()=>break,_=&mut deadline,if !hello=>break,next=source.next()=>next};
+        let started = Instant::now();
+        let mut frames_received = 0u64;
+        let mut bytes_received = 0u64;
+        eprintln!(
+            "{} event=ws_opened session={} namespace={}",
+            chrono::Utc::now().to_rfc3339(),
+            self.id,
+            self.namespace
+        );
+        let reason = loop {
+            let next = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break "cancel",
+                _ = &mut deadline, if !hello => break "hello_timeout",
+                next = source.next() => next,
+            };
+            if let Some(Ok(Message::Binary(bytes))) = &next {
+                frames_received += 1;
+                bytes_received += bytes.len() as u64;
+            }
             let result = match next {
                 Some(Ok(Message::Binary(bytes))) => match Frame::decode(&bytes) {
                     Ok(frame) if !hello => {
@@ -697,12 +715,37 @@ impl Session {
                     Ok(())
                 }
                 Some(Ok(Message::Ping(_))) => Ok(()),
-                _ => break,
+                Some(Ok(Message::Close(_))) => break "browser_close",
+                Some(Err(_)) => break "socket_error",
+                None => break "eof",
+                _ => break "unsupported_frame",
             };
-            if result.is_err() {
-                break;
+            if let Err(error) = result {
+                // Only fixed categories leave this boundary: SDK/device error strings
+                // may contain caller-supplied content or access-bearing URLs.
+                let category = match error.to_string().as_str() {
+                    "Stream receive buffer exceeded" => "receive_buffer_exceeded",
+                    "Unknown or unopened stream" | "Unknown relay stream" => "unknown_stream",
+                    "Invalid relay header" | "Invalid relay length" => "invalid_frame",
+                    "Invalid OpenResult" | "Unexpected OpenResult" => "invalid_open_result",
+                    "Relay closed" => "relay_closed",
+                    _ => "invalid_protocol_or_hello",
+                };
+                eprintln!(
+                    "{} event=ws_protocol_error session={} category={category}",
+                    chrono::Utc::now().to_rfc3339(),
+                    self.id
+                );
+                break "protocol_error";
             }
-        }
+        };
+        eprintln!(
+            "{} event=ws_closed session={} namespace={} reason={reason} duration_ms={} frames_received={frames_received} bytes_received={bytes_received}",
+            chrono::Utc::now().to_rfc3339(),
+            self.id,
+            self.namespace,
+            started.elapsed().as_millis()
+        );
         self.close().await;
         let _ = writer.await;
     }

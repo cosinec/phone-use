@@ -256,11 +256,12 @@ impl Daemon {
 
         // WDA 健康：本进程的 runner 还活着，且 /status ready
         let runner_alive = g.runner.as_ref().is_some_and(|r| r.alive());
-        let ready = match (&g.wda, runner_alive) {
-            (Some(w), true) => w.ready().await.unwrap_or(false),
-            _ => false,
+        let health_started = Instant::now();
+        let health = match (&g.wda, runner_alive) {
+            (Some(w), true) => w.ready().await.map_err(|error| error.to_string()),
+            _ => Ok(false),
         };
-        if ready {
+        if health == Ok(true) {
             g.wda_misses.reset();
             self.refresh_hid_rotation(g).await;
             if g.state != DeviceState::Ready {
@@ -281,11 +282,23 @@ impl Daemon {
             }
             return;
         }
-        if runner_alive && !g.wda_misses.hit() {
-            return;
+        if runner_alive {
+            let reason = health.as_ref().err().map(String::as_str).unwrap_or("/status returned ready=false");
+            let restart = g.wda_misses.hit();
+            self.log.log(&format!(
+                "event=wda_health_failed elapsed_ms={} misses={:?} restart={restart} reason={reason}",
+                health_started.elapsed().as_millis(),
+                g.wda_misses
+            ));
+            if !restart {
+                return;
+            }
         }
         if g.runner.is_some() {
-            self.log.log("WDA 不可用");
+            let reason = g.runner.as_ref().and_then(WdaRunner::exit_reason).unwrap_or_else(|| {
+                if runner_alive { "three consecutive health failures" } else { "runner task finished" }.to_owned()
+            });
+            self.log.log(&format!("WDA 不可用 event=wda_restart runner_alive={runner_alive} reason={reason}"));
             // 隧道和 HID 也一起丢：WDA 掉线常常是底层连接断了（例如 usbmuxd 重启），
             // 留着旧隧道，下次查镜像就报 socket io failed 并白白退避 60 秒
             self.drop_session(g).await;

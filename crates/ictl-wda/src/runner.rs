@@ -72,6 +72,7 @@ fn launch_hint(msg: String) -> String {
 #[derive(Default)]
 struct Progress {
     errors: Vec<String>,
+    exit_reason: Option<String>,
     automation_wait: Option<tokio::time::Instant>,
     /// 新 runner 已开始执行测试计划（WDA 的 HTTP 服务在测试里启动，一定晚于它）
     plan_started: bool,
@@ -141,6 +142,8 @@ impl XCUITestListener for ErrorListener {
 
 pub struct WdaRunner {
     task: JoinHandle<std::result::Result<(), IdeviceError>>,
+    progress: Arc<Mutex<Progress>>,
+    started: std::time::Instant,
 }
 
 impl WdaRunner {
@@ -169,11 +172,20 @@ impl WdaRunner {
         let progress = Arc::new(Mutex::new(Progress::default()));
         let task = {
             let (provider, progress) = (provider.clone(), progress.clone());
-            tokio::spawn(
-                async move { XCUITestService::new(provider).run(cfg, &mut ErrorListener(progress), None).await },
-            )
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                tracing::info!(event = "xctest_started");
+                let result = XCUITestService::new(provider).run(cfg, &mut ErrorListener(progress.clone()), None).await;
+                let reason = match &result {
+                    Ok(()) => "test plan completed".to_owned(),
+                    Err(e) => e.to_string(),
+                };
+                progress.lock().unwrap().exit_reason = Some(reason.clone());
+                tracing::warn!(event = "xctest_exited", lifetime_ms = started.elapsed().as_millis() as u64, reason = %reason);
+                result
+            })
         };
-        let mut runner = Self { task };
+        let mut runner = Self { task, progress: progress.clone(), started: std::time::Instant::now() };
         let client = WdaClient::new(DeviceTransport::new(provider, WDA_PORT));
 
         let failure = |extra: Option<String>| {
@@ -237,6 +249,10 @@ impl WdaRunner {
         !self.task.is_finished()
     }
 
+    pub fn exit_reason(&self) -> Option<String> {
+        self.progress.lock().unwrap().exit_reason.clone()
+    }
+
     /// 停掉 runner（即丢掉它，见 Drop）
     pub fn stop(self) {}
 }
@@ -244,6 +260,11 @@ impl WdaRunner {
 /// 丢掉就停：守护进程的后台启动任务可能在 start() 中途被取消，不能留下一个没人管的 XCTest 会话
 impl Drop for WdaRunner {
     fn drop(&mut self) {
+        tracing::info!(
+            event = "xctest_stop_requested",
+            lifetime_ms = self.started.elapsed().as_millis() as u64,
+            finished = self.task.is_finished()
+        );
         self.task.abort();
     }
 }
