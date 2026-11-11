@@ -4,7 +4,7 @@ Project additions are covered by the repository [MIT license](../LICENSE). Exist
 
 | Component | Pinned version/source | License/reuse |
 |---|---|---|
-| [@limrun/device-install](https://www.npmjs.com/package/@limrun/device-install/v/0.1.0) | 0.1.0; installed package metadata | MIT as declared by this published package; imported public USB chooser, pairing, relay close and IndexedDB store APIs. No USB protocol code copied or changed. |
+| [@limrun/device-install](https://www.npmjs.com/package/@limrun/device-install/v/0.1.0) | 0.1.0; installed package metadata | MIT as declared by this published package; public USB chooser, pairing, relay close and IndexedDB store APIs. The checksum-verified browser ESM patch handles stream cleanup, framing, flow control, independent receive/ACK progress and bounded USB writes. |
 | [iphone-control PR #34](https://github.com/Derrors/iphone-control/pull/34) | commit [ff78e757](https://github.com/Derrors/iphone-control/commit/ff78e757) | MIT; `web/interaction.mjs` adapts object-fit screenshot coordinate conversion and pointer tap/swipe/long-press behavior. Copyright (c) 2026 iphone-control contributors. |
 | Leptos | 0.8.23 | MIT; Rust/WASM client-rendered UI. Rust dependency metadata is pinned in the root Cargo.lock. |
 | wasm-bindgen / web-sys | 0.2.130 / 0.3.107 | MIT OR Apache-2.0; generated browser bindings and DOM/browser API access. |
