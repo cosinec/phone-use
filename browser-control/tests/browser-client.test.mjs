@@ -71,6 +71,58 @@ function fixture(overrides = {}) {
     relay,
   };
 }
+test('diagnostics wrap physical USB reads without recursing through the packet proxy; setup remains responsive', async t => {
+  const {attachTransportDiagnostics} = await import('../web/transport-diagnostics.mjs');
+  let tick;
+  t.mock.method(globalThis, 'setInterval', callback => { tick = callback; return 1; });
+  t.mock.method(globalThis, 'clearInterval', () => {});
+  const bytes = new Uint8Array(24);
+  new DataView(bytes.buffer).setUint32(4, bytes.length);
+  const fragments = [bytes.slice(0, 5), bytes.slice(5)];
+  let physicalReads = 0, pairedTarget, diagnosticDevice;
+  const device = {
+    async transferIn() {
+      assert.equal(this, device);
+      physicalReads++;
+      const chunk = fragments.shift();
+      assert.ok(chunk, 'packet reassembly must make exactly two physical reads');
+      return {status: 'ok', data: new DataView(chunk.buffer)};
+    },
+    async transferOut(_endpoint, data) { return {status: 'ok', bytesWritten: data.byteLength}; },
+  };
+  const nativeRead = device.transferIn, nativeWrite = device.transferOut;
+  const relay = {socket: {send() {}}, streams: new Map(), close() {}};
+  const {client, calls} = fixture({sdk: {
+    requestUSBAccess: async () => ({...target(), device}),
+    pairDevice: async options => {
+      pairedTarget = options.target;
+      pairedTarget.session = {pendingMuxWrites: 0};
+      return {relay, pairRecord: {udid: UID, pairRecordBase64: 'xml'}};
+    },
+    attachTransportDiagnostics(target, relay, report) {
+      diagnosticDevice = target.device;
+      return attachTransportDiagnostics(target, relay, report);
+    },
+  }});
+  t.after(() => client.disconnect());
+  await client.connect({apiBase: 'http://cloud', accessToken: 'token'});
+  // Fail before invoking a broken wrapper: the old integration otherwise keeps
+  // scheduling WASM promises and starves timers, clicks and session polling.
+  assert.equal(diagnosticDevice, device, 'instrument the physical device, not its packet-reassembly proxy');
+  assert.notEqual(pairedTarget.device, device, 'the SDK must retain complete-packet reads');
+  const received = await pairedTarget.device.transferIn(2, 16384);
+  assert.equal(received.data.byteLength, 24);
+  assert.equal(physicalReads, 2);
+  await tick();
+  const sample = calls.filter(c => c[0] === 'fetch' && c[1].endsWith('/diagnostics')).at(-1);
+  assert.equal(JSON.parse(sample[2].body).usbReadCalls, 2);
+  assert.equal(JSON.parse(sample[2].body).usbReadBytes, 24);
+  await client.startSetup();
+  assert.ok(calls.some(c => c[0] === 'fetch' && c[1].endsWith('/setup') && c[2].method === 'POST'));
+  await client.disconnect();
+  assert.equal(device.transferIn, nativeRead);
+  assert.equal(device.transferOut, nativeWrite);
+});
 test('task creation transmits the selected model once and keeps the omitted-model default compatible', async () => {
   const { client, calls } = fixture();
   await client.connect({ apiBase: 'http://cloud', accessToken: 'token' });

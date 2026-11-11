@@ -45,6 +45,8 @@ info,ictl_wda::http=debug,ictl_wda::runner=info,jktcp::adapter=trace,idevice=war
 
 打开结果与移除日志包含生命周期耗时、累计 `received_bytes`（浏览器到网关成功接收入队）、`sent_bytes`（网关到浏览器成功进入 WebSocket 队列）、当前接收积压和队列剩余帧容量。计数表示软件队列接受的数据，不表示手机或远端应用已经消费。正常数据包不逐条打印新增日志。
 
+采样器必须包装真实 `USBDevice`，不能包装 `completeUsbPacketReads` 的代理。该代理的 `transferIn` 会继续调用真实设备；若通过代理安装采样函数，赋值会转发到真实设备，但读属性仍返回报文重组函数，形成递归，导致微任务持续排队、定时器和点击事件饥饿。浏览器客户端单独保留真实设备用于采样，SDK 保留完整报文代理；采样器也会检查赋值是否真正可见，忽略赋值的代理会立即恢复原函数并报告 hooked=0。回归用例同时验证碎片合并、物理读取计数、setup 请求完成及清理后函数恢复。
+
 浏览器每秒通过已有独立诊断请求上报 `browser_transport`。新增流级字段：
 
 - `sendSeq` / `peerAck` / `inFlightBytes`：32 位序号及未确认字节数，按回绕计算。

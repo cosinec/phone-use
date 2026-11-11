@@ -15,6 +15,7 @@ struct Attempt {
     sdk: JsValue,
     cancelled: bool,
     target: JsValue,
+    physical_device: JsValue,
     session: JsValue,
     relay: JsValue,
     log: JsValue,
@@ -563,6 +564,10 @@ impl BrowserClient {
         let platform = a.borrow().platform.clone();
         let uid = if platform == "android" { android_uid(&serial) } else { canonical_uid(&serial) }.map_err(error)?;
         self.watch_usb(&a, uid.clone());
+        // Keep the actual device separate from the packet-reassembly proxy.
+        // Instrumenting that proxy can replace its underlying transferIn with
+        // a wrapper that calls the proxy again, starving reads and UI events.
+        a.borrow_mut().physical_device = get(&target, "device");
         if platform == "ios" && get(&get(&target, "device"), "transferIn").is_function() {
             set(&target, "device", &crate::packets::complete_usb_packet_reads(get(&target, "device"))?);
         }
@@ -649,8 +654,11 @@ impl BrowserClient {
                     .into()
             });
             let target = a.borrow().target.clone();
+            let diagnostic_target =
+                obj(&[("device", a.borrow().physical_device.clone()), ("session", get(&target, "session"))]);
             let diagnostics =
-                call(&sdk, "attachTransportDiagnostics", &[target, get(&result, "relay"), report]).unwrap_or_default();
+                call(&sdk, "attachTransportDiagnostics", &[diagnostic_target, get(&result, "relay"), report])
+                    .unwrap_or_default();
             a.borrow_mut().diagnostics = diagnostics;
         }
         let record = get(&result, "pairRecord");

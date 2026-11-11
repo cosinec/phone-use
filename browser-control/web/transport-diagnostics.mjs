@@ -21,6 +21,14 @@ export function attachTransportDiagnostics(target, relay, report) {
     const descriptor = Object.getOwnPropertyDescriptor(object, key);
     try {
       if (!Reflect.set(object, key, wrapper)) return false;
+      // A forwarding Proxy may mutate the native device while ignoring this
+      // assignment in its getter. Undo it before a wrapper can recurse through
+      // the proxy's packet reader; diagnostics must never alter USB semantics.
+      if (object[key] !== wrapper) {
+        if (descriptor) Object.defineProperty(object, key, descriptor);
+        else delete object[key];
+        return false;
+      }
     } catch {
       return false;
     }

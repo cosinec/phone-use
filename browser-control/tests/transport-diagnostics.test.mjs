@@ -1,6 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+test('an ignored forwarding-proxy assignment is undone before diagnostics can poison physical reads', async t => {
+  const {attachTransportDiagnostics} = await import('../web/transport-diagnostics.mjs');
+  const {completeUsbPacketReads} = await import('../web/usb-packets.mjs');
+  let tick;
+  t.mock.method(globalThis, 'setInterval', callback => { tick = callback; return 1; });
+  t.mock.method(globalThis, 'clearInterval', () => {});
+  const bytes = new Uint8Array(24);
+  new DataView(bytes.buffer).setUint32(4, bytes.length);
+  let reads = 0;
+  const device = {async transferIn() {
+    reads++;
+    return {status: 'ok', data: new DataView(bytes.buffer)};
+  }};
+  const nativeRead = device.transferIn;
+  const proxy = completeUsbPacketReads(device);
+  const samples = [];
+  const stop = attachTransportDiagnostics({device: proxy}, {streams: new Map()}, async sample => samples.push(sample));
+  t.after(stop);
+  assert.equal(device.transferIn, nativeRead, 'ignored proxy writes must be restored immediately');
+  const packet = await proxy.transferIn(2, 16384);
+  assert.equal(packet.data.byteLength, 24);
+  assert.equal(reads, 1);
+  await tick();
+  assert.equal(samples[0].usbReadHooked, 0, 'a rejected hook must not claim to be active');
+});
+
 test('transport diagnostics preserve USB results and persist bounded numeric metrics', async t => {
   const {attachTransportDiagnostics} = await import('../web/transport-diagnostics.mjs').catch(() => ({}));
   assert.equal(typeof attachTransportDiagnostics, 'function');
