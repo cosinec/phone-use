@@ -7,6 +7,7 @@
 pub mod client;
 pub mod elements;
 pub mod http;
+mod mjpeg;
 pub mod runner;
 pub mod timing;
 

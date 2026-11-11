@@ -87,13 +87,17 @@ pub(crate) struct Frame {
 }
 #[derive(Default)]
 pub struct Preview {
-    sender: Mutex<Option<watch::Sender<Option<Arc<Frame>>>>>,
+    producer: Mutex<Option<Producer>>,
+}
+struct Producer {
+    sender: watch::Sender<Option<Arc<Frame>>>,
+    cancel: CancellationToken,
 }
 
 impl Preview {
     pub async fn status(&self) -> Value {
-        let sender = self.sender.lock().await;
-        let frame = sender.as_ref().and_then(|s| s.borrow().clone());
+        let producer = self.producer.lock().await;
+        let frame = producer.as_ref().and_then(|p| p.sender.borrow().clone());
         match frame {
             Some(frame) => {
                 json!({"state":"streaming","ageMs":frame.at.elapsed().as_millis() as u64,"frames":frame.sequence,"frameBytes":frame.bytes.len()})
@@ -101,17 +105,26 @@ impl Preview {
             None => json!({"state":"waiting"}),
         }
     }
+    pub(crate) async fn stop(&self) {
+        if let Some(producer) = self.producer.lock().await.take() {
+            producer.cancel.cancel();
+        }
+    }
     pub(crate) async fn subscribe(
         &self,
         address: String,
         cancel: CancellationToken,
     ) -> watch::Receiver<Option<Arc<Frame>>> {
-        let mut current = self.sender.lock().await;
-        if let Some(sender) = current.as_ref().filter(|s| s.receiver_count() > 0) {
-            return sender.subscribe();
+        let mut current = self.producer.lock().await;
+        if let Some(producer) = current.as_ref().filter(|p| p.sender.receiver_count() > 0) {
+            return producer.sender.subscribe();
         }
+        if let Some(previous) = current.take() {
+            previous.cancel.cancel();
+        }
+        let cancel = cancel.child_token();
         let (sender, receiver) = watch::channel(None);
-        *current = Some(sender.clone());
+        *current = Some(Producer { sender: sender.clone(), cancel: cancel.clone() });
         tokio::spawn(async move {
             let mut sequence = 0;
             loop {
@@ -182,6 +195,22 @@ pub(crate) fn response(receiver: watch::Receiver<Option<Arc<Frame>>>, cancel: Ca
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_the_producer_and_ends_an_open_http_response() {
+        let cancel = CancellationToken::new();
+        let (sender, receiver) = watch::channel(None);
+        let preview = Preview { producer: Mutex::new(Some(Producer { sender, cancel: cancel.clone() })) };
+        let response = response(receiver, CancellationToken::new());
+        preview.stop().await;
+        assert!(cancel.is_cancelled());
+        let bytes = tokio::time::timeout(Duration::from_secs(1), axum::body::to_bytes(response.into_body(), 1024))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(preview.status().await["state"], "waiting");
+    }
 
     #[tokio::test]
     async fn reads_fragmented_frames_without_waiting_for_the_next_boundary() {

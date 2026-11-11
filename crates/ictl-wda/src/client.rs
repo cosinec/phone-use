@@ -384,6 +384,17 @@ impl<T: Transport> WdaClient<T> {
     pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
         if self.low_latency {
             self.session_id().await?;
+            // WDA 16.15.3 converts /screenshot back to PNG even when the source
+            // quality is JPEG. Capture one MJPEG frame before the WAN instead.
+            // A failed read must not trigger a multi-megabyte PNG fallback.
+            if let Some(jpeg) = self
+                .transport
+                .screenshot_jpeg()
+                .await
+                .map_err(|error| WdaError::Unavailable(format!("MJPEG capture failed: {error}")))?
+            {
+                return Ok(jpeg);
+            }
         }
         // base64 约 11MB：从 JSON 里直接拿走字符串，原地去掉换行，不再另外复制
         let Value::String(mut b64) = self.get("/screenshot").await? else {
@@ -819,6 +830,73 @@ mod tests {
         assert_eq!(profile["settings"]["mjpegServerFramerate"], 3);
         assert_eq!(profile["settings"]["mjpegScalingFactor"], 50);
         assert_eq!(profile["settings"]["mjpegServerScreenshotQuality"], 40);
+    }
+
+    struct JpegTransport {
+        http: Mock,
+        fail: bool,
+        captures: AtomicU64,
+    }
+
+    impl Transport for &JpegTransport {
+        async fn send(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> std::io::Result<(u16, Vec<u8>)> {
+            (&self.http).send(method, path, body, timeout).await
+        }
+
+        async fn screenshot_jpeg(&self) -> std::io::Result<Option<Vec<u8>>> {
+            self.captures.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow capture"))
+            } else {
+                Ok(Some(vec![255, 216, 255, 217]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_capture_uses_one_jpeg_instead_of_requesting_a_large_png() {
+        for fail in [false, true] {
+            let transport = JpegTransport {
+                http: Mock::with(&[
+                    (200, r#"{"sessionId":"A"}"#),
+                    (200, r#"{"value":{"screenshotQuality":1,"waitForIdleTimeout":1,"animationCoolOffTimeout":0}}"#),
+                ]),
+                fail,
+                captures: AtomicU64::new(0),
+            };
+            let mut client = WdaClient::new(&transport).with_low_latency(true);
+            let result = client.screenshot_png().await;
+            if fail {
+                assert!(matches!(result, Err(WdaError::Unavailable(_))));
+            } else {
+                assert_eq!(result.unwrap(), [255, 216, 255, 217]);
+            }
+            assert_eq!(transport.captures.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                transport.http.seen.lock().unwrap().iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+                ["/session", "/session/A/appium/settings"],
+                "even a failed JPEG read must not start a PNG transfer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_clients_keep_the_original_full_resolution_screenshot_path() {
+        let transport = JpegTransport {
+            http: Mock::with(&[(200, r#"{"value":"cG5n"}"#)]),
+            fail: false,
+            captures: AtomicU64::new(0),
+        };
+        let mut client = WdaClient::new(&transport);
+        assert_eq!(client.screenshot_png().await.unwrap(), b"png");
+        assert_eq!(transport.captures.load(Ordering::Relaxed), 0);
+        assert_eq!(transport.http.seen.lock().unwrap()[0].1, "/screenshot");
     }
 
     #[tokio::test]

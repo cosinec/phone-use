@@ -1035,8 +1035,10 @@ contract('MJPEG preview receives independent USB frames while model is thinking 
   const s = await app.session();
   const ws = new WebSocket(s.relayUrl, { origin });
   const ports = new Map(); const intervals = [];
+  const closedStreams = new Set();
   ws.on('message', bytes => {
     const f = decodeFrame(bytes);
+    if (f.type === F.StreamClose) closedStreams.add(f.streamId);
     if (f.type === F.OpenStream) {
       ports.set(f.streamId, JSON.parse(f.payload).port);
       ws.send(encodeFrame({ type: F.OpenResult, requestId: f.requestId, streamId: f.streamId, payload: jsonPayload({ ok: true }) }));
@@ -1064,7 +1066,20 @@ contract('MJPEG preview receives independent USB frames while model is thinking 
   assert.ok(Buffer.from(received.value).includes(Buffer.from([255,216,255,217])));
   const state = await (await app.api(route, s.token)).json();
   assert.equal(state.task.state, 'thinking'); assert.equal(state.preview.state, 'streaming'); assert.ok(state.preview.frames >= 1);
+  assert.equal((await app.api(route + '/preview/stream', 'wrong-token', undefined, {}, 'DELETE')).status, 401);
+  const stopped = await app.api(route + '/preview/stream', s.token, undefined, {}, 'DELETE');
+  assert.equal(stopped.status, 200);
+  await until(() => [...closedStreams].some(id => ports.get(id) === 9100));
+  let ended = false;
+  for (let i = 0; i < 10; i++) { if ((await reader.read()).done) { ended = true; break; } }
+  assert.ok(ended, 'explicit stop must close the HTTP body even if the browser/proxy keeps it open');
+  assert.equal(ws.readyState, WebSocket.OPEN);
+  assert.equal((await (await app.api(route, s.token)).json()).preview.state, 'waiting');
+  const resumed = await fetch(app.base + descriptor.url);
+  assert.equal(resumed.status, 200);
+  const resumedReader = resumed.body.getReader();
+  assert.ok(Buffer.from((await resumedReader.read()).value).includes(Buffer.from([255,216,255,217])));
   ws.close(); await once(ws, 'close');
-  for (let i = 0; i < 10; i++) { if ((await reader.read()).done) return; }
+  for (let i = 0; i < 10; i++) { if ((await resumedReader.read()).done) return; }
   assert.fail('preview did not close with its owning session');
 });

@@ -71,6 +71,14 @@ function fixture(overrides = {}) {
     relay,
   };
 }
+test('stopping continuous preview sends an authenticated DELETE without disconnecting the phone', async t => {
+  const {client, calls} = fixture();
+  t.after(() => client.disconnect());
+  await client.connect({apiBase: 'http://cloud', accessToken: 'token'});
+  await client.stopPreview();
+  assert.ok(calls.some(c => c[0] === 'fetch' && c[1].endsWith('/preview/stream') && c[2].method === 'DELETE'));
+  assert.ok(!calls.some(c => c[0] === 'relay.close'));
+});
 test('diagnostics wrap physical USB reads without recursing through the packet proxy; setup remains responsive', async t => {
   const {attachTransportDiagnostics} = await import('../web/transport-diagnostics.mjs');
   let tick;

@@ -24,6 +24,13 @@ fn pointer(event: &PointerEvent, ui: Ui) -> Option<Pointer> {
         time: now(),
     })
 }
+fn stop_preview(ui: Ui) {
+    ui.preview_url.set(String::new());
+    let pending = ui.client.get_value().stop_preview();
+    spawn_local(async move {
+        let _ = resolved(pending.into()).await;
+    });
+}
 #[component]
 pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     let down = StoredValue::new_local(None::<Pointer>);
@@ -54,7 +61,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
         // Release that subscription and let normal screenshot polling take over.
         if now() - started >= 5000.0 && ui.session()["preview"]["ageMs"].as_u64().is_none_or(|age| age > 5000) {
             preview_paused.set(true);
-            ui.preview_url.set(String::new());
+            stop_preview(ui);
             loaded.set(false);
             return;
         }
@@ -79,6 +86,20 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                     <span class="section-label">"设备屏幕"</span>
                     <h2>"实时画面"</h2>
                 </div>
+                <Show when=move || !ui.preview_url.get().is_empty()>
+                    <button
+                        class="button small"
+                        aria-label="暂停连续画面"
+                        title="暂停连续画面，改用单张截图"
+                        on:click=move |_| {
+                            preview_paused.set(true);
+                            loaded.set(false);
+                            stop_preview(ui);
+                        }
+                    >
+                        "暂停预览"
+                    </button>
+                </Show>
                 <button
                     class="icon-button"
                     aria-label="刷新屏幕"
@@ -137,8 +158,8 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                             on:error=move |_| {
                                 if !ui.preview_url.get_untracked().is_empty() {
                                     preview_paused.set(true);
+                                    stop_preview(ui);
                                 }
-                                ui.preview_url.set(String::new());
                                 loaded.set(false);
                                 landscape.set(false);
                             }

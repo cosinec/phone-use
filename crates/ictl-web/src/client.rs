@@ -255,6 +255,10 @@ impl BrowserClient {
     pub fn screen(&self) -> Promise {
         self.session_promise("/preview", "GET", JsValue::UNDEFINED)
     }
+    #[wasm_bindgen(js_name=stopPreview)]
+    pub fn stop_preview(&self) -> Promise {
+        self.session_promise("/preview/stream", "DELETE", JsValue::UNDEFINED)
+    }
     #[wasm_bindgen(js_name=previewStream)]
     pub fn preview_stream(&self) -> Promise {
         let Some(attempt) = self.inner.borrow().attempt.clone() else {

@@ -111,6 +111,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// [`ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut) 是发出后没在时限内应答，
 /// [`AFTER_SENT`] 是发出后连接断了或响应不完整、看不懂；其他 kind 都表示请求没送到
 pub trait Transport: Send + Sync {
+    /// An optional one-frame JPEG capture, independent of the control HTTP pool.
+    /// Unsupported test/custom transports retain the ordinary screenshot path.
+    fn screenshot_jpeg(&self) -> impl Future<Output = std::io::Result<Option<Vec<u8>>>> + Send {
+        async { Ok(None) }
+    }
+
     fn send(
         &self,
         method: &str,
@@ -151,6 +157,31 @@ fn after_sent(e: std::io::Error) -> std::io::Error {
 }
 
 impl Transport for DeviceTransport {
+    async fn screenshot_jpeg(&self) -> std::io::Result<Option<Vec<u8>>> {
+        let started = Instant::now();
+        let capture = async {
+            let mut socket = self
+                .provider
+                .connect(9100)
+                .await
+                .map_err(std::io::Error::other)?
+                .get_socket()
+                .ok_or_else(|| std::io::Error::other("MJPEG socket unavailable"))?;
+            crate::mjpeg::capture(&mut *socket).await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(8), capture)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "MJPEG frame capture timed out"))
+            .and_then(|result| result);
+        tracing::info!(
+            event = "mjpeg_capture",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            frame_bytes = result.as_ref().map_or(0, |frame| frame.len()),
+            outcome = if result.is_ok() { "ok" } else { "error" }
+        );
+        result.map(Some)
+    }
+
     #[tracing::instrument(name = "wda_http", skip_all, fields(http_id = NEXT_HTTP.fetch_add(1, Ordering::Relaxed), native_pid = std::process::id(), method = method, route = path.split('?').next().unwrap_or(path)))]
     async fn send(
         &self,

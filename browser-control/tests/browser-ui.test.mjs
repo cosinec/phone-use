@@ -521,7 +521,9 @@ test('MJPEG image renders while task is running and maps native pixels back to p
   }), 'base64');
   await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 800);
   await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'), null, { timeout: 4000 });
-
+  await page.getByRole('button', {name: '暂停连续画面', exact: true}).click();
+  await page.waitForFunction(() => fixture.calls.some(c => c.url?.endsWith('/preview/stream') && c.method === 'DELETE'));
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.src.startsWith('data:image/jpeg;base64,'));
 });
 
 test('a stale continuous preview falls back to fresh screenshots and permits manual control', async t => {
@@ -539,6 +541,7 @@ test('a stale continuous preview falls back to fresh screenshots and permits man
   await page.evaluate(() => { fixture.state.preview = {state: 'waiting'}; });
   await page.locator('.screen-meta').filter({hasText: '截图预览（连续画面已暂停）'}).waitFor({timeout: 12000});
   await page.waitForFunction(() => document.querySelector('.phone-screen')?.src.startsWith('data:image/jpeg;base64,'));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview/stream') && c.method === 'DELETE').length), 1);
   const image = page.locator('.phone-screen');
   const box = await image.boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);

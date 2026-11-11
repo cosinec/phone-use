@@ -482,8 +482,9 @@ impl Session {
         }
         let capture = Instant::now();
         let mut result = if observe {
-            let response =
-                native(json!({"op":"observe","limit":80,"snapshot_timeout_ms":1000})).await.map_err(native_error)?;
+            let response = native(json!({"op":"observe","limit":80,"snapshot_timeout_ms":1000}))
+                .await
+                .map_err(|_| ApiError::unavailable("WDA observation unavailable"))?;
             if response["kind"] != "text" {
                 if crate::error::recoverable_wda_error(response["message"].as_str().unwrap_or("")) {
                     return Err(ApiError::unavailable("WDA observation unavailable"));
@@ -500,7 +501,9 @@ impl Session {
             }
             value
         } else {
-            let image = native(json!({"op":"screenshot","region":null})).await.map_err(native_error)?;
+            let image = native(json!({"op":"screenshot","region":null}))
+                .await
+                .map_err(|_| ApiError::unavailable("暂时无法读取设备截图，请稍后刷新画面。"))?;
             if image["kind"] != "image" {
                 return Err(ApiError::unavailable("Screenshot unavailable"));
             }
@@ -922,6 +925,15 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             }
             s.ready().await?;
             Ok(reply(200, json!({"url":format!("/api/sessions/{}/preview/mjpeg/{}", s.id, s.preview_ticket)})))
+        }
+        (Method::DELETE, ["preview", "stream"]) => {
+            s.mjpeg.stop().await;
+            eprintln!(
+                "{} event=preview_stopped session={} reason=client_request",
+                chrono::Utc::now().to_rfc3339(),
+                s.id
+            );
+            Ok(reply(200, json!({"stopped":true})))
         }
         (Method::GET, ["preview", "mjpeg", _]) => {
             if !preview_access {
