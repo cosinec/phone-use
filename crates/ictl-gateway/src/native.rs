@@ -138,11 +138,14 @@ impl NativeController {
                 return Err(error);
             }
         };
+        // Keep the daemon's own tracing output: it is the only record of WDA timeouts, tunnel
+        // resets and restarts once the session is gone.
+        let log = NativeLog::open(self.0.data_dir.join("logs").join("native-daemon.log"), group.pid).await;
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(drain(stdout));
+            tokio::spawn(drain_to(stdout, log.clone()));
         }
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain(stderr));
+            tokio::spawn(drain_to(stderr, log));
         }
         let controller = self.clone();
         tokio::spawn(async move {
@@ -368,9 +371,64 @@ impl NativeController {
     }
 }
 
-async fn drain(mut input: impl AsyncRead + Unpin) {
+/// Rotated once at this size into `<name>.1`, so a session keeps at most twice this much.
+const MAX_NATIVE_LOG: u64 = 8 * 1024 * 1024;
+
+/// Append-only, owner-only log file shared by a native process's stdout and stderr.
+/// Logging is best effort: an unwritable file never stops the pipes from being drained.
+struct NativeLog {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+    size: u64,
+}
+
+impl NativeLog {
+    async fn open(path: PathBuf, pid: i32) -> Arc<Mutex<Self>> {
+        let mut log = Self { path, file: None, size: 0 };
+        log.reopen().await;
+        let marker =
+            format!("==== {} native daemon start pid={pid} ====\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
+        log.write(marker.as_bytes()).await;
+        Arc::new(Mutex::new(log))
+    }
+
+    async fn reopen(&mut self) {
+        self.file = None;
+        if let Some(dir) = self.path.parent() {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
+        if self.size >= MAX_NATIVE_LOG || tokio::fs::metadata(&self.path).await.is_ok_and(|m| m.len() >= MAX_NATIVE_LOG)
+        {
+            let _ = tokio::fs::rename(&self.path, self.path.with_extension("log.1")).await;
+        }
+        let opened = tokio::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&self.path).await;
+        if let Ok(file) = opened {
+            self.size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            self.file = Some(file);
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) {
+        if self.size >= MAX_NATIVE_LOG {
+            self.reopen().await;
+        }
+        let Some(file) = self.file.as_mut() else { return };
+        if file.write_all(bytes).await.is_ok() {
+            self.size += bytes.len() as u64;
+        } else {
+            self.file = None;
+        }
+    }
+}
+
+async fn drain_to(mut input: impl AsyncRead + Unpin, log: Arc<Mutex<NativeLog>>) {
     let mut buffer = [0; 8192];
-    while matches!(input.read(&mut buffer).await, Ok(length) if length > 0) {}
+    while let Ok(length) = input.read(&mut buffer).await {
+        if length == 0 {
+            break;
+        }
+        log.lock().await.write(&buffer[..length]).await;
+    }
 }
 
 fn signal_group(pid: i32, signal: i32) -> Result<()> {
@@ -554,5 +612,29 @@ mod tests {
         assert!(request.await.unwrap().is_err());
         assert_eq!(stream.read(&mut chunk).await.unwrap(), 0);
         assert!(tokio::time::timeout(Duration::from_millis(20), server.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn native_output_is_kept_in_an_owner_only_rotating_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("native-daemon.log");
+        let log = NativeLog::open(path.clone(), 42).await;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let draining = tokio::spawn(drain_to(reader, log.clone()));
+        writer.write_all(b"WARN wda /status timed out\n").await.unwrap();
+        drop(writer);
+        draining.await.unwrap();
+        let text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(text.contains("native daemon start pid=42"));
+        assert!(text.ends_with("WARN wda /status timed out\n"));
+        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // Crossing the size limit moves the old content to `.log.1` and starts a fresh file.
+        log.lock().await.size = MAX_NATIVE_LOG;
+        log.lock().await.write(b"after rotation\n").await;
+        let rotated = tokio::fs::read_to_string(dir.path().join("logs").join("native-daemon.log.1")).await.unwrap();
+        assert!(rotated.contains("timed out"));
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "after rotation\n");
     }
 }
