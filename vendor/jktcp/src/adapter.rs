@@ -522,7 +522,20 @@ impl Adapter {
 
             match action {
                 Action::Kill => {
-                    warn!("hp={hp} timed out after {MAX_RETRIES} retransmissions; closing");
+                    if let Some(state) = self.states.get(&hp) {
+                        warn!(
+                            hp,
+                            peer_port = state.peer_port,
+                            seq = state.seq,
+                            ack = state.ack,
+                            peer_window = state.peer_window,
+                            in_flight = state.bytes_in_flight,
+                            pending_write = state.write_buffer.len(),
+                            buffered_read = self.bytes_in_buf,
+                            pending_packets = self.outbox.len(),
+                            "timed out after {MAX_RETRIES} retransmissions; closing"
+                        );
+                    }
                     if let Some(state) = self.states.get_mut(&hp) {
                         state.status = ConnectionStatus::Error(ErrorKind::TimedOut);
                         // Nothing will be sent on this connection again. Leaving the
@@ -661,6 +674,18 @@ impl Adapter {
 
     pub(crate) async fn process_tcp_packet_from_payload(&mut self, payload: &[u8]) -> Result<(), std::io::Error> {
         let res = TcpPacket::parse(payload)?;
+        trace!(
+            hp = res.destination_port,
+            peer_port = res.source_port,
+            seq = res.sequence_number,
+            ack = res.acknowledgment_number,
+            window = res.window_size,
+            payload_bytes = res.payload.len(),
+            syn = res.flags.syn,
+            fin = res.flags.fin,
+            rst = res.flags.rst,
+            "received tunnel TCP packet"
+        );
         let mut ack_me = None;
 
         if let Some(state) = self.states.get_mut(&res.destination_port) {
@@ -836,7 +861,16 @@ impl Adapter {
         if let ConnectionStatus::Error(e) = state.status {
             return Err(std::io::Error::new(e, "socket error"));
         }
-        trace!("psh {} bytes on hp={host_port}", data.len());
+        trace!(
+            hp = host_port,
+            peer_port = state.peer_port,
+            seq = state.seq,
+            ack = state.ack,
+            payload_bytes = data.len(),
+            peer_window = state.peer_window,
+            in_flight = state.bytes_in_flight,
+            "queued tunnel TCP data"
+        );
         let seq = state.seq;
         let tcp = TcpPacket::create(
             self.host_ip,
