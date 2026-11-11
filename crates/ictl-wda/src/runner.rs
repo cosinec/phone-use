@@ -152,6 +152,17 @@ impl WdaRunner {
         bundle_id: &str,
         timeout: Duration,
     ) -> Result<(Self, WdaClient<DeviceTransport>)> {
+        let (_keep_alive, cancelled) = tokio::sync::oneshot::channel();
+        Self::start_cancellable(provider, bundle_id, timeout, cancelled).await
+    }
+
+    /// 显式取消会等待 XCTest 任务释放连接后才返回。
+    pub async fn start_cancellable(
+        provider: Arc<dyn IdeviceProvider>,
+        bundle_id: &str,
+        timeout: Duration,
+        mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(Self, WdaClient<DeviceTransport>)> {
         let lookup = async {
             let mut ip =
                 InstallationProxyClient::connect(&*provider).await.map_err(|e| WdaError::Unavailable(e.to_string()))?;
@@ -160,7 +171,11 @@ impl WdaRunner {
                 other => WdaError::StartFailed(other.to_string()),
             })
         };
-        let cfg = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await.map_err(|_| {
+        let cfg = tokio::select! {
+            result = tokio::time::timeout(LOOKUP_TIMEOUT, lookup) => result,
+            _ = &mut cancelled => return Err(WdaError::StartFailed("WDA 启动已取消".into())),
+        }
+        .map_err(|_| {
             WdaError::StartFailed(ictl_l10n::trf!(
                 "查 WDA 安装信息超时（{} 秒）",
                 "querying the WDA install info timed out ({} s)",
@@ -180,7 +195,7 @@ impl WdaRunner {
                 result
             })
         };
-        let mut runner = Self { task, progress: progress.clone() };
+        let runner = Self { task, progress: progress.clone() };
         let client = WdaClient::new(DeviceTransport::new(provider, WDA_PORT));
 
         let failure = |extra: Option<String>| {
@@ -200,42 +215,49 @@ impl WdaRunner {
         let mut deadline = t0 + timeout;
         let mut announced = false;
         let mut fallback_logged = false;
-        loop {
-            // runner 在等手机上输密码：等满它自己的 60 秒，期间输了密码就能直接就绪
-            if let Some(since) = progress.lock().unwrap().automation_wait {
-                deadline = deadline.max(since + AUTOMATION_WAIT);
-                if !announced {
-                    announced = true;
-                    tracing::info!("runner 在等手机上的「Enable UI Automation」密码");
+        let ready = async {
+            loop {
+                // runner 在等手机上输密码：等满它自己的 60 秒，期间输了密码就能直接就绪
+                if let Some(since) = progress.lock().unwrap().automation_wait {
+                    deadline = deadline.max(since + AUTOMATION_WAIT);
+                    if !announced {
+                        announced = true;
+                        tracing::info!("runner 在等手机上的「Enable UI Automation」密码");
+                    }
                 }
+                if runner.task.is_finished() {
+                    let msg = runner.exit_reason().unwrap_or_else(|| "XCTest runner ended early".into());
+                    break Err(failure(Some(msg)));
+                }
+                let plan_started = progress.lock().unwrap().plan_started;
+                if !plan_started && t0.elapsed() >= PLAN_START_FALLBACK && !fallback_logged {
+                    fallback_logged = true;
+                    tracing::info!(
+                        "{} 秒内没收到 runner 开始执行测试计划的回调，改为直接查 /status",
+                        PLAN_START_FALLBACK.as_secs()
+                    );
+                }
+                if (plan_started || fallback_logged) && client.ready().await.unwrap_or(false) {
+                    break Ok(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break Err(failure(Some(
+                        ictl_l10n::tr!("WDA 在限定时间内没有就绪", "WDA didn't become ready in time").to_owned(),
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            if runner.task.is_finished() {
-                let r = (&mut runner.task).await;
-                let msg = match r {
-                    Ok(Ok(())) => ictl_l10n::tr!("runner 提前结束", "the runner ended early").to_owned(),
-                    Ok(Err(e)) => e.to_string(),
-                    Err(e) => e.to_string(),
-                };
-                return Err(failure(Some(msg)));
+        };
+        let result = tokio::select! {
+            result = ready => result,
+            _ = &mut cancelled => Err(WdaError::StartFailed("WDA 启动已取消".into())),
+        };
+        match result {
+            Ok(()) => Ok((runner, client)),
+            Err(error) => {
+                runner.stop_and_wait().await;
+                Err(error)
             }
-            let plan_started = progress.lock().unwrap().plan_started;
-            if !plan_started && t0.elapsed() >= PLAN_START_FALLBACK && !fallback_logged {
-                fallback_logged = true;
-                tracing::info!(
-                    "{} 秒内没收到 runner 开始执行测试计划的回调，改为直接查 /status",
-                    PLAN_START_FALLBACK.as_secs()
-                );
-            }
-            if (plan_started || fallback_logged) && client.ready().await.unwrap_or(false) {
-                return Ok((runner, client));
-            }
-            if tokio::time::Instant::now() >= deadline {
-                runner.task.abort();
-                return Err(failure(Some(
-                    ictl_l10n::tr!("WDA 在限定时间内没有就绪", "WDA didn't become ready in time").to_owned(),
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -254,6 +276,12 @@ impl WdaRunner {
 
     /// 停掉 runner（即丢掉它，见 Drop）
     pub fn stop(self) {}
+
+    /// 安装和重新启动前，确认旧 XCTest 任务已经停止并释放连接。
+    pub async fn stop_and_wait(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 
 /// 丢掉就停：守护进程的后台启动任务可能在 start() 中途被取消，不能留下一个没人管的 XCTest 会话
@@ -266,6 +294,38 @@ impl Drop for WdaRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_and_wait_finishes_runner_cleanup_before_returning() {
+        struct Cleanup(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup = Cleanup(cleaned.clone());
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            started.send(()).unwrap();
+            std::future::pending().await
+        });
+        running.await.unwrap();
+        let runner = WdaRunner { task, progress: Arc::new(Mutex::new(Progress::default())) };
+        runner.stop_and_wait().await;
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_accepts_an_already_finished_runner() {
+        let runner =
+            WdaRunner { task: tokio::spawn(async { Ok(()) }), progress: Arc::new(Mutex::new(Progress::default())) };
+        while runner.alive() {
+            tokio::task::yield_now().await;
+        }
+        runner.stop_and_wait().await;
+    }
 
     #[test]
     fn untrusted_developer_hint_only_for_unexpected_response() {

@@ -4,7 +4,7 @@
 //! - 设备相关的状态在 [`Inner`] 里，一把锁串行访问：HID 会话、WDA 会话只能有一个持有者，
 //!   也不会出现 toolkit 那种「长请求期间被巡检误判 WDA 挂了」的问题
 //! - 每个控制请求一个任务，拿到锁才执行；巡检（[`crate::supervise`]）拿不到锁就跳过这一轮
-//! - 耗时的事不持锁：启动 WDA（含挂开发者镜像，最长约 2 分钟）、重签、会话检查在后台跑，做完再持锁写结果
+//! - 启动 WDA、Apple 签名和会话检查在后台跑；实际安装独占设备锁，结束旧 WDA 后再上传新包
 //! - `status` 读发布出来的快照（watch 通道），不碰锁
 //! - 改变手机状态的请求排队超过 [`STALE`] 就放弃，免得点击落到已经变了的屏幕上
 
@@ -177,6 +177,8 @@ pub(crate) struct Inner {
     pub wda: Option<WdaClient<DeviceTransport>>,
     /// 后台启动 WDA 的任务（含挂开发者镜像），巡检里收结果
     pub starting: Option<JoinHandle<StartOutcome>>,
+    /// 请求启动任务协作退出，使其中已经创建的 XCTest runner 也能完成清理。
+    pub start_cancel: Option<tokio::sync::oneshot::Sender<()>>,
     /// 开发者镜像连续挂载失败次数，到 3 次清缓存重新下载
     pub ddi_failures: u32,
     pub resigning: bool,
@@ -287,6 +289,7 @@ impl Daemon {
             runner: None,
             wda: None,
             starting: None,
+            start_cancel: None,
             ddi_failures: 0,
             resigning: false,
             wda_misses: Misses::default(),
@@ -416,10 +419,17 @@ impl Daemon {
     /// 丢掉整个会话：runner、WDA 客户端、正在后台启动的任务、隧道（先停 HID 媒体流）
     pub(crate) async fn drop_session(&self, g: &mut Inner) {
         if let Some(h) = g.starting.take() {
-            h.abort();
+            if let Some(cancel) = g.start_cancel.take() {
+                let _ = cancel.send(());
+            } else {
+                h.abort();
+            }
+            if let Ok(StartOutcome::Ready { runner, .. }) = h.await {
+                runner.stop_and_wait().await;
+            }
         }
         if let Some(r) = g.runner.take() {
-            r.stop();
+            r.stop_and_wait().await;
         }
         g.wda = None;
         g.elements_cache = None;
@@ -485,9 +495,13 @@ impl Daemon {
                 s.log_tail = self.log.tail(15);
                 return Response::text(serde_json::to_string_pretty(&s).unwrap_or_default());
             }
-            // 重签自己分段持锁：签名、安装要几十秒，期间不挡住别的请求
+            // Apple 签名在锁外，实际安装由 resign_now 独占设备锁。
             Request::Resign { force } => {
-                return self.resign_now(force).await.map(Response::text).unwrap_or_else(Response::error);
+                return self
+                    .resign_now(force, ctx.expect_udid.as_deref())
+                    .await
+                    .map(Response::text)
+                    .unwrap_or_else(Response::error);
             }
             _ => {}
         }
@@ -684,6 +698,64 @@ mod tests {
         let ctx = CallCtx { gone: None, expect_udid: Some("00008130-AAAA".into()) };
         let r = d.handle(Request::Status, Instant::now(), ctx).await;
         assert!(matches!(&r, Response::Error { message } if message.contains("设备变了")), "{r:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resign_for_another_device_is_refused_before_signing() {
+        let (d, dir) = test_daemon("resign-expect");
+        let ctx = CallCtx { gone: None, expect_udid: Some("fixture-phone".into()) };
+        let r = d.handle(Request::Resign { force: true }, Instant::now(), ctx).await;
+        assert!(matches!(&r, Response::Error { message } if message.contains("设备变了")), "{r:?}");
+        assert!(!d.inner.lock().await.resigning);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_session_waits_for_background_start_cleanup() {
+        struct Cleanup(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let (d, dir) = test_daemon("starting-cleanup");
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let cleanup = Cleanup(cleaned.clone());
+        let mut g = d.inner.lock().await;
+        g.starting = Some(tokio::spawn(async move {
+            let _cleanup = cleanup;
+            started.send(()).unwrap();
+            std::future::pending().await
+        }));
+        running.await.unwrap();
+        d.drop_session(&mut g).await;
+        assert!(
+            cleaned.load(std::sync::atomic::Ordering::SeqCst),
+            "the old starter must finish cancellation before installation can begin"
+        );
+        assert!(g.starting.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_session_asks_background_start_to_clean_up_before_joining() {
+        let (d, dir) = test_daemon("starting-cancel");
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup = cleaned.clone();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let mut g = d.inner.lock().await;
+        g.start_cancel = Some(cancel);
+        g.starting = Some(tokio::spawn(async move {
+            cancelled.await.unwrap();
+            cleanup.store(true, std::sync::atomic::Ordering::SeqCst);
+            StartOutcome::Wda(ictl_wda::WdaError::StartFailed("cancelled fixture".into()))
+        }));
+        d.drop_session(&mut g).await;
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(g.start_cancel.is_none());
+        assert!(g.starting.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -48,6 +48,77 @@ pub(crate) enum StartOutcome {
     Wda(WdaError),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_device(udid: &str, device_id: u32) -> Device {
+        Device::from_usb(&UsbDevice { udid: udid.into(), device_id })
+    }
+
+    #[tokio::test]
+    async fn installation_rejects_a_changed_phone_or_usb_connection_before_stopping_wda() {
+        for (udid, device_id) in [("another-phone", 1), ("signed-phone", 2)] {
+            let dir = std::env::temp_dir().join(format!("ictl-install-identity-{device_id}-{}", std::process::id()));
+            let daemon = Daemon::new(crate::config::Config::from_env(&dir));
+            let signed_device = fixture_device("signed-phone", 1);
+            let mut g = daemon.inner.lock().await;
+            g.device = Some(fixture_device(udid, device_id));
+            g.state = DeviceState::Ready;
+            g.starting = Some(tokio::spawn(std::future::pending()));
+            let result = daemon
+                .install_wda(
+                    &mut g,
+                    &signed_device,
+                    &dir.join("missing.ipa"),
+                    tokio::time::Instant::now() + RESIGN_TIMEOUT,
+                )
+                .await;
+            assert!(matches!(&result, Err(error) if error.contains("连接已变化")), "{result:?}");
+            assert_eq!(g.state, DeviceState::Ready);
+            assert!(g.starting.is_some(), "a different phone's runner must remain owned");
+            daemon.drop_session(&mut g).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_installation_quiesces_starting_and_leaves_wda_recoverable() {
+        let dir = std::env::temp_dir().join(format!("ictl-install-failure-{}", std::process::id()));
+        let daemon = Daemon::new(crate::config::Config::from_env(&dir));
+        let device = fixture_device("signed-phone", 1);
+        let mut g = daemon.inner.lock().await;
+        g.device = Some(device.clone());
+        g.state = DeviceState::Ready;
+        g.device_profile = DeviceProfile::Expires(u64::MAX);
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup = cleaned.clone();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        g.start_cancel = Some(cancel);
+        g.starting = Some(tokio::spawn(async move {
+            cancelled.await.unwrap();
+            cleanup.store(true, std::sync::atomic::Ordering::SeqCst);
+            StartOutcome::Wda(WdaError::StartFailed("cancelled fixture".into()))
+        }));
+        // install_package reads local metadata before contacting the provider.
+        // A missing IPA exercises a real installation failure without USB traffic.
+        let result = daemon
+            .install_wda(&mut g, &device, &dir.join("missing.ipa"), tokio::time::Instant::now() + RESIGN_TIMEOUT)
+            .await;
+        assert!(result.is_err());
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(g.starting.is_none());
+        assert!(g.runner.is_none());
+        assert_eq!(g.device_profile, DeviceProfile::NotChecked);
+        assert!(
+            matches!(&g.state, DeviceState::WdaStarting { last_error: Some(error) } if error.contains("安装到手机失败"))
+        );
+        assert!(g.backoff.ready(Instant::now()));
+        assert!(daemon.inner.try_lock().is_err(), "the caller retains exclusive device ownership through installation");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 impl Daemon {
     // ------------------------------------------------------------------ usbmuxd
 
@@ -165,7 +236,7 @@ impl Daemon {
             if g.device.is_some() && g.persisted.wda_bundle.is_some() {
                 let d = self.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = d.resign_now(false).await {
+                    if let Err(e) = d.resign_now(false, None).await {
                         let mut g = d.inner.lock().await;
                         d.notify(&mut g, Event::ResignFailed(e));
                     }
@@ -318,9 +389,11 @@ impl Daemon {
         }
         self.log.log("启动 WDA");
         let (cache, url, user_dir) = (self.cfg.ddi_cache(), self.cfg.ddi_url.clone(), self.cfg.ddi_dir.clone());
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+        g.start_cancel = Some(cancel);
         g.starting = Some(tokio::task::spawn_local(async move {
             // 手机重启后开发者镜像可能掉了；已挂载时只是一次查询。错误带上「是不是挂载这一步」
-            let ddi: Result<Option<String>, (DeviceError, bool)> = async {
+            let ddi = async {
                 let mut t = device.open_tunnel().await.map_err(|e| (e, false))?;
                 let r = async {
                     if t.ddi_mounted().await.map_err(|e| (e, false))?.is_some() {
@@ -336,14 +409,17 @@ impl Daemon {
                 .await;
                 t.close().await;
                 r
-            }
-            .await;
+            };
+            let ddi: Result<Option<String>, (DeviceError, bool)> = tokio::select! {
+                result = ddi => result,
+                _ = &mut cancelled => return StartOutcome::Wda(WdaError::StartFailed("WDA 启动已取消".into())),
+            };
             let mounted = match ddi {
                 Ok(v) => v,
                 Err((DeviceError::PasswordProtected, _)) => return StartOutcome::NeedsUnlock,
                 Err((e, mount_failed)) => return StartOutcome::Ddi { error: e.to_string(), mount_failed },
             };
-            match WdaRunner::start(device.provider(), &bundle, WDA_START_TIMEOUT).await {
+            match WdaRunner::start_cancellable(device.provider(), &bundle, WDA_START_TIMEOUT, cancelled).await {
                 Ok((runner, client)) => StartOutcome::Ready { runner, client, mounted },
                 Err(e) => StartOutcome::Wda(e),
             }
@@ -356,6 +432,7 @@ impl Daemon {
             return;
         }
         let h = g.starting.take().expect("刚检查过");
+        g.start_cancel = None;
         let outcome =
             h.await.unwrap_or_else(|e| StartOutcome::Wda(WdaError::StartFailed(format!("启动任务异常：{e}"))));
         match outcome {
@@ -401,6 +478,55 @@ impl Daemon {
 
     // ------------------------------------------------------------------ 重签与会话
 
+    async fn install_wda(
+        &self,
+        g: &mut Inner,
+        device: &Device,
+        package: &Path,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        if !g
+            .device
+            .as_ref()
+            .is_some_and(|current| current.udid == device.udid && current.device_id() == device.device_id())
+        {
+            return Err(ictl_l10n::tr!(
+                "签名期间手机连接已变化，没有安装；请重新运行准备向导",
+                "The phone connection changed during signing; installation was skipped. Run setup again"
+            )
+            .into());
+        }
+        self.drop_session(g).await;
+        g.device_profile = DeviceProfile::NotChecked;
+        g.backoff.reset();
+        self.set_state(
+            g,
+            DeviceState::WdaStarting { last_error: Some(ictl_l10n::tr!("正在安装 WDA", "Installing WDA").into()) },
+        );
+        self.publish(g);
+        let installed = tokio::time::timeout_at(deadline, device.install(package))
+            .await
+            .map_err(|_| {
+                ictl_l10n::tr!(
+                    "WDA 签名和安装超过总时限，请检查设备连接后重试",
+                    "WDA signing and installation exceeded the overall deadline; check the device connection and retry"
+                )
+                .to_owned()
+            })
+            .and_then(|result| {
+                result.map_err(|error| {
+                    ictl_l10n::trf!(
+                        "安装到手机失败，请检查 USB 连接并保持手机解锁：{error}",
+                        "Installation failed; check the USB connection and keep the phone unlocked: {error}"
+                    )
+                })
+            });
+        if let Err(error) = &installed {
+            self.set_state(g, DeviceState::WdaStarting { last_error: Some(error.clone()) });
+        }
+        installed
+    }
+
     async fn check_session(self: Arc<Self>) {
         let account = self.account();
         // plume_core 的 future 不是 Send，放到阻塞线程里 block_on（同重签）；也不持锁
@@ -427,11 +553,20 @@ impl Daemon {
         }
     }
 
-    /// 检查描述文件并按需重签（`force` 立即重签）。分三段：持锁取参数 → 不持锁签名、安装（几十秒）→ 持锁写结果
-    pub(crate) async fn resign_now(self: &Arc<Self>, force: bool) -> Result<String, String> {
+    /// 签名时保留设备控制，安装时独占设备锁并先结束 WDA 会话。
+    pub(crate) async fn resign_now(self: &Arc<Self>, force: bool, expect_udid: Option<&str>) -> Result<String, String> {
         let (device, name) = {
             let mut g = self.inner.lock().await;
             let g = &mut *g;
+            if let Some(want) = expect_udid
+                && g.device.as_ref().map(|d| d.udid.as_str()) != Some(want)
+            {
+                return Err(ictl_l10n::tr!(
+                    "正在控制的设备变了，没有重签或安装；请先确认设备",
+                    "The controlled device changed; signing and installation were not started. Check the device first"
+                )
+                .into());
+            }
             // 看这台手机上装的那份，不看最近一次签名：给别的手机签过之后，这台装的还是更早签的、更早到期
             if !force && g.persisted.wda_bundle.is_some() {
                 self.refresh_device_profile(g).await;
@@ -469,10 +604,12 @@ impl Daemon {
             self.log.log("开始重签");
             (device, name)
         };
-        let signed_udid = device.udid.clone();
+        let signing_udid = device.udid.clone();
+        let deadline = tokio::time::Instant::now() + RESIGN_TIMEOUT;
         let account = self.account();
         let (wda_dir, unsigned, signed_path) =
             (self.cfg.wda_dir(), self.cfg.wda_unsigned.clone(), self.cfg.wda_signed());
+        let install_path = signed_path.clone();
         let fetch = self.cfg.wda_unsigned_is_cache() && !unsigned.is_file();
         if fetch {
             self.log.log(&format!("没有未签名的 WDA 包（不在镜像里运行），先下载 {}", crate::wda_pkg::WDA_VERSION));
@@ -480,16 +617,15 @@ impl Daemon {
         // plume_core 的签名 future 不是 Send（持有 &mut dyn FnMut 和非 Send 的私钥），放到阻塞线程里 block_on
         let r: Result<ictl_sign::Signed, String> = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current()
-                .block_on(tokio::time::timeout(RESIGN_TIMEOUT, async move {
+                .block_on(tokio::time::timeout_at(deadline, async move {
                     if fetch {
                         crate::wda_pkg::ensure(&unsigned).await?;
                     }
                     let session = account.session().await.map_err(|e| e.to_string())?;
-                    session.ensure_device(&device.udid, &name).await.map_err(|e| e.to_string())?;
+                    session.ensure_device(&signing_udid, &name).await.map_err(|e| e.to_string())?;
                     std::fs::create_dir_all(&wda_dir).map_err(|e| e.to_string())?;
                     let tmp = wda_dir.join("WDA-signing.ipa");
-                    let signed = session.sign_ipa(&unsigned, &tmp, &device.udid).await.map_err(|e| e.to_string())?;
-                    device.install(&tmp).await.map_err(|e| format!("安装到手机失败(手机锁屏?)：{e}"))?;
+                    let signed = session.sign_ipa(&unsigned, &tmp, &signing_udid).await.map_err(|e| e.to_string())?;
                     std::fs::rename(&tmp, &signed_path).map_err(|e| e.to_string())?;
                     Ok(signed)
                 }))
@@ -502,6 +638,10 @@ impl Daemon {
 
         let mut g = self.inner.lock().await;
         let g = &mut *g;
+        let r = match r {
+            Ok(signed) => self.install_wda(g, &device, &install_path, deadline).await.map(|()| signed),
+            Err(error) => Err(error),
+        };
         g.resigning = false;
         let r = match r {
             Ok(s) => {
@@ -511,12 +651,9 @@ impl Daemon {
                 g.persisted.profile_expires = Some(exp);
                 g.persisted.last_resign = Some(format!("{} 成功", crate::eventlog::timestamp()));
                 g.persisted.save(&self.cfg.state_file());
-                // 新包装上后旧的 runner 会失效，下一轮巡检重新拉起。签名期间切到了别的设备就不动它的会话
-                if g.device.as_ref().is_some_and(|d| d.udid == signed_udid) {
-                    self.drop_session(g).await;
-                    self.refresh_device_profile(g).await;
-                    g.backoff.reset();
-                }
+                // 安装阶段已停止旧 runner，下一轮巡检使用新签名重建会话。
+                self.refresh_device_profile(g).await;
+                g.backoff.reset();
                 g.dedup.clear("resign");
                 let msg = format!("重签完成,新描述文件到期 {} UTC", crate::eventlog::format_utc(exp));
                 self.log.log(&msg);

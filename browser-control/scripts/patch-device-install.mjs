@@ -22,7 +22,8 @@ const originalHash =
   "da410b47f3150df18f0dab904d16d22f20f0fd2141d0846c1431d4d921375a20";
 const legacyMarker = "// phone-use: device-install stream lifecycle v1";
 const v2Marker = "// phone-use: device-install stream lifecycle v2";
-const marker = "// phone-use: device-install stream lifecycle v3";
+const v3Marker = "// phone-use: device-install stream lifecycle v3";
+const marker = "// phone-use: device-install stream lifecycle v4";
 const streamReplacements = [
   [
     "  async handleFrame(t) {\n    switch (t.type) {",
@@ -224,7 +225,7 @@ const flowReplacements = [
         break;`,
   ],
 ];
-const replacements = [
+const v3Replacements = [
   ...streamReplacements,
   ...framingReplacements,
   ...flowReplacements,
@@ -287,9 +288,9 @@ async function readMuxFrame(device, endpoint, version) {
   }
 }
 `;
-const helpers =
+const v3Helpers =
   v2Helpers
-    .replace(v2Marker, marker)
+    .replace(v2Marker, v3Marker)
     .replace(
       "  stream.error = new Error(reason);",
       "  stream.error = new Error(reason);\n  wakeDeviceWriters(stream);",
@@ -342,12 +343,96 @@ function queueDeviceWrite(stream, bytes) {
 }
 `;
 
+const recoveryReplacements = [
+  [
+    "  e.streams.clear();\n}",
+    "  e.streams.clear();\n  const onClose = e.onClose;\n  e.onClose = undefined;\n  onClose?.();\n}",
+  ],
+  [
+    "    this.webSocketUrl = t, this.session = n, this.deviceHello = r, this.log = a;",
+    `    this.webSocketUrl = t, this.session = n, this.deviceHello = r, this.log = a;
+    n.onClose = () => { this.log("USB transport closed"); this.close(); };`,
+  ],
+  [
+    "  async connect() {\n    const t = new WebSocket(this.webSocketUrl);",
+    `  async connect() {
+    if (this.session.closed) throw new Error("USB transport is closed.");
+    const t = new WebSocket(this.webSocketUrl);`,
+  ],
+  [
+    "    await U(e.device, e.outEndpoint, r);\n  }), e.writeChain;",
+    `    await U(e.device, e.outEndpoint, r);
+  }).catch(error => {
+    if (!e.closed) I(e);
+    throw error;
+  }), e.writeChain;`,
+  ],
+  [
+    `          r.seq += 1;
+          updateDeviceWindow(r, n);
+          r.ack = n.seq + 1;
+          await w(r, f, new Uint8Array());
+          r.resolveOpened();`,
+    `          if (!r.established) {
+            r.seq = (r.seq + 1) >>> 0;
+            r.ack = (n.seq + 1) >>> 0;
+            r.established = true;
+          }
+          updateDeviceWindow(r, n);
+          await w(r, f, new Uint8Array());
+          r.resolveOpened();`,
+  ],
+  [
+    `        if (n.payload.byteLength) {
+          r.ack = n.seq + n.payload.byteLength;
+          if (!(n.flags & 1)) await w(r, f, new Uint8Array());
+          r.waiters.length ? r.waiters.shift()(n.payload) : r.queue.push(n.payload);
+        }
+        if (n.flags & 1) {
+          r.ack = n.seq + n.payload.byteLength + 1;
+          await w(r, 17, new Uint8Array()); // FIN | ACK; FIN consumes one sequence number.
+          r.seq += 1;
+          releaseDeviceStream(r, { notify: false, discard: false, reason: "Device finished stream" });
+        }`,
+    `        if (n.payload.byteLength || (n.flags & 1)) await receiveDeviceData(r, n);`,
+  ],
+];
+const replacements = [...v3Replacements, ...recoveryReplacements];
+const helpers = v3Helpers.replace(v3Marker, marker) + `
+// Only acknowledge contiguous bytes. Retransmitted or overlapping segments must
+// not corrupt Lockdown TLS, HTTP or the tunneled TCP byte stream.
+async function receiveDeviceData(stream, packet) {
+  if (!stream.established) return;
+  if (!seqAtOrBefore(packet.seq, stream.ack)) {
+    await w(stream, f, new Uint8Array());
+    return;
+  }
+  const consumed = (stream.ack - packet.seq) >>> 0;
+  const payload = packet.payload.subarray(Math.min(consumed, packet.payload.byteLength));
+  if (payload.byteLength) {
+    stream.ack = (stream.ack + payload.byteLength) >>> 0;
+    stream.waiters.length ? stream.waiters.shift()(payload) : stream.queue.push(payload);
+  }
+  const finished = (packet.flags & 1) && ((packet.seq + packet.payload.byteLength) >>> 0) === stream.ack;
+  if (finished) {
+    stream.ack = (stream.ack + 1) >>> 0;
+    await w(stream, 17, new Uint8Array());
+    stream.seq = (stream.seq + 1) >>> 0;
+    releaseDeviceStream(stream, { notify: false, discard: false, reason: "Device finished stream" });
+  } else {
+    await w(stream, f, new Uint8Array());
+  }
+}
+`;
+
 function digest(text) {
   return createHash("sha256").update(text).digest("hex");
 }
 // Reverse our exact edits to authenticate both fresh and previously patched files.
 const applied = source.includes(marker)
   ? { helpers, replacements }
+  : source.includes(v3Marker)
+    ? { helpers: v3Helpers, replacements: v3Replacements }
   : source.includes(v2Marker)
     ? {
         helpers: v2Helpers,

@@ -42,21 +42,21 @@ use tokio::{
 use tracing::trace;
 
 use crate::adapter::{ConnectionStatus, UdpDatagram};
-use crate::time::timeout;
+use crate::time::{Instant, timeout};
+
+type ConnectResult = Result<(u16, mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>), std::io::Error>;
+
+struct PendingConnect {
+    response: oneshot::Sender<ConnectResult>,
+    started: Instant,
+    last_syn: Instant,
+}
 
 enum HandleMessage {
     /// Returns the host port
     ConnectToPort {
         target: u16,
-        res: oneshot::Sender<
-            Result<
-                (
-                    u16,
-                    mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>,
-                ),
-                std::io::Error,
-            >,
-        >,
+        res: oneshot::Sender<ConnectResult>,
     },
     Close {
         host_port: u16,
@@ -129,6 +129,48 @@ async fn deliver(
     }
 }
 
+async fn finish_connects(
+    adapter: &mut crate::adapter::Adapter,
+    pending: &mut HashMap<u16, PendingConnect>,
+    handles: &mut HashMap<u16, mpsc::UnboundedSender<Result<Vec<u8>, std::io::Error>>>,
+) {
+    for hp in pending.keys().copied().collect::<Vec<_>>() {
+        let connection = &pending[&hp];
+        if connection.response.is_closed() {
+            pending.remove(&hp);
+            let _ = adapter.close(hp).await;
+            continue;
+        }
+        let result = match adapter.get_status(hp) {
+            Ok(ConnectionStatus::Connected) => {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                handles.insert(hp, sender);
+                Some(Ok((hp, receiver)))
+            }
+            Ok(ConnectionStatus::Error(kind)) => Some(Err(std::io::Error::new(kind, "failed to connect"))),
+            Err(error) => Some(Err(error)),
+            Ok(ConnectionStatus::WaitingForSyn) => {
+                if connection.started.elapsed() >= std::time::Duration::from_secs(10) {
+                    Some(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "SYN timed out")))
+                } else if connection.last_syn.elapsed() >= std::time::Duration::from_secs(1) {
+                    pending.get_mut(&hp).unwrap().last_syn = Instant::now();
+                    adapter.send_syn(hp).await.err().map(Err)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(result) = result {
+            let connected = result.is_ok();
+            let response = pending.remove(&hp).unwrap().response;
+            if response.send(result).is_err() || !connected {
+                handles.remove(&hp);
+                let _ = adapter.close(hp).await;
+            }
+        }
+    }
+}
+
 /// A cloneable, thread-safe handle to a background [`crate::adapter::Adapter`] task.
 ///
 /// Constructed via [`crate::adapter::Adapter::to_async_handle`]. Cheap to clone.
@@ -151,6 +193,7 @@ impl AdapterHandle {
             let mut handles: HashMap<u16, mpsc::UnboundedSender<Result<Vec<u8>, std::io::Error>>> =
                 HashMap::new();
             let mut udp_handles: HashMap<u16, mpsc::UnboundedSender<UdpDatagram>> = HashMap::new();
+            let mut pending_connects = HashMap::new();
 
             loop {
                 let has_pending_work = adapter.has_pending_work();
@@ -161,15 +204,17 @@ impl AdapterHandle {
                         match msg {
                             Some(m) => match m {
                                 HandleMessage::ConnectToPort { target, res } => {
-                                    let connect_response = match adapter.connect(target).await {
-                                        Ok(c) => {
-                                            let (ptx, prx) = mpsc::unbounded_channel();
-                                            handles.insert(c, ptx);
-                                            Ok((c, prx))
+                                    if res.is_closed() { continue; }
+                                    match adapter.start_connect(target).await {
+                                        Ok(hp) => {
+                                            pending_connects.insert(hp, PendingConnect {
+                                                response: res,
+                                                started: Instant::now(),
+                                                last_syn: Instant::now(),
+                                            });
                                         }
-                                        Err(e) => Err(e),
-                                    };
-                                    res.send(connect_response).ok();
+                                        Err(error) => { let _ = res.send(Err(error)); }
+                                    }
                                 }
                                 HandleMessage::Close { host_port } => {
                                     handles.remove(&host_port);
@@ -254,6 +299,7 @@ impl AdapterHandle {
                     }
                 }
 
+                finish_connects(&mut adapter, &mut pending_connects, &mut handles).await;
                 deliver(&mut adapter, &mut handles).await;
             }
         });

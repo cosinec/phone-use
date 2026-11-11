@@ -73,6 +73,24 @@ struct Inner {
 #[derive(Clone)]
 pub struct Relay(Arc<Inner>);
 
+// Native callers can time out while a USB handshake is still in flight.
+// Dropping their open future must also retire the reserved relay stream.
+struct PendingOpen {
+    relay: Relay,
+    id: u32,
+    completed: bool,
+}
+
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        if !self.completed {
+            let relay = self.relay.clone();
+            let id = self.id;
+            tokio::spawn(async move { relay.retire(id, false).await });
+        }
+    }
+}
+
 impl Relay {
     pub fn new(outbound: mpsc::Sender<Frame>, cancel: CancellationToken) -> Self {
         Self(Arc::new(Inner { streams: Mutex::new(Streams { next_id: 1, entries: HashMap::new() }), outbound, cancel }))
@@ -127,6 +145,7 @@ impl Relay {
             );
             id
         };
+        let mut pending = PendingOpen { relay: self.clone(), id, completed: false };
         let opened = async {
             self.send(Frame::json(2, id, id, &json!({ "port": port }))).await?;
             match result_rx.await {
@@ -141,6 +160,7 @@ impl Relay {
         };
         if let Err(error) = result {
             self.retire(id, false).await;
+            pending.completed = true;
             return Err(error);
         }
         let (local, remote) = tokio::io::duplex(STREAM_BUFFER);
@@ -192,6 +212,7 @@ impl Relay {
             let _ = result;
             outbound_relay.retire(id, false).await;
         });
+        pending.completed = true;
         Ok(local)
     }
 
@@ -291,6 +312,29 @@ mod tests {
             assert!(Frame::decode(&bad).is_err());
         }
         assert!(Frame::decode(&bytes[..15]).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_open_releases_the_entry_and_notifies_the_usb_peer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let relay = Relay::new(tx, CancellationToken::new());
+        let opening = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.open(8100).await }
+        });
+        let id = rx.recv().await.unwrap().stream_id;
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+        let closed = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("cancelled open must retire its USB connection")
+            .unwrap();
+        assert_eq!((closed.kind, closed.stream_id), (5, id));
+        assert!(relay.0.streams.lock().await.entries.is_empty());
+        // The device may complete its handshake after the native caller timed out.
+        relay.handle(Frame::json(3, id, id, &json!({"ok":true}))).await.unwrap();
+        assert!(relay.0.streams.lock().await.entries.is_empty());
+        relay.close().await;
     }
 
     #[tokio::test]

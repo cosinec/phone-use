@@ -49,7 +49,7 @@ test("SDK patch is idempotent and refuses a changed package or modified chunk", 
   );
   const layouts = runInNewContext(
     definitions +
-      "\n({replacements,helpers,streamReplacements,framingReplacements,legacyHelpers,v2Helpers})",
+      "\n({replacements,helpers,streamReplacements,framingReplacements,legacyHelpers,v2Helpers,v3Replacements,v3Helpers})",
   );
   assert.ok(before.endsWith(layouts.helpers));
   let original = before.slice(0, -layouts.helpers.length);
@@ -65,6 +65,7 @@ test("SDK patch is idempotent and refuses a changed package or modified chunk", 
       [...layouts.streamReplacements, ...layouts.framingReplacements],
       layouts.v2Helpers,
     ],
+    [layouts.v3Replacements, layouts.v3Helpers],
   ]) {
     let legacy = original;
     for (const [from, to] of replacements) legacy = legacy.replace(from, to);
@@ -74,7 +75,7 @@ test("SDK patch is idempotent and refuses a changed package or modified chunk", 
     assert.equal(
       await readFile(chunk, "utf8"),
       before,
-      "legacy migration must match a fresh v3 patch exactly",
+      "legacy migration must match a fresh patch exactly",
     );
   }
   await writeFile(chunk, before + "\n// unexpected modification\n");

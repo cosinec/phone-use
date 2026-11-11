@@ -235,17 +235,7 @@ impl Adapter {
     // -----------------------------------------------------------------------
 
     pub(crate) async fn connect(&mut self, port: u16) -> Result<u16, std::io::Error> {
-        let host_port = loop {
-            let p: u16 = rand::random();
-            if !self.states.contains_key(&p) {
-                break p;
-            }
-        };
-        let state = ConnectionState::new(host_port, port);
-        self.states.insert(host_port, state);
-
-        // Send initial SYN.
-        self.send_syn(host_port).await?;
+        let host_port = self.start_connect(port).await?;
 
         // Wait for SYN-ACK, retransmitting the SYN on timeout.
         let start = Instant::now();
@@ -265,7 +255,6 @@ impl Adapter {
                             self.states.remove(&host_port);
                             return Err(std::io::Error::new(ErrorKind::TimedOut, "SYN timed out"));
                         }
-                        // Retransmit SYN every INITIAL_RTO_MS * 2^retry ms.
                         if last_syn.elapsed() >= std::time::Duration::from_millis(INITIAL_RTO_MS) {
                             debug!("retransmitting SYN for port {host_port}");
                             self.send_syn(host_port).await?;
@@ -274,6 +263,27 @@ impl Adapter {
                     }
                 }
             }
+        }
+
+        Ok(host_port)
+    }
+
+    /// Begin a handshake without waiting, so the handle can keep delivering
+    /// packets and processing cancellation for other connections.
+    pub(crate) async fn start_connect(&mut self, port: u16) -> Result<u16, std::io::Error> {
+        let host_port = loop {
+            let p: u16 = rand::random();
+            if !self.states.contains_key(&p) {
+                break p;
+            }
+        };
+        let state = ConnectionState::new(host_port, port);
+        self.states.insert(host_port, state);
+
+        // Send initial SYN.
+        if let Err(error) = self.send_syn(host_port).await {
+            self.states.remove(&host_port);
+            return Err(error);
         }
 
         Ok(host_port)
@@ -295,14 +305,15 @@ impl Adapter {
 
     pub(crate) async fn close(&mut self, host_port: u16) -> Result<(), std::io::Error> {
         if let Some(state) = self.states.remove(&host_port) {
+            let pending = state.status == ConnectionStatus::WaitingForSyn;
             let tcp = TcpPacket::create(
                 self.host_ip,
                 self.peer_ip,
                 state.host_port,
                 state.peer_port,
-                state.seq,
+                state.seq.wrapping_add(u32::from(pending)),
                 state.ack,
-                TcpFlags { fin: true, ack: true, ..Default::default() },
+                TcpFlags { fin: !pending, rst: pending, ack: !pending, ..Default::default() },
                 u16::MAX - 1,
                 &[],
                 &[],
@@ -827,7 +838,7 @@ impl Adapter {
     // Low-level send helpers
     // -----------------------------------------------------------------------
 
-    async fn send_syn(&mut self, host_port: u16) -> Result<(), std::io::Error> {
+    pub(crate) async fn send_syn(&mut self, host_port: u16) -> Result<(), std::io::Error> {
         let Some(state) = self.states.get(&host_port) else {
             return Err(std::io::Error::new(ErrorKind::NotConnected, "not connected"));
         };
@@ -1161,6 +1172,69 @@ mod tests {
     // ------------------------------------------------------------------
     // Tests
     // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pending_handle_connect_does_not_block_existing_stream_reads() {
+        let (client, peer) = tokio::io::duplex(65536);
+        let adapter = Adapter::new(Box::new(TestTransport(client)), IpAddr::V6(HOST_IP), IpAddr::V6(PEER_IP));
+        let mut handle = adapter.to_async_handle();
+        let (mut reader, mut writer) = tokio::io::split(peer);
+        let (connected, (hp, next_ack)) = tokio::join!(handle.connect(PEER_PORT), async {
+            let syn = read_pkt(&mut reader).await;
+            let hp = syn.source_port;
+            let next_ack = syn.sequence_number.wrapping_add(1);
+            writer
+                .write_all(&peer_ipv6_pkt(
+                    hp,
+                    PEER_ISN,
+                    next_ack,
+                    TcpFlags { syn: true, ack: true, ..Default::default() },
+                    &[],
+                ))
+                .await
+                .unwrap();
+            let _ = read_pkt(&mut reader).await;
+            (hp, next_ack)
+        });
+        let mut stream = connected.unwrap();
+        let mut second_handle = handle.clone();
+        let second = tokio::spawn(async move { second_handle.connect(81).await });
+        let pending_syn = read_pkt(&mut reader).await;
+        assert_eq!(pending_syn.destination_port, 81);
+        writer
+            .write_all(&peer_ipv6_pkt(
+                hp,
+                PEER_ISN + 1,
+                next_ack,
+                TcpFlags { ack: true, ..Default::default() },
+                b"live",
+            ))
+            .await
+            .unwrap();
+        let mut data = [0; 4];
+        let result = tokio::time::timeout(Duration::from_millis(200), stream.read_exact(&mut data)).await;
+        second.abort();
+        handle.close().await.unwrap();
+        result.expect("an unanswered SYN must not stop delivery to an established connection").unwrap();
+        assert_eq!(&data, b"live");
+    }
+
+    #[tokio::test]
+    async fn cancelled_handle_connect_releases_pending_connection_promptly() {
+        let (client, peer) = tokio::io::duplex(65536);
+        let adapter = Adapter::new(Box::new(TestTransport(client)), IpAddr::V6(HOST_IP), IpAddr::V6(PEER_IP));
+        let mut handle = adapter.to_async_handle();
+        let mut connecting_handle = handle.clone();
+        let connect = tokio::spawn(async move { connecting_handle.connect(PEER_PORT).await });
+        let (mut reader, _writer) = tokio::io::split(peer);
+        let syn = read_pkt(&mut reader).await;
+        connect.abort();
+        let closed = tokio::time::timeout(Duration::from_millis(600), read_pkt(&mut reader)).await;
+        handle.close().await.unwrap();
+        let closed = closed.expect("cancelling a connection must release its pending SYN");
+        assert_eq!(closed.source_port, syn.source_port);
+        assert!(closed.flags.rst, "an unestablished connection must be reset on cancellation");
+    }
 
     /// A cancelled, partially written packet must not be queued again under a new TCP sequence.
     #[tokio::test]

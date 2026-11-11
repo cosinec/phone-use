@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -135,7 +135,7 @@ fn number(value: &Dictionary, name: &str) -> Option<u64> {
     value.get(name).and_then(Value::as_unsigned_integer)
 }
 
-async fn send(socket: &mut TcpStream, value: Value, tag: u32) -> Result<()> {
+async fn send(socket: &mut (impl AsyncWrite + Unpin), value: Value, tag: u32) -> Result<()> {
     let mut payload = Vec::new();
     value.to_writer_xml(&mut payload)?;
     if payload.len() > MAX_PAYLOAD - 16 {
@@ -150,7 +150,7 @@ async fn send(socket: &mut TcpStream, value: Value, tag: u32) -> Result<()> {
     Ok(())
 }
 
-async fn result(socket: &mut TcpStream, code: u64, tag: u32) -> Result<()> {
+async fn result(socket: &mut (impl AsyncWrite + Unpin), code: u64, tag: u32) -> Result<()> {
     send(socket, dict([("MessageType", string("Result")), ("Number", integer(code))]), tag).await
 }
 
@@ -172,12 +172,13 @@ fn attached(device: &Device) -> Value {
 }
 
 async fn serve(
-    mut socket: TcpStream,
+    socket: TcpStream,
     device: Device,
     stored: Arc<Mutex<Stored>>,
     relay: Relay,
     pair_sender: mpsc::Sender<PairRecord>,
 ) -> Result<()> {
+    let mut socket = BufReader::new(socket);
     loop {
         let packet = tokio::time::timeout(Duration::from_secs(30), read_packet(&mut socket)).await??;
         let (value, tag) = packet;
@@ -237,11 +238,30 @@ async fn serve(
                     result(&mut socket, 1, tag).await?;
                     continue;
                 };
-                match relay.open((port as u16).swap_bytes()).await {
-                    Ok(mut remote) => {
+                let mut early_raw = Vec::new();
+                let opened = tokio::select! {
+                    result = relay.open((port as u16).swap_bytes()) => result,
+                    closed = async {
+                        // Native connect timeouts close this socket. Cancel the
+                        // USB SYN immediately, retaining any early raw bytes.
+                        loop {
+                            let bytes = socket.fill_buf().await?;
+                            if bytes.is_empty() {
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            if early_raw.len() + bytes.len() > MAX_PAYLOAD {
+                                bail!("usbmuxd early data exceeds limit");
+                            }
+                            early_raw.extend_from_slice(bytes);
+                            let length = bytes.len();
+                            socket.consume(length);
+                        }
+                    } => return closed,
+                };
+                match opened {
+                    Ok(remote) => {
                         result(&mut socket, 0, tag).await?;
-                        // read_exact consumed precisely the plist. Any coalesced raw bytes remain in the socket.
-                        tokio::io::copy_bidirectional(&mut socket, &mut remote).await?;
+                        relay_bytes(socket, remote, early_raw).await?;
                         return Ok(());
                     }
                     Err(_) => result(&mut socket, 3, tag).await?,
@@ -252,7 +272,27 @@ async fn serve(
     }
 }
 
-async fn read_packet(socket: &mut TcpStream) -> Result<(Value, u32)> {
+async fn relay_bytes(
+    native: impl AsyncRead + AsyncWrite + Unpin,
+    device: impl AsyncRead + AsyncWrite + Unpin,
+    early_raw: Vec<u8>,
+) -> std::io::Result<()> {
+    let (native_read, mut native_write) = tokio::io::split(native);
+    let (mut device_read, mut device_write) = tokio::io::split(device);
+    let mut upload = Cursor::new(early_raw).chain(native_read);
+    let to_device = async {
+        tokio::io::copy(&mut upload, &mut device_write).await?;
+        device_write.shutdown().await
+    };
+    let to_native = async {
+        tokio::io::copy(&mut device_read, &mut native_write).await?;
+        native_write.shutdown().await
+    };
+    tokio::try_join!(to_device, to_native)?;
+    Ok(())
+}
+
+async fn read_packet(socket: &mut (impl AsyncRead + Unpin)) -> Result<(Value, u32)> {
     let mut head = [0; 16];
     socket.read_exact(&mut head).await?;
     let number = |start| u32::from_le_bytes(head[start..start + 4].try_into().expect("bounded header"));
@@ -304,6 +344,107 @@ mod tests {
         assert!(
             read_pair_record(&PairRecord { pair_record_base64: "eA==".into(), ..record }, &"a".repeat(40)).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn early_upload_backpressure_does_not_block_the_device_response() {
+        let (native, mut user) = tokio::io::duplex(64);
+        let (device, mut phone) = tokio::io::duplex(64);
+        let forwarding = tokio::spawn(relay_bytes(native, device, vec![7; 1024]));
+        phone.write_all(b"reply").await.unwrap();
+        let mut response = [0; 5];
+        tokio::time::timeout(Duration::from_millis(200), user.read_exact(&mut response))
+            .await
+            .expect("blocked early upload must not stall the response")
+            .unwrap();
+        assert_eq!(&response, b"reply");
+        let mut uploaded = [0; 1024];
+        phone.read_exact(&mut uploaded).await.unwrap();
+        assert_eq!(uploaded, [7; 1024]);
+        drop(user);
+        drop(phone);
+        forwarding.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_disconnect_cancels_a_pending_usb_handshake() {
+        for early_raw in [false, true] {
+            let (outbound, mut frames) = mpsc::channel(8);
+            let relay = Relay::new(outbound, CancellationToken::new());
+            let (pair_sender, _) = mpsc::channel(8);
+            let device = Device {
+                platform: crate::identity::Platform::Ios,
+                serial_number: "a".repeat(40),
+                vendor_id: 1452,
+                product_id: 4776,
+                product_name: None,
+            };
+            let mux =
+                VirtualMux::start(device, None, relay.clone(), pair_sender, CancellationToken::new()).await.unwrap();
+            let mut socket = TcpStream::connect(mux.address()).await.unwrap();
+            send(
+                &mut socket,
+                dict([
+                    ("MessageType", string("Connect")),
+                    ("DeviceID", integer(1)),
+                    ("PortNumber", integer(8100u16.swap_bytes() as u64)),
+                ]),
+                1,
+            )
+            .await
+            .unwrap();
+            let opened = frames.recv().await.unwrap();
+            if early_raw {
+                socket.write_all(b"early native data").await.unwrap();
+            }
+            drop(socket);
+            let closed = tokio::time::timeout(Duration::from_millis(200), frames.recv())
+                .await
+                .expect("native timeout must cancel the pending USB handshake")
+                .unwrap();
+            assert_eq!((closed.kind, closed.stream_id), (5, opened.stream_id));
+            mux.close().await;
+            relay.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_preserves_early_raw_bytes_while_waiting_for_the_device() {
+        let (outbound, mut frames) = mpsc::channel(8);
+        let relay = Relay::new(outbound, CancellationToken::new());
+        let (pair_sender, _) = mpsc::channel(8);
+        let device = Device {
+            platform: crate::identity::Platform::Ios,
+            serial_number: "a".repeat(40),
+            vendor_id: 1452,
+            product_id: 4776,
+            product_name: None,
+        };
+        let mux = VirtualMux::start(device, None, relay.clone(), pair_sender, CancellationToken::new()).await.unwrap();
+        let mut socket = TcpStream::connect(mux.address()).await.unwrap();
+        let value = dict([
+            ("MessageType", string("Connect")),
+            ("DeviceID", integer(1)),
+            ("PortNumber", integer(8100u16.swap_bytes() as u64)),
+        ]);
+        let mut body = Vec::new();
+        value.to_writer_xml(&mut body).unwrap();
+        let mut packet = Vec::new();
+        for number in [(16 + body.len()) as u32, 1, 8, 1] {
+            packet.extend_from_slice(&number.to_le_bytes());
+        }
+        packet.extend_from_slice(&body);
+        packet.extend_from_slice(b"native preface");
+        socket.write_all(&packet).await.unwrap();
+        let id = frames.recv().await.unwrap().stream_id;
+        relay.handle(crate::relay::Frame::json(3, id, id, &serde_json::json!({"ok":true}))).await.unwrap();
+        let (reply, _) = read_packet(&mut socket).await.unwrap();
+        assert_eq!(number(reply.as_dictionary().unwrap(), "Number"), Some(0));
+        let raw = tokio::time::timeout(Duration::from_secs(1), frames.recv()).await.unwrap().unwrap();
+        assert_eq!((raw.kind, raw.payload.as_slice()), (4, b"native preface".as_slice()));
+        drop(socket);
+        mux.close().await;
+        relay.close().await;
     }
 
     #[tokio::test]

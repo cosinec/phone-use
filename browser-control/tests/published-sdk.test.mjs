@@ -110,7 +110,8 @@ for (const [allFail, fragmentVersion] of [[false, false], [true, false], [false,
       assert.equal(usb.device.opened, false);
     }
   });
-test("selected USB disconnect revokes live published SDK WS and closes real NativeController fixture process", async (t) => {
+for (const failure of ["USB read failure", "selected USB disconnect"])
+test(`${failure} revokes live published SDK WS and closes real NativeController fixture process`, async (t) => {
   const { NativeController } = await import("./reference/native-controller.mjs");
   const root = await mkdtemp(path.join(os.tmpdir(), "sdk-unplug-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -204,15 +205,10 @@ test("selected USB disconnect revokes live published SDK WS and closes real Nati
   events.disconnect({ serialNumber: "00008140001234567890FFFF" });
   assert.equal(client.snapshot().phase, "connected");
   assert.equal(gateway.sessions.size, 1);
-  usb.failRead();
-  await new Promise((r) => setImmediate(r));
-  assert.equal(
-    client.snapshot().phase,
-    "connected",
-    "SDK mux read failure alone does not revoke the WS",
-  );
-  events.disconnect(usb.device);
-  assert.equal(client.snapshot().phase, "offline");
+  if (failure === "USB read failure") usb.failRead();
+  else events.disconnect(usb.device);
+  await waitFor(() => client.snapshot().phase !== "connected");
+  assert.equal(client.snapshot().phase, failure === "USB read failure" ? "error" : "offline");
   assert.equal(client.snapshot().session, null);
   await waitFor(
     () =>
@@ -230,4 +226,19 @@ test("selected USB disconnect revokes live published SDK WS and closes real Nati
     404,
   );
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  if (failure === "USB read failure") {
+    const recovered = fakeUSB();
+    events.requestDevice = async () => recovered.device;
+    await client.connect({
+      apiBase: base,
+      accessToken: "fixture-controller-token",
+    });
+    await waitFor(() => controller?.state.ready);
+    assert.equal(client.snapshot().phase, "connected");
+    assert.equal(gateway.sessions.size, 1);
+    assert.equal(recovered.device.opened, true);
+    assert.notEqual([...controller.children][0].pid, pid);
+    await client.disconnect();
+    await waitFor(() => gateway.sessions.size === 0 && controller.children.size === 0);
+  }
 });

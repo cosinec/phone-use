@@ -73,7 +73,7 @@ async function fixture(t) {
           ack: view.getUint32(24),
           payload: bytes.slice(36),
         });
-        if (view.getUint8(29) & 2 && autoOpen) packet(stream, 18);
+        if (view.getUint8(29) & 2 && autoOpen) packet(stream, 18, new Uint8Array(), 0);
       }
     }
     return { status: "ok", bytesWritten: bytes.length };
@@ -181,8 +181,106 @@ async function fixture(t) {
     pauseOpen: () => {
       autoOpen = false;
     },
+    failRead: () => {
+      for (const reader of readers.splice(0))
+        reader.reject(new Error("USB read failed"));
+    },
   };
 }
+
+test("a USB read failure closes the relay and releases all native streams", async (t) => {
+  const f = await fixture(t),
+    stream = await f.open(1);
+  f.failRead();
+  await f.wait(() => f.relay.closed);
+  assert.equal(f.relay.socket.readyState, 3);
+  assert.equal(f.relay.streams.size, 0);
+  assert.equal(f.target.session.streams.size, 0);
+  assert.equal(stream.waiters.length, 0);
+});
+
+test("a USB write failure closes the relay instead of keeping a poisoned write queue", async (t) => {
+  const f = await fixture(t),
+    stream = await f.open(1);
+  f.target.device.transferOut = async () => {
+    throw new Error("USB write failed");
+  };
+  await f.send(4, 1, new Uint8Array([42]));
+  await f.wait(() => f.relay.closed);
+  assert.equal(f.relay.socket.readyState, 3);
+  assert.equal(f.target.session.streams.size, 0);
+  assert.equal(stream.queuedWriteBytes, 0);
+});
+
+test("a repeated SYN ACK preserves the established stream sequence", async (t) => {
+  const f = await fixture(t),
+    stream = await f.open(1);
+  f.packet(stream, 18, new Uint8Array(), 0, 512, 1);
+  await f.wait(() => f.sent.filter((packet) => packet.flags === 16).length === 2);
+  assert.equal(stream.seq, 1);
+  await f.send(4, 1, new Uint8Array([42]));
+  await f.wait(() => f.sent.some((packet) => packet.payload.length));
+  assert.equal(f.sent.find((packet) => packet.payload.length).seq, 1);
+});
+
+test("duplicate and overlapping device data is delivered exactly once and ACK never moves backwards", async (t) => {
+  const f = await fixture(t),
+    stream = await f.open(1);
+  f.packet(stream, 16, new Uint8Array([1, 2, 3]), 1);
+  await f.wait(() => stream.ack === 4);
+  f.packet(stream, 16, new Uint8Array([1, 2, 3]), 1);
+  f.packet(stream, 16, new Uint8Array([3, 4, 5]), 3);
+  await f.wait(() => stream.ack === 6);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    f.frames.filter((frame) => frame.type === 4).flatMap((frame) => [...frame.payload]),
+    [1, 2, 3, 4, 5],
+  );
+  assert.deepEqual(
+    f.sent.filter((packet) => packet.flags === 16).map((packet) => packet.ack),
+    [1, 4, 4, 6],
+  );
+});
+
+test("a device sequence gap requests missing data before accepting a later FIN", async (t) => {
+  const f = await fixture(t),
+    stream = await f.open(1);
+  f.packet(stream, 17, new Uint8Array([3, 4]), 3);
+  await f.wait(() => f.sent.filter((packet) => packet.flags === 16).length === 2);
+  assert.equal(stream.ack, 1);
+  assert.equal(
+    f.frames.filter((frame) => frame.type === 4 || frame.type === 5).length,
+    0,
+  );
+  f.packet(stream, 16, new Uint8Array([1, 2]), 1);
+  await f.wait(() => stream.ack === 3);
+  f.packet(stream, 17, new Uint8Array([3, 4]), 3);
+  await f.wait(() => f.frames.some((frame) => frame.type === 5));
+  assert.deepEqual(
+    f.frames.filter((frame) => frame.type === 4).flatMap((frame) => [...frame.payload]),
+    [1, 2, 3, 4],
+  );
+  assert.ok(f.sent.some((packet) => packet.flags === 17 && packet.ack === 6));
+});
+
+test("device receive sequence wraps while preserving cumulative ACK and rejecting old data", async (t) => {
+  const f = await fixture(t),
+    stream = await f.open(1);
+  stream.ack = 0xfffffffe;
+  f.packet(stream, 16, new Uint8Array([1, 2, 3, 4]), 0xfffffffe);
+  await f.wait(() => stream.ack === 2);
+  f.packet(stream, 16, new Uint8Array([1, 2]), 0xfffffffe);
+  f.packet(stream, 16, new Uint8Array([4, 5]), 1);
+  await f.wait(() => stream.ack === 3);
+  assert.deepEqual(
+    f.frames.filter((frame) => frame.type === 4).flatMap((frame) => [...frame.payload]),
+    [1, 2, 3, 4, 5],
+  );
+  assert.deepEqual(
+    f.sent.filter((packet) => packet.flags === 16).map((packet) => packet.ack),
+    [1, 2, 2, 3],
+  );
+});
 
 test("fragmented usbmux headers and large bodies arrive intact without closing other streams", async (t) => {
   const f = await fixture(t),
