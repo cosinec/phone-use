@@ -1,5 +1,7 @@
 // Compatibility patch for the browser ESM entry of @limrun/device-install 0.1.0.
 // Keep the upstream package pinned; fail closed if its implementation changes.
+// usbmux window/ACK protocol reference (behavior only; no implementation copied):
+// https://github.com/libimobiledevice/usbmuxd/blob/master/src/device.c
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 
@@ -19,7 +21,8 @@ let source = await readFile(path, "utf8");
 const originalHash =
   "da410b47f3150df18f0dab904d16d22f20f0fd2141d0846c1431d4d921375a20";
 const legacyMarker = "// phone-use: device-install stream lifecycle v1";
-const marker = "// phone-use: device-install stream lifecycle v2";
+const v2Marker = "// phone-use: device-install stream lifecycle v2";
+const marker = "// phone-use: device-install stream lifecycle v3";
 const streamReplacements = [
   [
     "  async handleFrame(t) {\n    switch (t.type) {",
@@ -147,8 +150,14 @@ const streamReplacements = [
 ];
 
 const framingReplacements = [
-  ["async function J(e, t) {", "async function J(e, t) {\n  muxReaders.delete(e);"],
-  ["function I(e) {\n  e.closed = !0;", "function I(e) {\n  muxReaders.delete(e.device);\n  e.closed = !0;"],
+  [
+    "async function J(e, t) {",
+    "async function J(e, t) {\n  muxReaders.delete(e);",
+  ],
+  [
+    "function I(e) {\n  e.closed = !0;",
+    "function I(e) {\n  muxReaders.delete(e.device);\n  e.closed = !0;",
+  ],
   [
     "    const r = await H(e, t), a = te(r, n);",
     "    const r = await readMuxFrame(e, t, n), a = te(r, n);",
@@ -160,7 +169,66 @@ const framingReplacements = [
   if (n < 20 || n > e.byteLength) throw new Error("Invalid usbmux TCP header length");`,
   ],
 ];
-const replacements = [...streamReplacements, ...framingReplacements];
+const flowReplacements = [
+  [
+    `async function K(e, t) {
+  if (e.closed || e.session.closed)
+    throw e.error ?? new Error("usbmux stream is closed.");
+  await w(e, f, t), e.seq += t.byteLength;
+}`,
+    `function K(e, t) {
+  return queueDeviceWrite(e, t);
+}`,
+  ],
+  ["async function w(e, t, n) {", "async function w(e, t, n, seq = e.seq) {"],
+  [
+    "a.setUint32(4, e.seq), a.setUint32(8, e.ack)",
+    "a.setUint32(4, seq), a.setUint32(8, e.ack)",
+  ],
+  [
+    "    flags: t.getUint8(13),",
+    "    flags: t.getUint8(13),\n    window: t.getUint16(14),",
+  ],
+  [
+    `  for (const t of e.streams.values())
+    for (t.error = new Error("usbmux session closed"), t.rejectOpened(t.error); t.waiters.length > 0; )
+      t.waiters.shift()(new Uint8Array());`,
+    `  for (const t of [...e.streams.values()])
+    releaseDeviceStream(t, { notify: false, reason: "usbmux session closed" });`,
+  ],
+  [
+    "          r.seq += 1, r.ack = n.seq + 1, await w(r, f, new Uint8Array()), r.resolveOpened();",
+    `          r.seq += 1;
+          updateDeviceWindow(r, n);
+          r.ack = n.seq + 1;
+          await w(r, f, new Uint8Array());
+          r.resolveOpened();`,
+  ],
+  [
+    "        if (n.payload.byteLength) {",
+    "        if (n.flags & f) updateDeviceWindow(r, n);\n        if (n.payload.byteLength) {",
+  ],
+  [
+    `        await K(n, t.payload);
+        break;`,
+    `        // Each stream owns its write queue. A zero-window stream must not
+        // block Ping, cancellation or an unrelated device connection.
+        void K(n, t.payload).catch(error => {
+          if (this.closed || this.streams.get(t.streamId) !== n) return;
+          this.streams.delete(t.streamId);
+          releaseDeviceStream(n);
+          this.log("Device stream write failed", h(error));
+          return this.send({ type: s.StreamClose, requestId: 0, streamId: t.streamId,
+            payload: l({ reason: h(error) }) });
+        }).catch(error => this.log("Relay stream write failed", h(error)));
+        break;`,
+  ],
+];
+const replacements = [
+  ...streamReplacements,
+  ...framingReplacements,
+  ...flowReplacements,
+];
 
 const legacyHelpers = `
 ${legacyMarker}
@@ -186,7 +254,9 @@ function releaseRelayStreams(relay) {
   relay.pairRecordWaiter = undefined;
 }
 `;
-const helpers = legacyHelpers.replace(legacyMarker, marker) + `
+const v2Helpers =
+  legacyHelpers.replace(legacyMarker, v2Marker) +
+  `
 // USB bulk-read boundaries are not usbmux packet boundaries. Retain partial
 // headers/bodies and surplus packets, bounded by the 64 KiB usbmux receive limit.
 const muxReaders = new WeakMap();
@@ -217,6 +287,60 @@ async function readMuxFrame(device, endpoint, version) {
   }
 }
 `;
+const helpers =
+  v2Helpers
+    .replace(v2Marker, marker)
+    .replace(
+      "  stream.error = new Error(reason);",
+      "  stream.error = new Error(reason);\n  wakeDeviceWriters(stream);",
+    ) +
+  `
+// usbmux's TCP window is scaled by 256 (unlike ordinary unnegotiated TCP).
+// Peer ACK/window credit is local USB flow control, separate from tunneled jktcp.
+function seqAtOrBefore(a, b) { return ((b - a) >>> 0) < 0x80000000; }
+function wakeDeviceWriters(stream) {
+  for (const wake of stream.writeWaiters?.splice(0) ?? []) wake();
+}
+function updateDeviceWindow(stream, packet) {
+  const previous = stream.peerAck ?? 1;
+  if (!seqAtOrBefore(previous, packet.ack) || !seqAtOrBefore(packet.ack, stream.seq)) return;
+  stream.peerAck = packet.ack;
+  stream.peerWindow = packet.window * 256;
+  wakeDeviceWriters(stream);
+}
+function queueDeviceWrite(stream, bytes) {
+  if (stream.closed || stream.session.closed) return Promise.reject(stream.error ?? new Error("usbmux stream is closed."));
+  // WebSocket has no receive backpressure API. Bound the per-stream queue and
+  // fail this connection explicitly rather than retaining unlimited app data.
+  const queued = (stream.queuedWriteBytes ?? 0) + bytes.byteLength;
+  if (queued > 1024 * 1024) return Promise.reject(new Error("usbmux stream write queue exceeded"));
+  stream.queuedWriteBytes = queued;
+  const data = bytes.slice();
+  const send = async () => {
+    let offset = 0;
+    while (offset < data.byteLength) {
+      if (stream.closed || stream.session.closed) throw stream.error ?? new Error("usbmux stream is closed.");
+      const inFlight = (stream.seq - (stream.peerAck ?? 1)) >>> 0;
+      const available = Math.max(0, (stream.peerWindow ?? 0) - inFlight);
+      if (!available) {
+        await new Promise(resolve => (stream.writeWaiters ??= []).push(resolve));
+        continue;
+      }
+      const length = Math.min(data.byteLength - offset, available, 3 * 16384 - 36);
+      const part = data.subarray(offset, offset + length);
+      const seq = stream.seq;
+      // Reserve sequence space BEFORE the asynchronous USB write. A concurrent
+      // peer data ACK must carry the sequence after all previously queued data.
+      stream.seq = (seq + length) >>> 0;
+      await w(stream, f, part, seq);
+      offset += length;
+    }
+  };
+  const pending = (stream.deviceWriteChain ?? Promise.resolve()).then(send);
+  stream.deviceWriteChain = pending;
+  return pending.finally(() => { stream.queuedWriteBytes -= data.byteLength; });
+}
+`;
 
 function digest(text) {
   return createHash("sha256").update(text).digest("hex");
@@ -224,9 +348,14 @@ function digest(text) {
 // Reverse our exact edits to authenticate both fresh and previously patched files.
 const applied = source.includes(marker)
   ? { helpers, replacements }
-  : source.includes(legacyMarker)
-    ? { helpers: legacyHelpers, replacements: streamReplacements }
-    : null;
+  : source.includes(v2Marker)
+    ? {
+        helpers: v2Helpers,
+        replacements: [...streamReplacements, ...framingReplacements],
+      }
+    : source.includes(legacyMarker)
+      ? { helpers: legacyHelpers, replacements: streamReplacements }
+      : null;
 if (applied) {
   if (!source.endsWith(applied.helpers))
     throw new Error("Unexpected device-install patch contents");
