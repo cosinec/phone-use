@@ -67,12 +67,17 @@ impl Transport for DeviceTransport {
     ) -> std::io::Result<(u16, Vec<u8>)> {
         let started = Instant::now();
         let req = build_request(method, path, body.as_deref());
+        let mut stage = "pool";
+        let mut write_started = false;
+        let mut reused_connection = false;
+        let mut timed_out = false;
         let operation = async {
             let mut idle = self.idle.lock().await;
             // Take the socket OUT of the pool before awaiting. Dropping this future
             // after cancellation cannot return a half-consumed response to the pool.
             let mut connection = idle.take().filter(|c| c.at.elapsed() < Duration::from_secs(15));
             if let Some(c) = connection.as_mut() {
+                stage = "probe";
                 let mut probe = [0u8; 1];
                 // Detect an already-closed idle socket before sending a mutation.
                 // An uncertain failure after writing still never replays a mutation.
@@ -81,19 +86,29 @@ impl Transport for DeviceTransport {
                 }
             }
             let reused = connection.is_some();
+            reused_connection = reused;
             for attempt in 0..2 {
                 let mut socket = match connection.take() {
                     Some(c) => c.socket,
-                    None => tokio::time::timeout(CONNECT_TIMEOUT, self.provider.connect(self.port))
-                        .await
-                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotConnected, "WDA connection timed out"))?
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string()))?
-                        .get_socket()
-                        .ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::NotConnected, "WDA socket unavailable")
-                        })?,
+                    None => {
+                        stage = "connect";
+                        tokio::time::timeout(CONNECT_TIMEOUT, self.provider.connect(self.port))
+                            .await
+                            .map_err(|_| {
+                                timed_out = true;
+                                std::io::Error::new(std::io::ErrorKind::NotConnected, "WDA connection timed out")
+                            })?
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string()))?
+                            .get_socket()
+                            .ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::NotConnected, "WDA socket unavailable")
+                            })?
+                    }
                 };
-                let response = exchange(&mut *socket, &req).await;
+                // From the first write onward a mutation may have reached WDA.
+                // Keep this true even if a GET retries its stale connection.
+                write_started = true;
+                let response = exchange(&mut *socket, &req, &mut stage).await;
                 match response {
                     Ok((status, body, reusable)) => {
                         if reusable {
@@ -109,11 +124,28 @@ impl Transport for DeviceTransport {
             }
             unreachable!()
         };
-        let result = tokio::time::timeout(timeout, operation)
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "WDA request timed out"))?;
         let short = path.split('?').next().unwrap_or(path);
-        tracing::debug!("wda {method} {short} ({:.2}s), ok={}", started.elapsed().as_secs_f64(), result.is_ok());
+        let mut result = match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
+            Err(_) => {
+                timed_out = true;
+                Err(std::io::ErrorKind::TimedOut.into())
+            }
+        };
+        if timed_out {
+            let kind = if write_started { std::io::ErrorKind::TimedOut } else { std::io::ErrorKind::NotConnected };
+            let detail = format!(
+                "WDA request timed out: {method} {short}, stage={stage}, reused={reused_connection}, elapsed={:.2}s",
+                started.elapsed().as_secs_f64()
+            );
+            tracing::warn!("{detail}");
+            result = Err(std::io::Error::new(kind, detail));
+        }
+        tracing::debug!(
+            "wda {method} {short} ({:.2}s), stage={stage}, reused={reused_connection}, ok={}",
+            started.elapsed().as_secs_f64(),
+            result.is_ok()
+        );
         result
     }
 }
@@ -121,11 +153,15 @@ impl Transport for DeviceTransport {
 async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
     socket: &mut S,
     request: &[u8],
+    stage: &mut &'static str,
 ) -> std::io::Result<(u16, Vec<u8>, bool)> {
     // Once writing starts, classify failure as uncertain, including flush errors.
     // The native engine must not fall back to HID and duplicate a sent action.
+    *stage = "write";
     socket.write_all(request).await.map_err(after_sent)?;
+    *stage = "flush";
     socket.flush().await.map_err(after_sent)?;
+    *stage = "read";
     let mut buffer = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     let mut head = None;
@@ -300,12 +336,15 @@ mod tests {
     struct Provider {
         sockets: SyncMutex<VecDeque<tokio::io::DuplexStream>>,
         connects: AtomicUsize,
+        connect_delay: Duration,
     }
     impl IdeviceProvider for Provider {
         fn connect(&self, _: u16) -> Pin<Box<dyn Future<Output = Result<Idevice, IdeviceError>> + Send>> {
             self.connects.fetch_add(1, Ordering::SeqCst);
             let socket = self.sockets.lock().unwrap().pop_front();
+            let delay = self.connect_delay;
             Box::pin(async move {
+                tokio::time::sleep(delay).await;
                 socket
                     .map(|s| Idevice::new(Box::new(s), "fixture"))
                     .ok_or_else(|| IdeviceError::UnexpectedResponse("no fixture socket".into()))
@@ -320,7 +359,11 @@ mod tests {
     }
     fn transport(count: usize) -> (DeviceTransport, Arc<Provider>, Vec<tokio::io::DuplexStream>) {
         let (clients, peers): (VecDeque<_>, Vec<_>) = (0..count).map(|_| tokio::io::duplex(65536)).unzip();
-        let provider = Arc::new(Provider { sockets: SyncMutex::new(clients), connects: AtomicUsize::new(0) });
+        let provider = Arc::new(Provider {
+            sockets: SyncMutex::new(clients),
+            connects: AtomicUsize::new(0),
+            connect_delay: Duration::ZERO,
+        });
         (DeviceTransport::new(provider.clone(), 8100), provider, peers)
     }
     async fn request(socket: &mut tokio::io::DuplexStream) -> Vec<u8> {
@@ -341,6 +384,75 @@ mod tests {
     }
     async fn ok(socket: &mut tokio::io::DuplexStream) {
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_before_connect_completes_is_not_reported_as_sent() {
+        let provider = Arc::new(Provider {
+            sockets: SyncMutex::new(VecDeque::new()),
+            connects: AtomicUsize::new(0),
+            connect_delay: Duration::from_secs(1),
+        });
+        let transport = DeviceTransport::new(provider, 8100);
+        let error = transport.send("GET", "/status?token=private", None, Duration::from_millis(20)).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert!(error.to_string().contains("stage=connect"));
+        assert!(error.to_string().contains("GET /status"));
+        assert!(!error.to_string().contains("private"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inner_connect_timeout_also_reports_its_stage() {
+        let provider = Arc::new(Provider {
+            sockets: SyncMutex::new(VecDeque::new()),
+            connects: AtomicUsize::new(0),
+            connect_delay: Duration::from_secs(20),
+        });
+        let transport = DeviceTransport::new(provider, 8100);
+        let error = transport.send("GET", "/status", None, Duration::from_secs(30)).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert!(error.to_string().contains("stage=connect"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_waiting_for_pool_has_not_sent_the_request() {
+        let (transport, provider, _peers) = transport(0);
+        let _guard = transport.idle.lock().await;
+        let error =
+            transport.send("POST", "/actions", Some(b"{}".to_vec()), Duration::from_millis(20)).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert!(error.to_string().contains("stage=pool"));
+        assert_eq!(provider.connects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_after_writing_does_not_allow_mutation_replay() {
+        let (transport, provider, mut peers) = transport(1);
+        let mut peer = peers.pop().unwrap();
+        let server = tokio::spawn(async move {
+            request(&mut peer).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let error =
+            transport.send("POST", "/actions", Some(b"{}".to_vec()), Duration::from_millis(30)).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stage=read"));
+        assert_eq!(provider.connects.load(Ordering::SeqCst), 1);
+        assert!(transport.idle.lock().await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_during_partial_write_remains_uncertain() {
+        let (transport, provider, _peers) = transport(1);
+        let error = transport
+            .send("POST", "/actions", Some(vec![b'x'; 128 * 1024]), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("stage=write"));
+        assert_eq!(provider.connects.load(Ordering::SeqCst), 1);
+        assert!(transport.idle.lock().await.is_none());
     }
 
     #[tokio::test]

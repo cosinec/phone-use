@@ -20,7 +20,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -632,40 +632,12 @@ impl Session {
         Ok(())
     }
     async fn websocket(self: Arc<Self>, socket: WebSocket) {
-        let (mut sink, mut source) = socket.split();
-        let (outbound, mut frames) = mpsc::channel::<Frame>(64);
+        let (sink, mut source) = socket.split();
+        let (outbound, frames) = mpsc::channel::<Frame>(64);
         let alive = Arc::new(AtomicBool::new(true));
         let writer_alive = alive.clone();
         let cancel = self.cancel.clone();
-        let writer = tokio::spawn(async move {
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-            heartbeat.tick().await;
-            loop {
-                let message = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    frame = frames.recv() => match frame {
-                        Some(frame) => Message::Binary(frame.encode().into()),
-                        None => break,
-                    },
-                    _ = heartbeat.tick() => {
-                        if !writer_alive.swap(false, Ordering::SeqCst) {
-                            cancel.cancel();
-                            break;
-                        }
-                        Message::Ping(Vec::new().into())
-                    }
-                };
-                let sent = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    result = tokio::time::timeout(Duration::from_secs(20), sink.send(message)) => result,
-                };
-                if !matches!(sent, Ok(Ok(()))) {
-                    cancel.cancel();
-                    break;
-                }
-            }
-        });
+        let writer = tokio::spawn(crate::heartbeat::write_frames(sink, frames, writer_alive, cancel));
         let deadline = tokio::time::sleep(Duration::from_secs(10));
         tokio::pin!(deadline);
         let mut hello = false;

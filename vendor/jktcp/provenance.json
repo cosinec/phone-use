@@ -1,0 +1,21 @@
+{
+  "upstream": "https://crates.io/crates/jktcp/0.1.8",
+  "license": "MIT",
+  "upstreamAdapterSha256": "a90d0ded6d40667b63fd800608f33119dd22582402d2d18a57fcccad39f3f7c9",
+  "changes": [
+    "Commit queued application data and TCP sequence bookkeeping before cancellable transport writes.",
+    "Add bounded-backpressure cancellation regression test.",
+    "Add payload-free TCP sequence/window metadata to trace logs and retransmission timeout diagnostics.",
+    "Use a per-connection retransmission timer with a 1s initial RTO, capped exponential backoff and timer renewal only on valid ACK progress; trim partial ACKs and reject ACKs beyond transmitted data.",
+    "Add paused-time WAN regression tests, including batched advancing ACKs matching the VPS retransmission burst.",
+    "Drive AdapterHandle connection handshakes in the shared packet loop so unanswered SYNs do not block established streams or cancellation.",
+    "Reset cancelled pending handshakes and close successful handshakes whose caller has gone away.",
+    "Add duplex-transport regressions for concurrent stream delivery and prompt pending-connect cancellation.",
+    "Retain upstream test dependencies; privileged manual TUN tests are skipped in hardware-free unit verification.",
+    "Poll bounded, cancellation-safe transport output alongside input in AdapterHandle so outbound backpressure cannot block inbound delivery, timers or control messages.",
+    "Preserve direct AdapterStream flush behavior; complete handle flush responses only after queued transport output drains, and propagate fatal transport errors to readers.",
+    "Add regressions for same/other connection reads, driver close, partial-write resume without replay, fatal write errors, and bounded control-packet output."
+  ],
+  "upstreamArchiveSha256": "f67259b6408391e66f7d7fd3dbef41ef3bc65e1d67f4c8d5512f2e59835f7844",
+  "localPatchBaseline": "phone-use 5bea928b8e3cb6d7e9b53688df99acac34d16b2b (jktcp subtree only)"
+}

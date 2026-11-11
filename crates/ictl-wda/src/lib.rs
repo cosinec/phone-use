@@ -17,8 +17,8 @@ pub enum WdaError {
     /// 连不上 WDA（runner 没了、端口不通）：可以退到 HID 重做
     #[error("{}", ictl_l10n::trf!("WDA 不可用：{0}", "WDA unavailable: {0}", .0))]
     Unavailable(String),
-    /// 请求已经发出但没在时限内应答：手机可能还在执行，不能退到 HID 再做一遍
-    #[error("{}", ictl_l10n::trf!("WDA 请求超时（请求已发出，手机可能仍在执行，先截图确认）：{0}", "WDA request timed out (it was sent, the phone may still be carrying it out; take a screenshot first): {0}", .0))]
+    /// 请求可能已部分或全部发出，但没在时限内应答：手机可能还在执行，不能退到 HID 再做一遍
+    #[error("{}", ictl_l10n::trf!("WDA 请求超时（请求可能已发出，手机可能仍在执行，先截图确认）：{0}", "WDA request timed out (it may have been sent, the phone may still be carrying it out; take a screenshot first): {0}", .0))]
     Timeout(String),
     /// 请求已经发出，之后连接断了或响应不完整：手机可能已经执行，同样不能退到 HID 再做一遍
     #[error("{}", ictl_l10n::trf!("WDA 在请求发出后断开（手机可能已经执行，先截图确认）：{0}", "WDA disconnected after the request was sent (the phone may have carried it out; take a screenshot first): {0}", .0))]
