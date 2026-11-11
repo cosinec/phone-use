@@ -4,8 +4,10 @@
 //! 就绪判定 = 本进程持有的 runner 任务还活着 **且** `/status` ready（手机上残留的 WDA 在 runner 退出后还会响应几十秒）。
 //! 启动时还要等新 runner 开始执行测试计划后才问 `/status`：在那之前应答的只可能是残留的旧 WDA。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing::Instrument;
 
 use idevice::{
     IdeviceError, IdeviceService,
@@ -19,6 +21,7 @@ use crate::http::DeviceTransport;
 use crate::{Result, WdaClient, WdaError, is_automation_pin_error};
 
 pub const WDA_PORT: u16 = 8100;
+static NEXT_RUNNER: AtomicU64 = AtomicU64::new(1);
 
 /// runner 等「Enable UI Automation」密码的时长是 60 秒（runner 自己的超时），多留 5 秒收它的报错
 const AUTOMATION_WAIT: Duration = Duration::from_secs(65);
@@ -32,7 +35,7 @@ const PLAN_START_FALLBACK: Duration = Duration::from_secs(30);
 /// 手机重启后 runner 一启动就进入 `enabling automation mode` 等待（手机上弹密码框），60 秒没输密码报
 /// `Timed out while enabling automation mode.`。这个报错经 `_XCT_initializationForUITestingDidFailWithError:`
 /// 发回，idevice 解码失败（只给出 unexpected response，不调回调），所以从调试日志里认
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum AutomationSignal {
     /// 开始等 automation mode（已授权时会马上结束）
     Waiting,
@@ -71,6 +74,13 @@ fn launch_hint(msg: String) -> String {
 /// XCTest 过程中收集的信息：报错文字（识别密码框超时用），以及 runner 是否正在等 automation mode
 #[derive(Default)]
 struct Progress {
+    runner_id: u64,
+    event_seq: u64,
+    initialization_count: u64,
+    authorization_wait_count: u64,
+    plan_start_count: u64,
+    log_messages: u64,
+    debug_messages: u64,
     errors: Vec<String>,
     exit_reason: Option<String>,
     automation_wait: Option<tokio::time::Instant>,
@@ -84,45 +94,98 @@ impl ErrorListener {
     fn push(&self, s: &str) {
         self.0.lock().unwrap().errors.push(s.to_owned());
     }
+
+    fn event(&self, event: &'static str) {
+        let mut p = self.0.lock().unwrap();
+        p.event_seq += 1;
+        match event {
+            "xctest_ui_initializing" => p.initialization_count += 1,
+            "xctest_authorization_wait" => p.authorization_wait_count += 1,
+            "xctest_plan_started" => p.plan_start_count += 1,
+            _ => {}
+        }
+        // Fixed lifecycle categories only. Never promote raw device messages,
+        // activity titles, typed text or callback error descriptions to INFO.
+        tracing::info!(
+            event,
+            runner_id = p.runner_id,
+            native_pid = std::process::id(),
+            event_seq = p.event_seq,
+            initialization_count = p.initialization_count,
+            authorization_wait_count = p.authorization_wait_count,
+            plan_start_count = p.plan_start_count
+        );
+    }
 }
 
-// 其余回调只记 debug 日志，用于排查启动卡住
+// 生命周期以固定字段记录到 INFO；原始手机消息只留在 DEBUG。
 impl XCUITestListener for ErrorListener {
     async fn log_message(&mut self, message: &str) -> std::result::Result<(), IdeviceError> {
+        self.0.lock().unwrap().log_messages += 1;
         tracing::debug!("xctest log: {message}");
         Ok(())
     }
 
     async fn log_debug_message(&mut self, message: &str) -> std::result::Result<(), IdeviceError> {
         tracing::debug!("xctest debug: {message}");
-        let mut p = self.0.lock().unwrap();
-        match automation_signal(message) {
-            Some(AutomationSignal::Waiting) => p.automation_wait = Some(tokio::time::Instant::now()),
-            Some(AutomationSignal::Done) => p.automation_wait = None,
-            Some(AutomationSignal::Failed) => p.errors.push(message.to_owned()),
+        let signal = automation_signal(message);
+        {
+            let mut p = self.0.lock().unwrap();
+            p.debug_messages += 1;
+            match signal {
+                Some(AutomationSignal::Waiting) => p.automation_wait = Some(tokio::time::Instant::now()),
+                Some(AutomationSignal::Done) => p.automation_wait = None,
+                Some(AutomationSignal::Failed) => p.errors.push(message.to_owned()),
+                None => {}
+            }
+        }
+        match signal {
+            Some(AutomationSignal::Waiting) => self.event("xctest_authorization_wait"),
+            Some(AutomationSignal::Done) => self.event("xctest_authorization_wait_ended"),
+            Some(AutomationSignal::Failed) => self.event("xctest_ui_initialization_failed"),
             None => {}
         }
         Ok(())
     }
 
     async fn did_begin_initializing_for_ui_testing(&mut self) -> std::result::Result<(), IdeviceError> {
-        tracing::debug!("xctest: 开始初始化 UI 测试");
+        self.event("xctest_ui_initializing");
         Ok(())
     }
 
     async fn test_bundle_ready(&mut self) -> std::result::Result<(), IdeviceError> {
-        tracing::debug!("xctest: test bundle ready");
+        self.event("xctest_bundle_ready");
         Ok(())
     }
 
     async fn test_runner_ready_with_capabilities(&mut self) -> std::result::Result<(), IdeviceError> {
-        tracing::debug!("xctest: runner ready");
+        self.event("xctest_runner_ready");
         Ok(())
     }
 
     async fn did_begin_executing_test_plan(&mut self) -> std::result::Result<(), IdeviceError> {
-        tracing::debug!("xctest: 开始执行测试计划");
+        self.event("xctest_plan_started");
         self.0.lock().unwrap().plan_started = true;
+        Ok(())
+    }
+
+    async fn did_finish_executing_test_plan(&mut self) -> std::result::Result<(), IdeviceError> {
+        self.event("xctest_plan_finished");
+        Ok(())
+    }
+
+    async fn test_bundle_ready_with_protocol_version(
+        &mut self,
+        version: u64,
+        minimum: u64,
+    ) -> std::result::Result<(), IdeviceError> {
+        self.event("xctest_bundle_protocol_ready");
+        tracing::info!(
+            event = "xctest_protocol_version",
+            runner_id = self.0.lock().unwrap().runner_id,
+            version,
+            minimum
+        );
         Ok(())
     }
 
@@ -131,11 +194,13 @@ impl XCUITestListener for ErrorListener {
         description: &str,
     ) -> std::result::Result<(), IdeviceError> {
         self.push(description);
+        self.event("xctest_ui_initialization_failed");
         Ok(())
     }
 
     async fn did_fail_to_bootstrap(&mut self, description: &str) -> std::result::Result<(), IdeviceError> {
         self.push(description);
+        self.event("xctest_bootstrap_failed");
         Err(IdeviceError::UnexpectedResponse(format!("test runner failed to bootstrap: {description}")))
     }
 }
@@ -153,6 +218,8 @@ impl WdaRunner {
         bundle_id: &str,
         timeout: Duration,
     ) -> Result<(Self, WdaClient<DeviceTransport>)> {
+        let runner_id = NEXT_RUNNER.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(event = "xctest_start_requested", runner_id, native_pid = std::process::id());
         let lookup = async {
             let mut ip =
                 InstallationProxyClient::connect(&*provider).await.map_err(|e| WdaError::Unavailable(e.to_string()))?;
@@ -169,21 +236,33 @@ impl WdaRunner {
             ))
         })??;
 
-        let progress = Arc::new(Mutex::new(Progress::default()));
+        let progress = Arc::new(Mutex::new(Progress { runner_id, ..Progress::default() }));
         let task = {
             let (provider, progress) = (provider.clone(), progress.clone());
-            tokio::spawn(async move {
+            let span = tracing::info_span!("xctest_runner", runner_id);
+            let run = async move {
                 let started = std::time::Instant::now();
-                tracing::info!(event = "xctest_started");
+                tracing::info!(event = "xctest_started", runner_id, native_pid = std::process::id());
                 let result = XCUITestService::new(provider).run(cfg, &mut ErrorListener(progress.clone()), None).await;
                 let reason = match &result {
                     Ok(()) => "test plan completed".to_owned(),
                     Err(e) => e.to_string(),
                 };
                 progress.lock().unwrap().exit_reason = Some(reason.clone());
-                tracing::warn!(event = "xctest_exited", lifetime_ms = started.elapsed().as_millis() as u64, reason = %reason);
+                {
+                    let p = progress.lock().unwrap();
+                    tracing::warn!(
+                        event = "xctest_exited", runner_id,
+                        lifetime_ms = started.elapsed().as_millis() as u64, reason = %reason,
+                        phone_log_messages = p.log_messages, phone_debug_messages = p.debug_messages,
+                        initialization_count = p.initialization_count,
+                        authorization_wait_count = p.authorization_wait_count,
+                        plan_start_count = p.plan_start_count, callback_events = p.event_seq
+                    );
+                }
                 result
-            })
+            };
+            tokio::spawn(run.instrument(span))
         };
         let mut runner = Self { task, progress: progress.clone(), started: std::time::Instant::now() };
         let client = WdaClient::new(DeviceTransport::new(provider, WDA_PORT));
@@ -232,6 +311,7 @@ impl WdaRunner {
                 );
             }
             if (plan_started || fallback_logged) && client.ready().await.unwrap_or(false) {
+                tracing::info!(event = "xctest_http_ready", runner_id, elapsed_ms = t0.elapsed().as_millis() as u64);
                 return Ok((runner, client));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -260,8 +340,11 @@ impl WdaRunner {
 /// 丢掉就停：守护进程的后台启动任务可能在 start() 中途被取消，不能留下一个没人管的 XCTest 会话
 impl Drop for WdaRunner {
     fn drop(&mut self) {
+        let runner_id = self.progress.lock().map(|p| p.runner_id).unwrap_or(0);
         tracing::info!(
             event = "xctest_stop_requested",
+            runner_id,
+            native_pid = std::process::id(),
             lifetime_ms = self.started.elapsed().as_millis() as u64,
             finished = self.task.is_finished()
         );
@@ -272,6 +355,82 @@ impl Drop for WdaRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_phone_callbacks_are_visible_at_production_info_level() {
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Output {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let output = Output::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .with_env_filter("info,ictl_wda::runner=info,idevice=warn")
+            .finish();
+        let progress = Arc::new(Mutex::new(Progress { runner_id: 7, ..Progress::default() }));
+        let mut listener = ErrorListener(progress.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                for _ in 0..2 {
+                    listener.did_begin_initializing_for_ui_testing().await.unwrap();
+                    listener
+                        .log_debug_message("entering wait loop enabling automation mode PRIVATE_AUTH_PAYLOAD")
+                        .await
+                        .unwrap();
+                    listener.log_debug_message("cleaning up enabling automation mode").await.unwrap();
+                }
+                listener.test_bundle_ready().await.unwrap();
+                listener.test_bundle_ready_with_protocol_version(36, 22).await.unwrap();
+                listener.test_runner_ready_with_capabilities().await.unwrap();
+                listener.did_begin_executing_test_plan().await.unwrap();
+                listener.did_finish_executing_test_plan().await.unwrap();
+                listener.initialization_for_ui_testing_did_fail("PRIVATE_ERROR_PAYLOAD").await.unwrap();
+                listener.log_message("PRIVATE_PHONE_PAYLOAD").await.unwrap();
+            });
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        for event in [
+            "xctest_ui_initializing",
+            "xctest_authorization_wait",
+            "xctest_authorization_wait_ended",
+            "xctest_bundle_ready",
+            "xctest_bundle_protocol_ready",
+            "xctest_protocol_version",
+            "xctest_runner_ready",
+            "xctest_plan_started",
+            "xctest_plan_finished",
+            "xctest_ui_initialization_failed",
+        ] {
+            assert!(text.contains(event), "missing {event}: {text}");
+        }
+        assert!(
+            text.contains("runner_id=7")
+                && text.contains("initialization_count=2")
+                && text.contains("authorization_wait_count=2")
+                && text.contains("plan_start_count=1"),
+            "{text}"
+        );
+        assert!(!text.contains("PRIVATE"), "{text}");
+        let p = progress.lock().unwrap();
+        assert!(p.plan_started && p.automation_wait.is_none());
+        assert_eq!(p.errors, ["PRIVATE_ERROR_PAYLOAD"]);
+        assert_eq!((p.log_messages, p.debug_messages, p.event_seq), (1, 4, 12));
+    }
 
     #[test]
     fn untrusted_developer_hint_only_for_unexpected_response() {

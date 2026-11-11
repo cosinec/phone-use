@@ -11,6 +11,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use ictl_daemon::config::env as env_nonempty;
 use ictl_daemon::protocol::{self, Request, Response};
+mod phone_logs;
 
 #[cfg(feature = "debug-cmds")]
 mod debug;
@@ -120,8 +121,17 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_env_filter(filter)
+        .event_format(phone_logs::PhoneEvents)
+        .with_env_filter(phone_logs::with_phone_launch(filter))
         .init();
+    tracing::info!(
+        event = "phone_diagnostics_enabled",
+        schema = 1,
+        native_pid = std::process::id(),
+        callback_events = true,
+        phone_process_launch = true,
+        raw_phone_debug = false
+    );
 
     match cli.command {
         Command::Daemon => {

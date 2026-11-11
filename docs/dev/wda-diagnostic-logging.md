@@ -18,6 +18,31 @@ info,ictl_wda::http=debug,ictl_wda::runner=info,jktcp::adapter=trace,idevice=war
 
 不启用整个 idevice 的 debug/trace，不记录 WebSocket URL/query、访问令牌、配对包、请求正文或正常 XCTest 原始调试消息。WebSocket 协议错误只记录固定分类，不回显对端错误文本。
 
+## 手机 XCTest / WDA 生命周期
+
+过去 UI 初始化、授权等待、bundle ready 和测试计划开始回调仅为 DEBUG；上述生产过滤器会过滤它们。此前部署留下的大量 TCP/HTTP 日志不能排除手机端反复授权或初始化，也不能把服务端 `xctest_started` 次数等同于手机界面出现次数。此改动不能补回历史缺失的回调。
+
+现在以下固定事件以 INFO 写入 `daemon.stderr.log*`：
+
+| 事件 | 含义 |
+| --- | --- |
+| `phone_diagnostics_enabled` | 原生程序已启用本组诊断；含 schema、native_pid 和覆盖标记 |
+| `xctest_start_requested` / `xctest_started` | 本次启动请求 / 服务端 XCTest 任务开始 |
+| `phone_process_launched` | 手机启动接口返回的真实 runner PID（`phone_pid`）；不是服务端任务 PID |
+| `xctest_ui_initializing` | 手机报告 UI 测试初始化开始 |
+| `xctest_authorization_wait` / `xctest_authorization_wait_ended` | 手机开始/结束 automation mode 等待；结束不代表授权成功，超时清理也会出现 |
+| `xctest_bundle_ready` / `xctest_bundle_protocol_ready` / `xctest_runner_ready` | 手机测试包、协议和 runner 就绪回调 |
+| `xctest_plan_started` / `xctest_plan_finished` | 手机测试计划开始/结束回调 |
+| `xctest_ui_initialization_failed` / `xctest_bootstrap_failed` | 手机初始化/引导失败分类 |
+| `xctest_http_ready` | 当前服务端 runner 的 WDA HTTP 就绪 |
+| `xctest_exited` / `xctest_stop_requested` | 服务端任务结束 / 被主动停止 |
+
+使用 namespace → `native_pid` → `runner_id` 对照，同一个 native 进程内 runner_id 递增，进程重启后从 1 开始；不能跨进程仅凭 runner_id 合并。PID 桥接事件从 `xctest_runner` span 获取 runner_id。回调附 `event_seq`、累计 `initialization_count`、`authorization_wait_count` 和 `plan_start_count`，重复回调会逐次落盘；退出记录附收到的原始 phone log/debug 消息条数和回调计数，但不提升原始消息正文的日志级别。
+
+手机 PID 来自锁定版本 idevice 的启动返回日志。格式器仅为其 XCTest 子模块启用 DEBUG 以提取严格校验的正整数 PID，丢弃该子模块其他 INFO/DEBUG 消息，保留已有 WARN/ERROR 行为；不输出启动环境、手机原始消息或活动正文。依赖升级改变目标/格式时须更新并验证此桥接，启动覆盖标记本身不证明实际收到手机 PID。
+
+这些是手机 XCTest 回调和启动结果，不是完整 iOS syslog、SpringBoard/TCC 日志或 crash report。链路中断时回调可能缺失；手机自行死亡且没有回调时，只能结合连接错误和后续新 PID 判断。若手机画面再次出现而没有对应回调，不能据此断言没有发生，需进一步采集系统日志。现场验收必须重新连接真机并确认实际回调，合成日志测试只验证过滤和落盘管道。
+
 ## 定位顺序
 
 1. `ws_closed`：检查 browser_close、socket_error、hello_timeout、eof、protocol_error 或 cancel；writer 日志进一步说明 heartbeat_pong_missing/send timeout/socket send failed。两者通过 session ID 关联。
