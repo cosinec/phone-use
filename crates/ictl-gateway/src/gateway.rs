@@ -650,6 +650,7 @@ impl Session {
                     },
                     _ = heartbeat.tick() => {
                         if !writer_alive.swap(false, Ordering::SeqCst) {
+                            eprintln!("{} USB relay closed: heartbeat pong missing", chrono::Utc::now().to_rfc3339());
                             cancel.cancel();
                             break;
                         }
@@ -661,6 +662,8 @@ impl Session {
                     result = tokio::time::timeout(Duration::from_secs(20), sink.send(message)) => result,
                 };
                 if !matches!(sent, Ok(Ok(()))) {
+                    let cause = if sent.is_err() { "send timeout" } else { "socket send failed" };
+                    eprintln!("{} USB relay closed: {cause}", chrono::Utc::now().to_rfc3339());
                     cancel.cancel();
                     break;
                 }
@@ -725,9 +728,34 @@ impl Session {
                     Ok(())
                 }
                 Some(Ok(Message::Ping(_))) => Ok(()),
+                Some(Ok(Message::Close(_))) => {
+                    eprintln!("{} USB relay closed: browser closed socket", chrono::Utc::now().to_rfc3339());
+                    break;
+                }
+                Some(Err(_)) => {
+                    eprintln!("{} USB relay closed: socket receive failed", chrono::Utc::now().to_rfc3339());
+                    break;
+                }
                 _ => break,
             };
-            if result.is_err() {
+            if let Err(error) = result {
+                // Errors here describe framing/limits, never print binary frames,
+                // URLs, headers, pairing records or the peer's close reason.
+                let error = error.to_string();
+                let detail = match error.as_str() {
+                    "Invalid relay header"
+                    | "Invalid relay length"
+                    | "Unknown relay stream"
+                    | "Invalid OpenResult"
+                    | "Unexpected OpenResult"
+                    | "Unknown or unopened stream"
+                    | "Stream receive buffer exceeded"
+                    | "Invalid StreamData"
+                    | "Invalid StreamClose"
+                    | "Unsupported stream frame" => error.as_str(),
+                    _ => "invalid relay frame or device hello",
+                };
+                eprintln!("{} USB relay closed: rejected frame ({detail})", chrono::Utc::now().to_rfc3339());
                 break;
             }
         }
