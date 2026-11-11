@@ -66,6 +66,8 @@ COPY --from=assets /usr/share/doc/iphone-control/ /usr/share/doc/iphone-control/
 COPY --from=gateway-notices /GATEWAY_LICENSES.html /usr/share/doc/iphone-control/GATEWAY_LICENSES.html
 COPY --from=web-build /web/dist/ ./dist/
 COPY --from=gateway-notices /WEB_LICENSES.html ./dist/licenses/rust-wasm.html
+COPY vendor/jktcp/LICENSE /usr/share/licenses/jktcp/LICENSE
+COPY THIRD_PARTY.md /usr/share/doc/iphone-control/THIRD_PARTY.md
 COPY LICENSE ./LICENSE
 COPY browser-control/THIRD_PARTY.md ./THIRD_PARTY.md
 RUN mkdir -p /app/.runtime && chown -R control:control /app

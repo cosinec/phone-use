@@ -1,0 +1,11 @@
+{
+  "upstream": "https://crates.io/crates/jktcp/0.1.8",
+  "license": "MIT",
+  "upstreamAdapterSha256": "a90d0ded6d40667b63fd800608f33119dd22582402d2d18a57fcccad39f3f7c9",
+  "changes": [
+    "Commit queued application data and TCP sequence bookkeeping before cancellable transport writes.",
+    "Add bounded-backpressure cancellation regression test.",
+    "Retain upstream test dependencies; privileged manual TUN tests are skipped in hardware-free unit verification."
+  ],
+  "upstreamArchiveSha256": "f67259b6408391e66f7d7fd3dbef41ef3bc65e1d67f4c8d5512f2e59835f7844"
+}
