@@ -18,8 +18,9 @@ const path = new URL("dist/index-DJrAlfkC.js", root);
 let source = await readFile(path, "utf8");
 const originalHash =
   "da410b47f3150df18f0dab904d16d22f20f0fd2141d0846c1431d4d921375a20";
-const marker = "// phone-use: device-install stream lifecycle v1";
-const replacements = [
+const legacyMarker = "// phone-use: device-install stream lifecycle v1";
+const marker = "// phone-use: device-install stream lifecycle v2";
+const streamReplacements = [
   [
     "  async handleFrame(t) {\n    switch (t.type) {",
     "  async handleFrame(t) {\n    if (this.closed) return;\n    switch (t.type) {",
@@ -145,8 +146,24 @@ const replacements = [
   ],
 ];
 
-const helpers = `
-${marker}
+const framingReplacements = [
+  ["async function J(e, t) {", "async function J(e, t) {\n  muxReaders.delete(e);"],
+  ["function I(e) {\n  e.closed = !0;", "function I(e) {\n  muxReaders.delete(e.device);\n  e.closed = !0;"],
+  [
+    "    const r = await H(e, t), a = te(r, n);",
+    "    const r = await readMuxFrame(e, t, n), a = te(r, n);",
+  ],
+  [
+    "  const t = new DataView(e.buffer, e.byteOffset, e.byteLength), n = (t.getUint8(12) >> 4) * 4;",
+    `  if (e.byteLength < 20) throw new Error("Short usbmux TCP header");
+  const t = new DataView(e.buffer, e.byteOffset, e.byteLength), n = (t.getUint8(12) >> 4) * 4;
+  if (n < 20 || n > e.byteLength) throw new Error("Invalid usbmux TCP header length");`,
+  ],
+];
+const replacements = [...streamReplacements, ...framingReplacements];
+
+const legacyHelpers = `
+${legacyMarker}
 // Close both bookkeeping layers and wake readers BEFORE any asynchronous USB write.
 // Local cancellation uses RST|ACK so a peer cannot retain an abandoned connection.
 function releaseDeviceStream(stream, { notify = true, discard = true, reason = "Stream closed" } = {}) {
@@ -169,16 +186,52 @@ function releaseRelayStreams(relay) {
   relay.pairRecordWaiter = undefined;
 }
 `;
+const helpers = legacyHelpers.replace(legacyMarker, marker) + `
+// USB bulk-read boundaries are not usbmux packet boundaries. Retain partial
+// headers/bodies and surplus packets, bounded by the 64 KiB usbmux receive limit.
+const muxReaders = new WeakMap();
+async function readMuxFrame(device, endpoint, version) {
+  let endpoints = muxReaders.get(device);
+  if (!endpoints) muxReaders.set(device, endpoints = new Map());
+  let reader = endpoints.get(endpoint.endpointNumber);
+  if (!reader) endpoints.set(endpoint.endpointNumber, reader = { buffer: new Uint8Array() });
+  const headerLength = version >= 2 ? 16 : 8;
+  for (;;) {
+    const buffer = reader.buffer;
+    if (buffer.byteLength >= 8) {
+      const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      const length = view.getUint32(4);
+      if (length < headerLength || length > 65536) throw new Error("Invalid usbmux packet length: " + length);
+      if (buffer.byteLength >= length) {
+        const packet = buffer.slice(0, length);
+        reader.buffer = buffer.slice(length);
+        return packet;
+      }
+    }
+    const chunk = await H(device, endpoint);
+    if (!chunk.byteLength) continue; // A USB zero-length packet carries no mux data.
+    const combined = new Uint8Array(reader.buffer.byteLength + chunk.byteLength);
+    combined.set(reader.buffer);
+    combined.set(chunk, reader.buffer.byteLength);
+    reader.buffer = combined;
+  }
+}
+`;
 
 function digest(text) {
   return createHash("sha256").update(text).digest("hex");
 }
 // Reverse our exact edits to authenticate both fresh and previously patched files.
-if (source.includes(marker)) {
-  if (!source.endsWith(helpers))
+const applied = source.includes(marker)
+  ? { helpers, replacements }
+  : source.includes(legacyMarker)
+    ? { helpers: legacyHelpers, replacements: streamReplacements }
+    : null;
+if (applied) {
+  if (!source.endsWith(applied.helpers))
     throw new Error("Unexpected device-install patch contents");
-  source = source.slice(0, -helpers.length);
-  for (const [before, after] of [...replacements].reverse()) {
+  source = source.slice(0, -applied.helpers.length);
+  for (const [before, after] of [...applied.replacements].reverse()) {
     if (source.split(after).length !== 2)
       throw new Error("Unexpected device-install patched code");
     source = source.replace(after, before);

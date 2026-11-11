@@ -19,7 +19,7 @@ async function fixture(t) {
     readers.length ? readers.shift().resolve(result) : incoming.push(result);
   };
   let receiveSeq = 0;
-  const packet = (stream, flags, payload = new Uint8Array(), seq = 1) => {
+  const packetBytes = (stream, flags, payload = new Uint8Array(), seq = 1) => {
     const bytes = new Uint8Array(36 + payload.length),
       view = new DataView(bytes.buffer);
     view.setUint32(0, 6);
@@ -33,8 +33,9 @@ async function fixture(t) {
     view.setUint8(28, 0x50);
     view.setUint8(29, flags);
     bytes.set(payload, 36);
-    deliver(bytes);
+    return bytes;
   };
+  const packet = (...args) => deliver(packetBytes(...args));
   let autoOpen = true;
   usb.device.claimInterface = async () => {};
   usb.device.transferIn = async () =>
@@ -163,6 +164,8 @@ async function fixture(t) {
     frames,
     sent,
     packet,
+    packetBytes,
+    deliver,
     wait,
     send,
     open,
@@ -171,6 +174,66 @@ async function fixture(t) {
     },
   };
 }
+
+test("fragmented usbmux headers and large bodies arrive intact without closing other streams", async (t) => {
+  const f = await fixture(t), stream = await f.open(1), other = await f.open(2);
+  const expected = Uint8Array.from({ length: 24000 }, (_, i) => i % 251);
+  const bytes = f.packetBytes(stream, 16, expected);
+  for (const chunk of [bytes.slice(0, 3), bytes.slice(3, 11), bytes.slice(11, 16384), bytes.slice(16384)]) {
+    f.deliver(chunk);
+  }
+  await f.wait(() => f.frames.some(frame => frame.type === 4 && frame.streamId === 1));
+  const received = f.frames.filter(frame => frame.type === 4 && frame.streamId === 1).flatMap(frame => [...frame.payload]);
+  assert.deepEqual(received, [...expected]);
+  assert.equal(f.target.session.closed, false);
+  f.packet(other, 16, new Uint8Array([42]));
+  await f.wait(() => f.frames.some(frame => frame.type === 4 && frame.streamId === 2));
+});
+
+test("coalesced usbmux packets retain each stream's complete payload", async (t) => {
+  const f = await fixture(t), first = await f.open(1), second = await f.open(2);
+  const a = f.packetBytes(first, 16, new Uint8Array([1, 2, 3]));
+  const b = f.packetBytes(second, 16, new Uint8Array([4, 5]));
+  const combined = new Uint8Array(a.length + b.length);
+  combined.set(a); combined.set(b, a.length);
+  f.deliver(combined);
+  await f.wait(() => f.frames.some(frame => frame.type === 4 && frame.streamId === 2));
+  assert.deepEqual([...f.frames.find(frame => frame.type === 4 && frame.streamId === 1).payload], [1, 2, 3]);
+  assert.deepEqual([...f.frames.find(frame => frame.type === 4 && frame.streamId === 2).payload], [4, 5]);
+});
+
+test("the default 16 KiB USB read can split a large mux body without forwarding partial data", async (t) => {
+  const f = await fixture(t), stream = await f.open(1);
+  const expected = Uint8Array.from({ length: 32000 }, (_, i) => i % 251);
+  const bytes = f.packetBytes(stream, 16, expected);
+  f.deliver(bytes.slice(0, 16384));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.frames.filter(frame => frame.type === 4).length, 0, "an incomplete mux packet must not be acknowledged or delivered");
+  f.deliver(bytes.slice(16384));
+  await f.wait(() => f.frames.some(frame => frame.type === 4));
+  assert.equal(Buffer.compare(Buffer.from(f.frames.find(frame => frame.type === 4).payload), Buffer.from(expected)), 0);
+  assert.equal(f.target.session.closed, false);
+});
+
+test("invalid mux lengths and short TCP headers close waiting streams instead of hanging or growing buffers", async (t) => {
+  for (const invalid of [7, 15, 65537, "tcp"]) {
+    await t.test(String(invalid), async (t) => {
+      const f = await fixture(t), stream = await f.open(1);
+      let bytes = f.packetBytes(stream, 16);
+      if (invalid === "tcp") {
+        bytes = bytes.slice(0, 24);
+        new DataView(bytes.buffer).setUint32(4, bytes.length);
+      } else {
+        bytes = bytes.slice(0, 16);
+        new DataView(bytes.buffer).setUint32(4, invalid);
+      }
+      f.deliver(bytes);
+      await f.wait(() => f.target.session.closed);
+      assert.equal(f.target.session.streams.size, 0);
+      assert.equal(stream.waiters.length, 0);
+    });
+  }
+});
 
 test("100 server stream closes release both SDK maps, readers and phone connections", async (t) => {
   const f = await fixture(t);

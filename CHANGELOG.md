@@ -14,7 +14,7 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Fixed
 
-- Browser iPhone USB forwarding releases device connections and waiting readers when streams close, including remote FIN/RST and cancellation during connection setup. The server drains final queued bytes before EOF, and a closed relay cannot start queued connections. This fixes a reproduced connection leak that could contribute to WDA disconnects; sustained physical-device verification is still required.
+- Browser iPhone USB forwarding reassembles fragmented usbmux headers and bodies, preserves packets received together, and rejects invalid packet lengths before dispatch. It also releases device connections and waiting readers when streams close, including remote FIN/RST and cancellation during connection setup. The server drains final queued bytes before EOF, and a closed relay cannot start queued connections. This fixes a reproduced connection leak that could contribute to WDA disconnects; sustained physical-device verification is still required.
 - Scroll bars are dropped from element lists in every system language, not only Chinese and English: they are recognised by their percentage value and thin shape instead of their label. On a German iPhone, for example, lines like `Other "Vertikaler Rollbalken, 1 Seite"` no longer appear.
 
 ## [0.1.4] - 2026-11-07
