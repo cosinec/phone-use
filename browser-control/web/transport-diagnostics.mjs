@@ -11,6 +11,7 @@ export function attachTransportDiagnostics(target, relay, report) {
     usbReadHooked: 0, usbWriteHooked: 0, wsHooked: 0,
   };
   const pendingSince = {usbRead: 0, usbWrite: 0};
+  const streamSamples = new WeakMap();
   const restore = [];
   let sequence = 0;
   let stopped = false;
@@ -91,12 +92,37 @@ export function attachTransportDiagnostics(target, relay, report) {
       usbReadPendingMs: stats.usbReadPending ? Math.round(now - pendingSince.usbRead) : 0,
       usbWritePendingMs: stats.usbWritePending ? Math.round(now - pendingSince.usbWrite) : 0,
       pendingMuxWrites: target.session?.pendingMuxWrites ?? 0,
-      streams: [...(relay.streams?.entries() ?? [])].slice(0, 64).map(([streamId, stream]) => ({
-        streamId, port: stream.dport,
-        readQueuedBytes: (stream.queue ?? []).reduce((sum, bytes) => sum + bytes.byteLength, 0),
-        writeQueuedBytes: stream.queuedWriteBytes ?? 0,
-        peerWindowBytes: stream.peerWindow ?? 0,
-      })),
+      usbSessionClosed: target.session?.closed ? 1 : 0,
+      wsReadyState: socket.readyState ?? 0,
+      streams: [...(relay.streams?.entries() ?? [])].slice(0, 64).map(([streamId, stream]) => {
+        const sendSeq = (stream.seq ?? 1) >>> 0;
+        const peerAck = (stream.peerAck ?? 1) >>> 0;
+        const inFlightBytes = (sendSeq - peerAck) >>> 0;
+        const peerWindowBytes = stream.peerWindow ?? 0;
+        const availableWindowBytes = Math.max(0, peerWindowBytes - inFlightBytes);
+        const writeQueuedBytes = stream.queuedWriteBytes ?? 0;
+        const windowBlocked = writeQueuedBytes > 0 && availableWindowBytes === 0;
+        let previous = streamSamples.get(stream);
+        if (!previous) {
+          previous = {peerAck, ackSince: now, blockedSince: null, hadQueued: false};
+          streamSamples.set(stream, previous);
+        }
+        if (!writeQueuedBytes || !previous.hadQueued || previous.peerAck !== peerAck) previous.ackSince = now;
+        previous.hadQueued = writeQueuedBytes > 0;
+        previous.peerAck = peerAck;
+        previous.blockedSince = windowBlocked ? previous.blockedSince ?? now : null;
+        return {
+          streamId, port: stream.dport,
+          readQueuedBytes: (stream.queue ?? []).reduce((sum, bytes) => sum + bytes.byteLength, 0),
+          readQueuedFrames: stream.queue?.length ?? 0,
+          writeQueuedBytes, peerWindowBytes, sendSeq, peerAck, inFlightBytes, availableWindowBytes,
+          writeWaiters: stream.writeWaiters?.length ?? 0,
+          ackPending: stream.ackWriting || stream.ackNeeded ? 1 : 0,
+          windowBlocked: windowBlocked ? 1 : 0,
+          windowBlockedMs: windowBlocked ? Math.round(now - previous.blockedSince) : 0,
+          peerAckUnchangedMs: writeQueuedBytes ? Math.round(now - previous.ackSince) : 0,
+        };
+      }),
     };
     const abort = new AbortController();
     upload = abort;

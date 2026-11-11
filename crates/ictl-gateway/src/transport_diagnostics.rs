@@ -18,6 +18,16 @@ struct Stream {
     read_queued_bytes: u64,
     write_queued_bytes: u64,
     peer_window_bytes: u64,
+    read_queued_frames: u64,
+    send_seq: u32,
+    peer_ack: u32,
+    in_flight_bytes: u64,
+    available_window_bytes: u64,
+    write_waiters: u64,
+    ack_pending: u8,
+    window_blocked: u8,
+    window_blocked_ms: u64,
+    peer_ack_unchanged_ms: u64,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -50,6 +60,8 @@ struct Metrics {
     skipped_samples: u64,
     upload_errors: u64,
     pending_mux_writes: u64,
+    usb_session_closed: u8,
+    ws_ready_state: u8,
     streams: Vec<Stream>,
 }
 
@@ -78,7 +90,11 @@ mod tests {
             record(
                 "fixture",
                 json!({"schema":1,"event":"sample","wsBufferedBytes":1024,
-            "streams":[{"streamId":7,"port":9100,"readQueuedBytes":128}]})
+            "usbSessionClosed":0,"wsReadyState":1,
+            "streams":[{"streamId":7,"port":9100,"readQueuedBytes":128,
+            "sendSeq":32,"peerAck":4294967280u32,"inFlightBytes":48,"availableWindowBytes":0,
+            "windowBlocked":1,"windowBlockedMs":1500,"peerAckUnchangedMs":1500,
+            "writeWaiters":1,"ackPending":1,"readQueuedFrames":2}]})
             )
             .is_ok()
         );

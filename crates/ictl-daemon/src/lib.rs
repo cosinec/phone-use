@@ -157,11 +157,11 @@ async fn serve_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) {
     }
 }
 
+type ParsedRequest = (protocol::Request, bool, Option<String>, ictl_l10n::Lang, Option<u64>);
+
 /// 解析一行请求，并取出 [`protocol::CANCEL_ON_CLOSE`]、[`protocol::EXPECT_UDID`]、[`protocol::LANG`]。
 /// No language (an older client) means Chinese, which is what those clients expect and parse
-fn parse_request(
-    line: &[u8],
-) -> serde_json::Result<(protocol::Request, bool, Option<String>, ictl_l10n::Lang, Option<u64>)> {
+fn parse_request(line: &[u8]) -> serde_json::Result<ParsedRequest> {
     let mut v: serde_json::Value = serde_json::from_slice(line)?;
     let (cancel, expect, lang, diagnostic_id) = match v.as_object_mut() {
         Some(o) => (

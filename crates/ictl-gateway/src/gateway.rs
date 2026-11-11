@@ -897,7 +897,8 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
     }
     match (method, route) {
         (Method::POST, ["diagnostics"]) => {
-            let input = body_with_limit(request, 16 * 1024).await?;
+            // Allow all 64 streams with the expanded, strictly numeric window metrics.
+            let input = body_with_limit(request, 64 * 1024).await?;
             crate::transport_diagnostics::record(&s.id, input)?;
             Ok(reply(200, json!({"recorded":true})))
         }

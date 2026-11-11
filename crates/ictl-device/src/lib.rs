@@ -89,6 +89,8 @@ impl From<IdeviceError> for DeviceError {
             IdeviceError::PairingDialogResponsePending => Self::PairingPending,
             IdeviceError::UserDeniedPairing => Self::PairingDenied,
             IdeviceError::DeveloperModeNotEnabled => Self::DeveloperModeOff,
+            // 带上底层 io::Error，否则只剩「device socket io failed」，看不出是断开、超时还是被重置
+            IdeviceError::Socket(io) => Self::Idevice(format!("device socket io failed ({:?}: {io})", io.kind())),
             other => Self::Idevice(other.to_string()),
         }
     }
@@ -486,6 +488,17 @@ impl Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_error_preserves_kind_and_underlying_cause() {
+        let error = DeviceError::from(IdeviceError::Socket(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "early eof",
+        )));
+        let text = error.to_string();
+        assert!(text.contains("UnexpectedEof"));
+        assert!(text.contains("early eof"));
+    }
 
     /// 真机：摄像头在左（z=270）时，HID 按竖放发 (265,314) 落在了界面的 (314,165)，反过来要换算回 (265,314)
     #[test]

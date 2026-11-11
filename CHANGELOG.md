@@ -14,6 +14,8 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Fixed
 
+- A temporarily full browser relay queue no longer disconnects the entire iPhone session when closing a stream. Transport diagnostics now expose stream lifecycle, close delivery, USB window stalls and underlying device IO errors.
+
 - Scroll bars are dropped from element lists in every system language, not only Chinese and English: they are recognised by their percentage value and thin shape instead of their label. On a German iPhone, for example, lines like `Other "Vertikaler Rollbalken, 1 Seite"` no longer appear.
 
 ## [0.1.4] - 2026-11-07

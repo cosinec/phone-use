@@ -41,7 +41,7 @@ async function harness(t, env = {}, fileEnv = {}) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const session = async (extra = {}) => { const response = await api('/api/sessions', token, { device, ...extra }); assert.equal(response.status, 201, await response.clone().text()); return response.json(); };
-  return { api, session, base, dir };
+  return { api, session, base, dir, logs: () => errors };
 }
 async function peer(t, session, selected = device) {
   const ws = new WebSocket(session.relayUrl, { origin });
@@ -62,6 +62,31 @@ async function ready(app, session) {
   return state;
 }
 const contract = (name, fn) => test(name, { skip: !binary }, fn);
+
+contract('transport diagnostics accept all 64 enriched streams and reject unauthenticated or private payloads', async t => {
+  const app = await harness(t);
+  const session = await app.session();
+  const route = `/api/sessions/${session.id}/diagnostics`;
+  const metrics = {schema: 1, event: 'sample', streams: Array.from({length: 64}, (_, i) => ({
+    streamId: i + 1, port: 8100, readQueuedBytes: 1024, writeQueuedBytes: 1048576,
+    peerWindowBytes: 131072, readQueuedFrames: 10, sendSeq: 0xffffffff, peerAck: 0xffffff00,
+    inFlightBytes: 255, availableWindowBytes: 130817, writeWaiters: 1, ackPending: 1,
+    windowBlocked: 0, windowBlockedMs: 0, peerAckUnchangedMs: 10000,
+  }))};
+  assert.ok(Buffer.byteLength(JSON.stringify(metrics)) > 16 * 1024, 'fixture must exceed the previous upload limit');
+  assert.equal((await app.api(route, 'wrong-token', metrics)).status, 401);
+  const response = await app.api(route, session.token, metrics);
+  assert.equal(response.status, 200, await response.clone().text());
+  await until(() => app.logs().split('\n').slice(0, -1).some(line => line.includes('event=browser_transport')));
+  const line = app.logs().split('\n').find(line => line.includes('event=browser_transport'));
+  assert.ok(line.includes(`session=${session.id}`));
+  const stored = JSON.parse(line.split(' metrics=')[1]);
+  assert.equal(stored.streams.length, 64);
+  assert.equal(stored.streams[63].sendSeq, 0xffffffff);
+  assert.equal(stored.streams[63].peerAckUnchangedMs, 10000);
+  assert.equal((await app.api(route, session.token, {...metrics, payload: 'PRIVATE_DIAGNOSTIC_PAYLOAD'})).status, 400);
+  assert.ok(!app.logs().includes('PRIVATE_DIAGNOSTIC_PAYLOAD'));
+});
 
 async function modelReplyTask(t, respond, env = {}) {
   const requests = [];

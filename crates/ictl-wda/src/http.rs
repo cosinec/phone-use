@@ -86,10 +86,10 @@ impl Drop for HttpTrace {
         let span = self.span.clone();
         tracing::dispatcher::with_default(&dispatch, || {
             span.in_scope(|| {
-                if self.outcome != "cancelled" {
-                    if let Some(phase) = self.phase.take() {
-                        phase.finish(self.outcome == "ok");
-                    }
+                if self.outcome != "cancelled"
+                    && let Some(phase) = self.phase.take()
+                {
+                    phase.finish(self.outcome == "ok");
                 }
                 tracing::info!(event = "http_complete", outcome = self.outcome, attempt = self.attempt,
             elapsed_ms = self.started.elapsed().as_millis() as u64, phase = self.phase_name,
@@ -530,10 +530,32 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostics_split_first_byte_body_and_cancelled_reads_without_payloads() {
+        // Other parallel HTTP tests may create disabled spans before this test
+        // installs its subscriber. Isolate log capture, including Drop events,
+        // so callsite registration cannot race with subscriber initialization.
+        const CHILD: &str = "ICTL_HTTP_DIAGNOSTICS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "http::tests::diagnostics_split_first_byte_body_and_cancelled_reads_without_payloads",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let logs = Arc::new(SyncMutex::new(Vec::new()));
         let writer = LogWriter(logs.clone());
-        // A process-wide subscriber keeps callsite filters stable while other
-        // HTTP tests exercise the same tracing sites on parallel threads.
+        // The child has exactly one test and installs tracing before any request.
         tracing::subscriber::set_global_default(
             tracing_subscriber::fmt()
                 .with_ansi(false)

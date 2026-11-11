@@ -1,17 +1,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_USB_DATA: usize = 3 * 16384 - 16 - 20;
 const STREAM_BUFFER: usize = 64 * 1024;
+// Match the WebSocket writer's single-send budget without blocking stream cleanup.
+const CLOSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
 pub struct Frame {
@@ -57,6 +60,28 @@ struct Entry {
     incoming: mpsc::Sender<Vec<u8>>,
     queued: Arc<AtomicUsize>,
     cancel: CancellationToken,
+    stats: Arc<StreamStats>,
+}
+
+struct StreamStats {
+    started: Instant,
+    received_bytes: AtomicU64,
+    sent_bytes: AtomicU64,
+}
+
+impl Entry {
+    fn log(&self, session: &str, id: u32, event: &str, reason: &str) {
+        eprintln!(
+            "{} event={event} session={session} stream={id} port={} reason={reason} elapsed_ms={} received_bytes={} sent_bytes={} queued_bytes={} queue_capacity={}",
+            chrono::Utc::now().to_rfc3339(),
+            self.port,
+            self.stats.started.elapsed().as_millis(),
+            self.stats.received_bytes.load(Ordering::Relaxed),
+            self.stats.sent_bytes.load(Ordering::Relaxed),
+            self.queued.load(Ordering::Relaxed),
+            self.incoming.capacity()
+        );
+    }
 }
 
 struct Streams {
@@ -92,25 +117,52 @@ impl Relay {
         }
     }
 
-    async fn retire(&self, id: u32, remote: bool) {
-        if let Some(entry) = self.0.streams.lock().await.entries.remove(&id) {
+    async fn retire(&self, id: u32, reason: &'static str) {
+        let entry = self.0.streams.lock().await.entries.remove(&id);
+        if let Some(entry) = entry {
+            entry.log(&self.0.session_id, id, "relay_stream_retired", reason);
             entry.cancel.cancel();
-            if !remote && !self.0.cancel.is_cancelled() {
+            if !self.0.cancel.is_cancelled() {
                 // Closing a stream must never block cleanup behind a stalled socket.
-                if let Err(error) =
-                    self.0.outbound.try_send(Frame { kind: 5, request_id: 0, stream_id: id, payload: Vec::new() })
-                {
-                    let reason = match error {
-                        mpsc::error::TrySendError::Full(_) => "outbound_queue_full",
-                        mpsc::error::TrySendError::Closed(_) => "outbound_queue_closed",
-                    };
-                    eprintln!(
-                        "{} event=relay_cancel_requested session={} stream={id} port={} reason={reason}",
-                        chrono::Utc::now().to_rfc3339(),
-                        self.0.session_id,
-                        entry.port
-                    );
-                    self.0.cancel.cancel();
+                match self.0.outbound.try_send(Frame { kind: 5, request_id: 0, stream_id: id, payload: Vec::new() }) {
+                    Ok(()) => entry.log(&self.0.session_id, id, "relay_close_enqueued", "queued_immediately"),
+                    Err(mpsc::error::TrySendError::Full(frame)) => {
+                        entry.log(&self.0.session_id, id, "relay_close_deferred", "outbound_queue_full");
+                        let outbound = self.0.outbound.clone();
+                        let cancel = self.0.cancel.clone();
+                        let session = self.0.session_id.clone();
+                        tokio::spawn(async move {
+                            let began = Instant::now();
+                            let result = tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    entry.log(&session, id, "relay_close_abandoned", "session_cancelled");
+                                    return;
+                                },
+                                sent = tokio::time::timeout(CLOSE_DELIVERY_TIMEOUT, outbound.send(frame)) => sent,
+                            };
+                            let (event, reason) = match result {
+                                Ok(Ok(())) => ("relay_close_enqueued", "queue_recovered"),
+                                Ok(Err(_)) => ("relay_cancel_requested", "close_queue_closed"),
+                                Err(_) => ("relay_cancel_requested", "close_delivery_timeout"),
+                            };
+                            eprintln!(
+                                "{} event={event} session={session} stream={id} port={} reason={reason} wait_ms={} timeout_ms={} outbound_capacity={}",
+                                chrono::Utc::now().to_rfc3339(),
+                                entry.port,
+                                began.elapsed().as_millis(),
+                                CLOSE_DELIVERY_TIMEOUT.as_millis(),
+                                outbound.capacity()
+                            );
+                            if !matches!(result, Ok(Ok(()))) {
+                                cancel.cancel();
+                            }
+                        });
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        entry.log(&self.0.session_id, id, "relay_cancel_requested", "outbound_queue_closed");
+                        self.0.cancel.cancel();
+                    }
                 }
             }
         }
@@ -121,6 +173,11 @@ impl Relay {
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(256);
         let cancel = self.0.cancel.child_token();
         let queued = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(StreamStats {
+            started: Instant::now(),
+            received_bytes: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+        });
         let id = {
             let mut streams = self.0.streams.lock().await;
             if self.0.cancel.is_cancelled() || streams.entries.len() >= 64 || streams.next_id > u32::MAX as u64 {
@@ -137,10 +194,16 @@ impl Relay {
                     incoming: incoming_tx,
                     queued: queued.clone(),
                     cancel: cancel.clone(),
+                    stats: stats.clone(),
                 },
             );
             id
         };
+        eprintln!(
+            "{} event=relay_stream_open_requested session={} stream={id} port={port}",
+            chrono::Utc::now().to_rfc3339(),
+            self.0.session_id
+        );
         let opened = async {
             self.send(Frame::json(2, id, id, &json!({ "port": port }))).await?;
             match result_rx.await {
@@ -148,13 +211,16 @@ impl Relay {
                 _ => bail!("Device refused stream"),
             }
         };
-        let result = tokio::select! {
+        let (result, failure_reason) = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(anyhow!("Relay closed")),
-            result = tokio::time::timeout(Duration::from_secs(20), opened) => result.map_err(|_| anyhow!("Stream open timeout")).and_then(|r| r),
+            _ = cancel.cancelled() => (Err(anyhow!("Relay closed")), "open_cancelled"),
+            result = tokio::time::timeout(Duration::from_secs(20), opened) => match result {
+                Ok(result) => (result, "open_send_or_result_failed"),
+                Err(_) => (Err(anyhow!("Stream open timeout")), "open_timeout"),
+            },
         };
         if let Err(error) = result {
-            self.retire(id, false).await;
+            self.retire(id, failure_reason).await;
             return Err(error);
         }
         let (local, remote) = tokio::io::duplex(STREAM_BUFFER);
@@ -179,30 +245,46 @@ impl Relay {
                 Ok(())
             }
             .await;
-            let _ = result;
-            inbound_relay.retire(id, false).await;
+            let reason = if inbound_cancel.is_cancelled() {
+                "stream_cancelled"
+            } else if result.is_err() {
+                "local_write_failed"
+            } else {
+                "incoming_queue_closed"
+            };
+            inbound_relay.retire(id, reason).await;
         });
         let outbound_relay = self.clone();
         tokio::spawn(async move {
+            let mut failure_reason = "local_read_failed";
             let result: Result<()> = async {
                 let mut buffer = vec![0; MAX_USB_DATA];
                 loop {
+                    failure_reason = "local_read_failed";
                     let length = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => break,
                         result = read.read(&mut buffer) => result?,
                     };
                     if length == 0 { break; }
+                    failure_reason = "outbound_send_failed";
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => break,
                         result = outbound_relay.send(Frame { kind: 4, request_id: 0, stream_id: id, payload: buffer[..length].to_vec() }) => result?,
                     }
+                    stats.sent_bytes.fetch_add(length as u64, Ordering::Relaxed);
                 }
                 Ok(())
             }.await;
-            let _ = result;
-            outbound_relay.retire(id, false).await;
+            let reason = if cancel.is_cancelled() {
+                "stream_cancelled"
+            } else if result.is_err() {
+                failure_reason
+            } else {
+                "local_eof"
+            };
+            outbound_relay.retire(id, reason).await;
         });
         Ok(local)
     }
@@ -225,11 +307,13 @@ impl Relay {
                 }
                 if ok {
                     entry.opened = true;
+                    entry.log(&self.0.session_id, frame.stream_id, "relay_stream_opened", "device_accepted");
                     if let Some(sender) = entry.result.take() {
                         let _ = sender.send(true);
                     }
                 } else {
                     let entry = streams.entries.remove(&frame.stream_id).expect("entry exists");
+                    entry.log(&self.0.session_id, frame.stream_id, "relay_stream_retired", "device_refused");
                     entry.cancel.cancel();
                     if let Some(sender) = entry.result {
                         let _ = sender.send(false);
@@ -269,7 +353,9 @@ impl Relay {
                     // A slow reader is local to this stream. Release the registry
                     // before retiring it so unrelated device channels keep running.
                     drop(streams);
-                    self.retire(frame.stream_id, false).await;
+                    self.retire(frame.stream_id, reason).await;
+                } else {
+                    entry.stats.received_bytes.fetch_add(length as u64, Ordering::Relaxed);
                 }
             }
             5 => {
@@ -277,6 +363,7 @@ impl Relay {
                     bail!("Invalid StreamClose");
                 }
                 if let Some(entry) = streams.entries.remove(&frame.stream_id) {
+                    entry.log(&self.0.session_id, frame.stream_id, "relay_stream_retired", "peer_close");
                     entry.cancel.cancel();
                 }
             }
@@ -287,7 +374,8 @@ impl Relay {
 
     pub async fn close(&self) {
         self.0.cancel.cancel();
-        for (_, entry) in self.0.streams.lock().await.entries.drain() {
+        for (id, entry) in self.0.streams.lock().await.entries.drain() {
+            entry.log(&self.0.session_id, id, "relay_stream_retired", "session_closed");
             entry.cancel.cancel();
         }
     }
@@ -296,6 +384,100 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn opened_stream(relay: &Relay, rx: &mut mpsc::Receiver<Frame>) -> (DuplexStream, u32) {
+        let opening = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.open(8100).await }
+        });
+        let frame = rx.recv().await.unwrap();
+        relay.handle(Frame::json(3, frame.stream_id, frame.stream_id, &json!({"ok":true}))).await.unwrap();
+        (opening.await.unwrap().unwrap(), frame.stream_id)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_queue_defers_close_while_other_stream_keeps_working() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let relay = Relay::new(tx.clone(), cancel.clone(), "fixture".into());
+        let (_closing, id) = opened_stream(&relay, &mut rx).await;
+        let (mut control, control_id) = opened_stream(&relay, &mut rx).await;
+        tx.send(Frame::json(9, 1, 0, &Value::Null)).await.unwrap();
+        relay.retire(id, "test_close").await;
+        tokio::task::yield_now().await;
+        assert!(!cancel.is_cancelled());
+        relay
+            .handle(Frame { kind: 4, request_id: 0, stream_id: control_id, payload: b"alive".to_vec() })
+            .await
+            .unwrap();
+        let mut word = [0; 5];
+        control.read_exact(&mut word).await.unwrap();
+        assert_eq!(&word, b"alive");
+        assert_eq!(rx.recv().await.unwrap().kind, 9);
+        let close = rx.recv().await.unwrap();
+        assert_eq!((close.kind, close.stream_id), (5, id));
+        assert!(!cancel.is_cancelled());
+        relay.retire(id, "duplicate_close").await;
+        assert!(rx.try_recv().is_err(), "close is delivered once");
+        relay.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_delivery_timeout_cancels_a_stalled_session() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let relay = Relay::new(tx.clone(), cancel.clone(), "fixture".into());
+        let (_stream, id) = opened_stream(&relay, &mut rx).await;
+        tx.send(Frame::json(9, 1, 0, &Value::Null)).await.unwrap();
+        relay.retire(id, "test_close").await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLOSE_DELIVERY_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(!cancel.is_cancelled());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_queue_cancels_immediate_and_deferred_closes() {
+        for deferred in [false, true] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            let relay = Relay::new(tx.clone(), cancel.clone(), "fixture".into());
+            let (_stream, id) = opened_stream(&relay, &mut rx).await;
+            if deferred {
+                tx.send(Frame::json(9, 1, 0, &Value::Null)).await.unwrap();
+                relay.retire(id, "test_close").await;
+                tokio::task::yield_now().await;
+            }
+            drop(rx);
+            if !deferred {
+                relay.retire(id, "test_close").await;
+            }
+            tokio::task::yield_now().await;
+            assert!(cancel.is_cancelled());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_cancel_releases_a_pending_close_sender() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let relay = Relay::new(tx.clone(), cancel.clone(), "fixture".into());
+        let (_stream, id) = opened_stream(&relay, &mut rx).await;
+        tx.send(Frame::json(9, 1, 0, &Value::Null)).await.unwrap();
+        relay.retire(id, "test_close").await;
+        tokio::task::yield_now().await;
+        assert_eq!(tx.strong_count(), 3);
+        relay.close().await;
+        // The two stream pumps and deferred close must all observe cancellation.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tx.strong_count(), 2);
+        assert_eq!(rx.recv().await.unwrap().kind, 9);
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn binary_frames_reject_flags_lengths_and_versions() {
