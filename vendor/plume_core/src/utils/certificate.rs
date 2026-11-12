@@ -447,11 +447,11 @@ mod tests {
         let der = rcgen::Certificate::from_params(params).unwrap().serialize_der().unwrap();
         plist::from_value(&plist::Value::Dictionary(
             [
-                ("name".into(), plist::Value::String("fixture".into())),
-                ("certificateId".into(), plist::Value::String("fixture".into())),
-                ("serialNumber".into(), plist::Value::String("123".into())),
-                ("status".into(), plist::Value::String(status.into())),
-                ("certContent".into(), plist::Value::Data(der)),
+                ("name".to_string(), plist::Value::String("fixture".into())),
+                ("certificateId".to_string(), plist::Value::String("fixture".into())),
+                ("serialNumber".to_string(), plist::Value::String("123".into())),
+                ("status".to_string(), plist::Value::String(status.into())),
+                ("certContent".to_string(), plist::Value::Data(der)),
             ]
             .into_iter()
             .collect(),
@@ -459,7 +459,7 @@ mod tests {
         .unwrap()
     }
     fn temporary() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("certificate-test-{}", uuid::Uuid::new_v4()));
+        let path = fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("certificate-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
     }
