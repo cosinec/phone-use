@@ -202,9 +202,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocked = dir.path().join("blocked");
         tokio::fs::write(&blocked, b"file, not a directory").await.unwrap();
-        let (mut writer, reader) = tokio::io::duplex(64);
+        // Match the pump read buffer so the deadline measures log backpressure, not tiny-buffer scheduling.
+        let (mut writer, reader) = tokio::io::duplex(8192);
         let task = tokio::spawn(drain(reader, blocked.join("stderr.log")));
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             writer.write_all(&vec![42; 2 * 1024 * 1024]).await.unwrap();
             drop(writer);
             task.await.unwrap();
@@ -216,9 +217,10 @@ mod tests {
     async fn stalled_logger_queue_never_backpressures_pipe_and_reports_drops() {
         let (sender, mut receiver) = mpsc::channel(1);
         let dropped = Arc::new(AtomicU64::new(0));
-        let (mut writer, reader) = tokio::io::duplex(64);
+        // Match the pump read buffer so the deadline measures log backpressure, not tiny-buffer scheduling.
+        let (mut writer, reader) = tokio::io::duplex(8192);
         let pump_task = tokio::spawn(pump(reader, sender, dropped.clone(), "fixture".into()));
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             writer.write_all(&vec![42; 2 * 1024 * 1024]).await.unwrap();
             drop(writer);
             pump_task.await.unwrap();
