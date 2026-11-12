@@ -384,7 +384,8 @@ async fn run(
             })
             .await?;
         let steps = snapshot["steps"].as_array().unwrap();
-        while history.len() > 8 || history.iter().map(|v| v.to_string().len()).sum::<usize>() > 24000 {
+        compact_history(&mut history);
+        while history.len() > 8 || history.iter().map(|v| v.to_string().len()).sum::<usize>() > HISTORY_CHARS {
             history.remove(0);
         }
         let thinking = Instant::now();
@@ -637,6 +638,25 @@ fn continue_after_element_miss(mode: crate::model::ObservationMode, misses: u32)
     mode == crate::model::ObservationMode::Ocr && misses <= MAX_OCR_ELEMENT_MISSES
 }
 
+/// Total history sent to the model. Input tokens drive time to first token, so
+/// only the newest result keeps its full text; older results keep a short summary.
+const HISTORY_CHARS: usize = 16000;
+const OLDER_RESULT_CHARS: usize = 1500;
+
+fn compact_history(history: &mut [Value]) {
+    let Some((_, older)) = history.split_last_mut() else { return };
+    for entry in older {
+        for key in ["text", "caption", "message"] {
+            if let Some(text) = entry["result"][key].as_str()
+                && text.chars().count() > OLDER_RESULT_CHARS
+            {
+                entry["result"][key] = json!(text.chars().take(OLDER_RESULT_CHARS).collect::<String>());
+                entry["result"]["truncated"] = json!(true);
+            }
+        }
+    }
+}
+
 fn inference_result(result: &Value) -> Value {
     let mut summary = json!({"kind":result["kind"]});
     for key in ["text", "caption", "message"] {
@@ -671,6 +691,23 @@ mod tests {
             vec!["at", "elapsed_ms", "event", "observation_id", "phase", "session_id", "stage", "status", "task_id"]
         );
         stage.finish("error");
+    }
+
+    #[test]
+    fn only_the_newest_history_result_keeps_its_full_text() {
+        let long = "x".repeat(5000);
+        let mut history = vec![
+            json!({"tool":"iphone_list_apps","result":{"kind":"text","text":long}}),
+            json!({"tool":"iphone_tap","result":{"kind":"text","text":"Tapped"}}),
+            json!({"tool":"iphone_list_elements","result":{"kind":"text","text":long}}),
+        ];
+        compact_history(&mut history);
+        assert_eq!(history[0]["result"]["text"].as_str().unwrap().len(), OLDER_RESULT_CHARS);
+        assert_eq!(history[0]["result"]["truncated"], true);
+        assert_eq!(history[1]["result"]["text"], "Tapped");
+        assert!(history[1]["result"].get("truncated").is_none());
+        assert_eq!(history[2]["result"]["text"].as_str().unwrap().len(), 5000);
+        compact_history(&mut []);
     }
 
     #[test]

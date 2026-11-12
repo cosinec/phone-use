@@ -38,9 +38,13 @@ where
 
 /// 锁屏后至少等这么久再自动解锁：锁屏过渡没走完就唤醒，WDA 第一下上滑卡约 16 秒后报 `point.x != INFINITY`
 pub(crate) const LOCK_SETTLE: Duration = Duration::from_secs(3);
-/// 确认没锁屏之后这么久内不再检查。自动锁屏至少要空闲 30 秒，任务里每一步都有点击、滑动；
-/// 经本进程锁屏会立刻清掉。一步里「观察」和「动作」之间通常只隔一次模型调用，第二次检查可省掉
-pub(crate) const UNLOCK_REUSE: Duration = Duration::from_secs(5);
+/// 确认没锁屏（或之后又成功触摸过）这么久内不再检查。iOS 自动锁屏最短要空闲 30 秒，触摸会重置计时；
+/// 经本进程锁屏会立刻清掉。手动按电源键锁屏最多晚这么久才发现：那时的操作落在锁屏上，下一步观察即可看到
+pub(crate) const UNLOCK_REUSE: Duration = Duration::from_secs(20);
+/// 滑动停稳后的元素树给紧接着的观察复用的时限
+pub(crate) const SETTLED_TREE_REUSE: Duration = Duration::from_secs(2);
+/// 滑动手势结束后先等这么久再开始比较元素树：短滑动多半已经停了，少拉一两次 `/source`（每次约 35KB 上行）
+const SCROLL_FIRST_POLL: Duration = Duration::from_millis(300);
 /// 元素少于这么多个就按画面判断是否稳定（游戏只有几个状态栏元素；普通 App 页面通常几十个）
 const VISUAL_SETTLE_BELOW: usize = 12;
 /// 两帧缩略图平均逐像素差低于这个值算静止（0～255）。游戏背景的轻微摆动约 1～2，消除动画几十
@@ -391,7 +395,14 @@ impl Daemon {
         });
         let reading = Instant::now();
         if limit > 0 && !budget.is_zero() {
+            // 刚滑动停稳时读到的树就是当前界面：直接用，省一次 `/source`
+            let settled = g.settled_tree.take().filter(|(at, _)| at.elapsed() < SETTLED_TREE_REUSE);
             let read = async {
+                if let Some((_, tree)) = settled {
+                    let text = tree.elements.iter().take(limit).map(|e| e.describe()).collect::<Vec<_>>().join("\n");
+                    g.elements_cache = Some((Instant::now(), tree));
+                    return Ok::<_, String>(text);
+                }
                 let wda = self.require_wda(g)?;
                 let view = match view {
                     Some(view) => view,
@@ -703,7 +714,9 @@ impl Daemon {
                 // 列表还在滚时下一次点击只会让它停住，点不到东西
                 Ok(()) => {
                     let vertical = (to.1 - from.1).abs() >= (to.0 - from.0).abs();
-                    return Ok(ictl_l10n::trf!("已滑动 {desc}{}", "Swiped {desc}{}", wait_scrolled(w, vertical).await));
+                    let (note, settled) = wait_scrolled(w, vertical).await;
+                    g.settled_tree = settled.map(|tree| (Instant::now(), tree));
+                    return Ok(ictl_l10n::trf!("已滑动 {desc}{}", "Swiped {desc}{}", note));
                 }
                 Err(WdaError::Unavailable(_)) => {}
                 Err(e) => return Err(e.to_string()),
@@ -1023,35 +1036,46 @@ fn middle_is_empty(tree: &Tree, screen_h: f64) -> bool {
 
 /// 滑动后等列表停下（最多 [`SCROLL_SETTLE`]）：沿滑动方向的位置连续两次差不超过 [`STILL_TOLERANCE`]。
 /// 没停下返回提醒；元素很少（游戏、地图）看不出来，不等
-async fn wait_scrolled(w: &mut WdaClient<DeviceTransport>, vertical: bool) -> String {
+/// 返回结果说明，以及停稳时的元素树（没停稳或读失败时为 None）
+async fn wait_scrolled(
+    w: &mut WdaClient<DeviceTransport>,
+    vertical: bool,
+) -> (String, Option<ictl_wda::elements::Tree>) {
     if w.begin_polling().await.is_err() {
-        return String::new();
+        return (String::new(), None);
     }
     let t0 = Instant::now();
-    let r: Result<bool, WdaError> = async {
-        let mut prev = w.tree().await?;
+    let r: Result<(bool, Option<ictl_wda::elements::Tree>), WdaError> = async {
+        // 一次滑动里方向不会变：只问一次，之后每次轮询只拉元素树
+        let view = w.view().await?;
+        tokio::time::sleep(SCROLL_FIRST_POLL).await;
+        let mut prev = w.tree_in_view(view).await?;
         if prev.elements.len() < VISUAL_SETTLE_BELOW {
-            return Ok(true);
+            return Ok((true, None));
         }
         while t0.elapsed() < SCROLL_SETTLE {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            let cur = w.tree().await?;
+            let cur = w.tree_in_view(view).await?;
             if cur.still_along(&prev, vertical, STILL_TOLERANCE) {
-                return Ok(true);
+                return Ok((true, Some(cur)));
             }
             prev = cur;
         }
-        Ok(false)
+        Ok((false, None))
     }
     .await;
     w.end_polling().await;
     match r {
-        Ok(false) => ictl_l10n::trf!(
-            "({:.1} 秒后列表还在动,可能还在滚动)",
-            " (the list was still moving after {:.1} s, it may still be scrolling)",
-            SCROLL_SETTLE.as_secs_f64()
+        Ok((false, _)) => (
+            ictl_l10n::trf!(
+                "({:.1} 秒后列表还在动,可能还在滚动)",
+                " (the list was still moving after {:.1} s, it may still be scrolling)",
+                SCROLL_SETTLE.as_secs_f64()
+            ),
+            None,
         ),
-        _ => String::new(),
+        Ok((true, settled)) => (String::new(), settled),
+        Err(_) => (String::new(), None),
     }
 }
 

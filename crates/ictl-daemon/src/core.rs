@@ -228,6 +228,9 @@ pub(crate) struct Inner {
     /// 最近一次确认手机没锁屏的时间。[`crate::tools::UNLOCK_REUSE`] 内的下一个操作不再问 `/wda/locked`
     /// （每次是一个经浏览器转发的往返）；锁屏、换设备、检查出错都会清掉
     pub unlocked_at: Option<Instant>,
+    /// 滑动后等到的、已经停稳的元素树。只给紧接着的一次观察用（[`crate::tools::SETTLED_TREE_REUSE`] 内），
+    /// 省一次 `/source`；其它操作开始前就清掉
+    pub settled_tree: Option<(Instant, ictl_wda::elements::Tree)>,
     /// HID 会话最近一次使用的时间；空闲超过 [`crate::supervise::HID_IDLE`] 就关掉（它持有屏幕媒体流）
     pub hid_used: Option<Instant>,
     /// 最近一次读到的元素树。只在调用方允许（max_age_ms）时复用；改变界面的操作做完就清掉
@@ -336,6 +339,7 @@ impl Daemon {
             offline_since: Some(now),
             last_lock: None,
             unlocked_at: None,
+            settled_tree: None,
             hid_used: None,
             elements_cache: None,
             dedup: Dedup::default(),
@@ -468,6 +472,8 @@ impl Daemon {
         }
         g.wda = None;
         g.elements_cache = None;
+        g.settled_tree = None;
+        g.unlocked_at = None;
         drop_tunnel(g).await;
         g.wda_misses.reset();
     }
@@ -612,6 +618,9 @@ impl Daemon {
         // 改变界面的操作做完后缓存的元素树就作废；只有调用方声明「不改变布局」的按名字点击（max_age_ms > 0）保留
         let keeps_cache = matches!(req, Request::TapElement { max_age_ms, .. } if max_age_ms > 0);
         let invalidates = req.is_device_action() && !keeps_cache;
+        if !matches!(req, Request::Observe { .. }) {
+            g.settled_tree = None;
+        }
         // what the text reports, for clients that act on it (Response::Text.outcome)
         let mut outcome = crate::protocol::Outcome::default();
         let r = match req {
@@ -678,6 +687,10 @@ impl Daemon {
         };
         if invalidates {
             g.elements_cache = None;
+            // 触摸成功会重置手机的自动锁屏计时，确认过的「没锁」顺延；经本进程锁屏时这里已是 None
+            if r.is_ok() && g.unlocked_at.is_some() {
+                g.unlocked_at = Some(Instant::now());
+            }
         }
         self.publish(g);
         r.map(|t| Response::text_with(t, outcome)).unwrap_or_else(Response::error)

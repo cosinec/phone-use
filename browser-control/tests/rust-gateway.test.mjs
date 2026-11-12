@@ -31,7 +31,7 @@ async function harness(t, env = {}, fileEnv = {}) {
   const child = spawn(binary, [], { cwd: dir, env: { ...process.env, HOST: '127.0.0.1', PORT: '0', CONTROL_ACCESS_TOKEN: token,
     ALLOWED_ORIGINS: origin, RUNTIME_DIR: path.join(dir, 'runtime'), ICTL_BIN: native,
     WEB_DIST_DIR: fileURLToPath(new URL('../dist', import.meta.url)), LLM_BASE_URL: '', LLM_MODEL: '', LLM_API_KEY: '',
-    OCR_PYTHON: process.execPath, OCR_WORKER: fileURLToPath(new URL('./fixtures/ocr-worker.mjs', import.meta.url)), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    AI_OBSERVATION: 'ocr', OCR_PYTHON: process.execPath, OCR_WORKER: fileURLToPath(new URL('./fixtures/ocr-worker.mjs', import.meta.url)), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '', errors = '', startupError;
   child.on('error', error => { startupError = error; });
   child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { errors += chunk; });
@@ -347,7 +347,10 @@ contract('model reply corrects missing and non-text tools with the same schema b
       assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
       assert.equal(fixture.requests.length, 2);
       assert.deepEqual(fixture.requests[1].response_format, fixture.requests[0].response_format);
-      assert.match(fixture.requests[1].messages.at(-1).content, /iphone_screenshot/);
+      // The correction must not suggest a concrete tool that the model might copy.
+      const correction = fixture.requests[1].messages.at(-1).content;
+      assert.match(correction, /string tool name from the catalog/);
+      assert.doesNotMatch(correction, /iphone_/);
       assert.equal(state.task.steps.length, 0);
     });
   }
@@ -1248,4 +1251,17 @@ contract('OCR failure stops the task before the model receives any request', asy
   assert.equal(state.task.state, 'failed', JSON.stringify(state.task));
   assert.match(state.task.error, /OCR/i);
   assert.equal(fixture.requests.length, 0);
+});
+
+contract('default image planning sends a screenshot without starting OCR', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'done', message: 'Image verified' })), {
+    AI_OBSERVATION: '', FIXTURE_OCR_ERROR: '1',
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(fixture.requests.length, 1);
+  const content = fixture.requests[0].messages[1].content;
+  assert.equal(content.filter(part => part.type === 'image_url').length, 1);
+  assert.equal(JSON.parse(content[0].text).observation.ocr, undefined);
 });

@@ -498,7 +498,8 @@ fn decode_logged_reply(choice: &Value, attempt: u8, observation_id: &str) -> Res
         "event=model_protocol metrics={}",
         json!({"observation_id":observation_id,"attempt":attempt,"decode_category":category,
             "reply_chars":decoded.reply_chars,"json_error":decoded.json_error,
-            "trailing_kind":decoded.trailing_kind,"trailing_bytes":decoded.trailing_bytes})
+            "trailing_kind":decoded.trailing_kind,"trailing_bytes":decoded.trailing_bytes,
+            "leading":decoded.leading,"fenced":decoded.fenced,"repair":decoded.repair})
     );
     result
 }
@@ -563,6 +564,86 @@ struct DecodeDiagnostics {
     json_error: Option<&'static str>,
     trailing_kind: Option<&'static str>,
     trailing_bytes: usize,
+    /// Content-free shape of the reply: what it starts with and whether it has a code fence.
+    leading: Option<&'static str>,
+    fenced: bool,
+    /// Which tolerant repair produced the accepted object, if any.
+    repair: Option<&'static str>,
+}
+
+fn leading_class(text: &str) -> &'static str {
+    match text.chars().next() {
+        None => "empty",
+        Some('{') => "object",
+        Some('[') => "array",
+        Some('`') => "fence",
+        Some('<') => "tag",
+        Some(c) if c.is_alphabetic() => "text",
+        Some(_) => "other",
+    }
+}
+
+/// The first fenced block's body, tolerating prose around it and a missing language tag.
+fn fenced_block(text: &str) -> Option<&str> {
+    let start = text.find("```")? + 3;
+    let body = &text[start..];
+    let body = body.split_once('\n').map_or(body, |(language, rest)| {
+        if language.trim().is_empty() || language.trim().eq_ignore_ascii_case("json") { rest } else { body }
+    });
+    Some(body.split("```").next().unwrap_or(body).trim())
+}
+
+/// Escapes raw control characters inside JSON string literals (models sometimes
+/// write a literal newline in `reason`). Text outside strings is unchanged.
+fn escape_string_controls(json: &str) -> Option<String> {
+    let mut out = String::with_capacity(json.len() + 8);
+    let (mut in_string, mut escaped, mut changed) = (false, false, false);
+    for c in json.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            } else if c.is_control() {
+                changed = true;
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ => out.push_str(&format!("\\u{:04x}", c as u32)),
+                }
+                continue;
+            }
+        } else if c == '"' {
+            in_string = true;
+        }
+        out.push(c);
+    }
+    changed.then_some(out)
+}
+
+/// Candidate JSON texts in order of preference, each labelled with its repair.
+fn json_candidates(text: &str) -> Vec<(&'static str, String)> {
+    let mut candidates = vec![("none", text.to_owned())];
+    if let Some(block) = fenced_block(text)
+        && block != text
+    {
+        candidates.push(("fence", block.to_owned()));
+    }
+    if let Some(start) = text.find('{')
+        && start > 0
+    {
+        candidates.push(("prefix", text[start..].to_owned()));
+    }
+    let escaped: Vec<_> = candidates
+        .iter()
+        .filter_map(|(repair, json)| escape_string_controls(json).map(|json| (*repair, json)))
+        .map(|(repair, json)| (if repair == "none" { "controls" } else { "controls+" }, json))
+        .collect();
+    candidates.extend(escaped);
+    candidates
 }
 
 #[cfg(test)]
@@ -610,17 +691,28 @@ fn decode_reply_with(choice: &Value, diagnostics: &mut DecodeDiagnostics) -> Res
     let text = reply_text(choice)?;
     diagnostics.reply_chars = Some(text.chars().count());
     let text = text.trim().trim_start_matches('\u{feff}').trim();
-    let json = if text.starts_with("```") && text.ends_with("```") && text.len() >= 6 {
-        let (language, json) =
-            text[3..text.len() - 3].split_once('\n').ok_or_else(|| invalid_reply("incomplete JSON code fence"))?;
-        if !language.trim().is_empty() && !language.trim().eq_ignore_ascii_case("json") {
-            return Err(invalid_reply("code fence must contain JSON"));
+    diagnostics.leading = Some(leading_class(text));
+    diagnostics.fenced = text.contains("```");
+    // Try the reply as-is first, then tolerant repairs. The first candidate that
+    // parses AND validates wins; otherwise report the original reply's error.
+    let mut first_error = None;
+    for (repair, json) in json_candidates(text) {
+        let mut attempt = DecodeDiagnostics::default();
+        match first_json_value(json.trim(), &mut attempt).and_then(validate_reply) {
+            Ok(action) => {
+                diagnostics.trailing_kind = attempt.trailing_kind;
+                diagnostics.trailing_bytes = attempt.trailing_bytes;
+                diagnostics.repair = Some(repair);
+                return Ok(action);
+            }
+            Err(error) if first_error.is_none() => {
+                diagnostics.json_error = attempt.json_error;
+                first_error = Some(error);
+            }
+            Err(_) => {}
         }
-        json.trim()
-    } else {
-        text
-    };
-    validate_reply(first_json_value(json, diagnostics)?)
+    }
+    Err(first_error.unwrap_or_else(|| invalid_reply("invalid JSON: empty reply")))
 }
 
 pub fn validate_reply(mut value: Value) -> Result<Value> {
@@ -991,6 +1083,46 @@ for line in sys.stdin:
             r#"{{"type":"action","tool":"unknown","args":{{}},"reason":"x","requiresConfirmation":false}}{second}"#
         );
         assert!(decode_reply(&reply(&invalid_first)).is_err());
+    }
+
+    #[test]
+    fn tolerant_repairs_accept_prose_fences_and_raw_newlines_but_not_invalid_actions() {
+        let action = r#"{"type":"action","tool":"iphone_tap","args":{"x":10,"y":20},"reason":"Open","requiresConfirmation":false}"#;
+        let newline = "{\"type\":\"action\",\"tool\":\"iphone_tap\",\"args\":{\"x\":10,\"y\":20},\"reason\":\"Open\nthe list\",\"requiresConfirmation\":false}";
+        for (content, repair, leading) in [
+            (action.to_owned(), "none", "object"),
+            (format!("Sure, here is the next action:\n{action}"), "prefix", "text"),
+            (format!("```json\n{action}\n```\nThis opens the list."), "fence", "fence"),
+            (format!("```\n{action}\n```"), "fence", "fence"),
+            (newline.to_owned(), "controls", "object"),
+            (format!("Next:\n{newline}"), "controls+", "text"),
+        ] {
+            let mut diagnostics = DecodeDiagnostics::default();
+            let decoded =
+                decode_reply_with(&reply(&content), &mut diagnostics).unwrap_or_else(|e| panic!("{content}: {e}"));
+            assert_eq!(decoded["tool"], "iphone_tap", "{content}");
+            assert_eq!(diagnostics.repair, Some(repair), "{content}");
+            assert_eq!(diagnostics.leading, Some(leading), "{content}");
+        }
+        // Repairs never turn invalid content into an action.
+        for content in [
+            "{type:action}".to_owned(),
+            format!("```python\n{action}\n```"),
+            r#"Here: {"type":"action","tool":"unknown","args":{},"reason":"x"}"#.to_owned(),
+            "No JSON here".to_owned(),
+        ] {
+            let mut diagnostics = DecodeDiagnostics::default();
+            if content.starts_with("```python") {
+                // The python fence is skipped as a fence, but the JSON object after it still parses as a prefix repair.
+                assert_eq!(decode_reply_with(&reply(&content), &mut diagnostics).unwrap()["tool"], "iphone_tap");
+                assert_eq!(diagnostics.repair, Some("prefix"));
+                continue;
+            }
+            assert!(decode_reply_with(&reply(&content), &mut diagnostics).is_err(), "{content}");
+            assert!(diagnostics.repair.is_none());
+        }
+        assert_eq!(escape_string_controls("{\"a\":\"x\\\"\ny\"}").unwrap(), "{\"a\":\"x\\\"\\ny\"}");
+        assert!(escape_string_controls("{\n\"a\": 1\n}").is_none(), "whitespace outside strings is valid JSON");
     }
 
     #[test]

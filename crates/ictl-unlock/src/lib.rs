@@ -117,7 +117,7 @@ pub async fn ensure_unlocked<T: Transport>(wda: &mut WdaClient<T>, cfg: &UnlockC
     // 核对也拿不准（锁屏样式的界面，WDA 说没锁）时：能自动解锁就进解锁流程，理由同上；不能就按没锁处理
     if !(reported && code.is_ok()) {
         match wda.check_lock(Some(reported), false).await {
-            Ok(c) if !c.locked && !(c.uncertain && code.is_ok()) => return Ok(Outcome::NotLocked),
+            Ok(c) if !(c.locked || c.uncertain && code.is_ok()) => return Ok(Outcome::NotLocked),
             Ok(_) => {}
             Err(WdaError::Unavailable(_)) => return Ok(Outcome::NotLocked),
             Err(e) => return Err(e.into()),

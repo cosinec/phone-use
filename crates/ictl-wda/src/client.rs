@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// MJPEG 抓帧的缩放比例。整屏最终缩到「点」尺寸（约原始像素的 1/3）给模型看，40% 仍比点尺寸略大，
+/// 不损失画质；每帧经浏览器上行的字节比 50% 少约 36%
+const MJPEG_SCALING_PERCENT: u32 = 40;
 /// 同一操作内（滑动后轮询元素树、输入后核对等）复用刚问到的方向
 const ORIENTATION_REUSE: Duration = Duration::from_millis(1500);
 /// 截图横竖和缓存一致时，方向最多复用这么久（任务里一步约 6–9 秒，相邻两步可复用）
@@ -217,7 +220,7 @@ impl<T: Transport> WdaClient<T> {
         self.session = Some(id.clone());
         if self.low_latency {
             let settings = json!({"settings":{"screenshotQuality":1,"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.0,
-                    "mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40}});
+                    "mjpegServerFramerate":3,"mjpegScalingFactor":MJPEG_SCALING_PERCENT,"mjpegServerScreenshotQuality":40}});
             match self.call("POST", &format!("/session/{id}/appium/settings"), Some(settings), DEFAULT_TIMEOUT).await {
                 Ok(value)
                     if value["value"]["screenshotQuality"].as_f64() == Some(1.0)
@@ -881,7 +884,7 @@ mod tests {
         let profile: Value = serde_json::from_str(seen[1].2.as_deref().unwrap()).unwrap();
         assert_eq!(profile["settings"]["screenshotQuality"], 1);
         assert_eq!(profile["settings"]["mjpegServerFramerate"], 3);
-        assert_eq!(profile["settings"]["mjpegScalingFactor"], 50);
+        assert_eq!(profile["settings"]["mjpegScalingFactor"], MJPEG_SCALING_PERCENT);
         assert_eq!(profile["settings"]["mjpegServerScreenshotQuality"], 40);
     }
 
