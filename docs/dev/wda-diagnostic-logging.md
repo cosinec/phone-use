@@ -206,3 +206,28 @@ runner 的 stop_reason 取固定类别：startup_timeout、startup_cancellation�
 - 用合成延迟或受控断链核对 unknown、monitoring=false 和 socket 释放；不要为验证 false 而杀掉正在使用的手机进程。
 - runner 再次建立后，确认健康记录和最后 PID 观测对应新的 runner_id；容器重建后确认 native_start_id 已改变。
 - 查询不被支持时，记录 setup/channel/request 固定分类并保留未知状态。合成测试通过只能证明分类、并发和取消行为；真机支持性、实际崩溃原因和长时间稳定性须单独验收。
+
+## 采图、动作时限与任务控制边界（2026-11-12）
+
+网关为原生进程强制设置 `ICTL_CAPTURE_POLICY=bounded-remote`，即使 `ICTL_LOW_LATENCY=0` 也生效。采图策略与手势等待时间分开配置。远程采图只读现有的单帧 MJPEG，继续使用 8 秒、2 MiB 上限；读取失败保留原始错误，不转到 WDA `/screenshot` PNG 或 CoreDevice PNG。CoreDevice 的共享截图入口也检查策略，因此 HID 触摸前用于核对方向的隐式截图同样会被拒绝。WDA 解锁检查、稳定性检查等内部采图使用同一策略。未设置此策略的本地原生进程继续保留原有截图和后备路径。
+
+需要控制权的操作共用 `Request::requires_control` 分类。除点击、启动 App 等明确动作外，截图、观察、列元素和等待元素也可能自动解锁，因此也要申请控制权并受动作时限保护。状态、应用列表和设备列表仍可读取；任务期间的预览返回缓存，不向手机发请求。
+
+30 秒从网关首次收到控制请求开始计算，包含 HTTP 正文读取、网关队列、就绪等待、IPC 传递和原生设备锁等待。任务内部命令在自己的入口建立时限，确认等待不算作某个尚未发起命令的排队时间。网关把原始截止时间以内部字段 `action_deadline_monotonic_ns` 传给原生进程；重试和重复 requestId 不重建已排队命令，也不更新其截止时间。检查发生在网关出队和就绪等待后、IPC 写入前、原生设备锁取得后；重签的独立持锁路径也检查。过期操作尚未派发时直接拒绝，已经发送的动作仍保留原来的结果不确定语义，不因过期而重放或撤回。
+
+字段必须是无符号整数，null、字符串、小数、负数和超过本地 30 秒上限的未来值都会被拒绝。单调时钟读取或转换失败也不放行。老客户端不带字段时，原生进程继续检查自己的 30 秒排队时限。
+
+**网关与原生进程需要一起升级。** 内部截止时间依赖两者在同一宿主机或容器上读取同一个 `CLOCK_MONOTONIC`；它不是跨主机协议，不受系统时间调整影响。现有镜像一起打包网关与原生程序。本次不增加混合版本协商；只升级网关而保留旧原生程序，不能保证 IPC 后的总时限。
+
+任务持有会话内部的类型化控制权，覆盖观察、模型调用、恢复和人工确认。新的手动控制命令在入队前返回 409；请求里的 taskId 等字段不能赋予控制权。已接受的手动命令也持有许可，直到对应作业结束或被丢弃，因此新任务不能越过排队中的手动命令。任务停止、失败或结束后，仍在排队或收尾的任务作业保留许可，取消的作业不会再派发；最后一个作业释放后才允许新任务或手动操作。停止任务不能撤回已经发送的动作。
+
+HTTP setup、setup input 和没有配对记录时触发 setup 的 WebSocket StartPairing 也申请手动许可。setup 子进程等待输入期间继续持有许可，任务不能抢先启动。已有配对记录的读取仍可使用。WebSocket 控制权拒绝返回固定 Error 帧，并保留会话和任务；setup 失败也返回有界错误，不输出错误正文。没有把普通“正在忙”拒绝当作协议错误来断开连接。
+
+| 事件 | 字段和含义 |
+| --- | --- |
+| `capture_rejected` | 固定 category：`remote_fallback_forbidden`、`coredevice_png_forbidden`、`mjpeg_failed`、`mjpeg_unsupported` |
+| `action_rejected` | 固定 category：`expired` 或 `invalid_metadata`；stage 标明网关队列、就绪等待、IPC 写入或原生设备锁；记录预算、当前层排队年龄及已有 diagnostic_id，不含命令参数 |
+| `control_rejected` | 固定 category：`control_busy` 或 `setup_unavailable`；记录 session、namespace 和拒绝阶段，不含任务指令、setup 输入或模型内容 |
+| `control_response_dropped` | 固定 category：`relay_unavailable`；表示有界 Error 帧没能进入 relay 队列 |
+
+这些回归验证使用合成 WDA、IPC 和真实网关 HTTP/WebSocket 测试夹具，没有操作真机或 VPS。它们证明拒绝、排队和许可释放路径，不证明真机长期稳定性。当前手机最后观察到的系统是 iOS 26.5.2，`cpu_resource_fatal` 是否导致历史中断仍未证实。PR 42 的视频重写只作范围参考，本次保留按需单帧采图和原有 `image=0.25.10`，没有合入新视频栈。

@@ -35,7 +35,7 @@ use ictl_wda::diagnostics::StopReason;
 
 pub const TICK: Duration = Duration::from_secs(10);
 /// 改变手机状态的请求排队超过这么久就放弃
-pub const STALE: Duration = Duration::from_secs(30);
+pub const STALE: Duration = ictl_protocol::ACTION_LIFETIME;
 /// 长按、滑动的时长上限（秒）：HID 拖动按时长换算采样点，不设上限一个请求就能占住设备很久
 pub const MAX_GESTURE_SECONDS: f64 = 10.0;
 /// 等界面稳定、等元素出现的上限（毫秒）：持着设备锁等，不能太久
@@ -131,6 +131,28 @@ pub fn wda_profile_expiry(profiles: &[Vec<u8>], team: Option<&str>, bundle: &str
         .max()
 }
 
+pub(crate) fn check_action_admission(
+    queued_at: Instant,
+    deadline: Option<ictl_protocol::ActionDeadline>,
+    stage: &'static str,
+) -> Result<(), String> {
+    if queued_at.elapsed() >= STALE || deadline.is_some_and(|d| d.expired().unwrap_or(true)) {
+        tracing::warn!(
+            event = "action_rejected",
+            category = "expired",
+            stage,
+            queue_age_ms = queued_at.elapsed().as_millis() as u64,
+            budget_ms = STALE.as_millis() as u64
+        );
+        return Err(ictl_l10n::trf!(
+            "操作已过期：从首次接收起总等待超过 {} 秒，未发送到手机；先截图看看再发起新操作",
+            "Action expired: the total admission lifetime exceeds {} seconds; the request was dropped before dispatch. Take a screenshot before a new action",
+            STALE.as_secs()
+        ));
+    }
+    Ok(())
+}
+
 /// 一次请求的附带条件（来自请求里的 [`ictl_protocol::CANCEL_ON_CLOSE`]、[`ictl_protocol::EXPECT_UDID`]）
 #[derive(Default)]
 pub struct CallCtx {
@@ -140,6 +162,7 @@ pub struct CallCtx {
     /// 正在控制的不是这台就不执行
     pub expect_udid: Option<String>,
     pub diagnostic_id: Option<u64>,
+    pub action_deadline: Option<ictl_protocol::ActionDeadline>,
 }
 
 /// 快照：`iphone-control status` 显示
@@ -540,7 +563,11 @@ impl Daemon {
             }
             // 重签自己分段持锁：签名、安装要几十秒，期间不挡住别的请求
             Request::Resign { force } => {
-                return self.resign_now(force).await.map(Response::text).unwrap_or_else(Response::error);
+                return self
+                    .resign_now(force, Some((queued_at, ctx.action_deadline)))
+                    .await
+                    .map(Response::text)
+                    .unwrap_or_else(Response::error);
             }
             _ => {}
         }
@@ -573,12 +600,10 @@ impl Daemon {
                 ));
             }
         }
-        if req.is_device_action() && queued_at.elapsed() > STALE {
-            return Response::error(ictl_l10n::trf!(
-                "守护进程正忙,这个操作排队超过 {} 秒,已放弃执行(以免落到已经变化的屏幕上);先截图看看再重试",
-                "The daemon is busy and this action waited in the queue for more than {} seconds, so it was dropped (it could have landed on a changed screen); take a screenshot and try again",
-                STALE.as_secs()
-            ));
+        if req.requires_control()
+            && let Err(error) = check_action_admission(queued_at, ctx.action_deadline, "daemon_lock")
+        {
+            return Response::error(error);
         }
         // 改变界面的操作做完后缓存的元素树就作废；只有调用方声明「不改变布局」的按名字点击（max_age_ms > 0）保留
         let keeps_cache = matches!(req, Request::TapElement { max_age_ms, .. } if max_age_ms > 0);
@@ -746,9 +771,7 @@ mod tests {
         let busy = d.inner.lock().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(()).unwrap();
-        let r = d
-            .handle(Request::Status, Instant::now(), CallCtx { gone: Some(rx), expect_udid: None, diagnostic_id: None })
-            .await;
+        let r = d.handle(Request::Status, Instant::now(), CallCtx { gone: Some(rx), ..CallCtx::default() }).await;
         drop(busy);
         assert!(matches!(&r, Response::Error { message } if message.contains("已取消")), "{r:?}");
         std::fs::remove_dir_all(dir).unwrap();
@@ -758,9 +781,82 @@ mod tests {
     #[tokio::test]
     async fn request_for_another_device_is_refused() {
         let (d, dir) = test_daemon("expect");
-        let ctx = CallCtx { gone: None, expect_udid: Some("00008130-AAAA".into()), diagnostic_id: None };
+        let ctx = CallCtx { expect_udid: Some("00008130-AAAA".into()), ..CallCtx::default() };
         let r = d.handle(Request::Status, Instant::now(), ctx).await;
         assert!(matches!(&r, Response::Error { message } if message.contains("设备变了")), "{r:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_deadline_is_rechecked_after_daemon_lock_without_local_renewal() {
+        let (d, dir) = test_daemon("expired-upstream");
+        let deadline =
+            ictl_protocol::ActionDeadline::parse(serde_json::json!(ictl_protocol::monotonic_ns().unwrap() - 1))
+                .unwrap();
+        let busy = d.inner.lock().await;
+        let operation = d.handle(
+            Request::Tap { x: 1.0, y: 2.0 },
+            Instant::now(),
+            CallCtx { action_deadline: Some(deadline), ..CallCtx::default() },
+        );
+        tokio::pin!(operation);
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut operation).await.is_err());
+        drop(busy);
+        let response = operation.await;
+        assert!(
+            matches!(&response, Response::Error { message } if message.contains("expired") || message.contains("已过期")),
+            "{response:?}"
+        );
+        let fresh = d
+            .handle(
+                Request::Tap { x: 1.0, y: 2.0 },
+                Instant::now(),
+                CallCtx {
+                    action_deadline: Some(ictl_protocol::ActionDeadline::admit().unwrap()),
+                    ..CallCtx::default()
+                },
+            )
+            .await;
+        assert!(matches!(&fresh, Response::Error { message } if !message.contains("expired")), "{fresh:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_resign_is_rejected_before_its_separate_lock_path() {
+        let (d, dir) = test_daemon("expired-resign");
+        let deadline =
+            ictl_protocol::ActionDeadline::parse(serde_json::json!(ictl_protocol::monotonic_ns().unwrap() - 1))
+                .unwrap();
+        let response = d
+            .handle(
+                Request::Resign { force: false },
+                Instant::now(),
+                CallCtx { action_deadline: Some(deadline), ..CallCtx::default() },
+            )
+            .await;
+        assert!(matches!(response, Response::Error { message } if message.contains("已过期")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn split_gateway_and_daemon_waits_share_one_budget_and_old_clients_keep_local_guard() {
+        let (d, dir) = test_daemon("split-expiry");
+        // 19s before IPC plus 12s in the native queue; neither queue alone exceeds 30s.
+        let deadline =
+            ictl_protocol::ActionDeadline::admit_at(ictl_protocol::monotonic_ns().unwrap() - 31_000_000_000).unwrap();
+        let queued_at = Instant::now() - Duration::from_secs(12);
+        let split = d
+            .handle(
+                Request::Tap { x: 1.0, y: 2.0 },
+                queued_at,
+                CallCtx { action_deadline: Some(deadline), ..CallCtx::default() },
+            )
+            .await;
+        assert!(matches!(split, Response::Error { message } if message.contains("已过期")));
+        let old = d
+            .handle(Request::Tap { x: 1.0, y: 2.0 }, Instant::now() - Duration::from_secs(31), CallCtx::default())
+            .await;
+        assert!(matches!(old, Response::Error { message } if message.contains("已过期")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

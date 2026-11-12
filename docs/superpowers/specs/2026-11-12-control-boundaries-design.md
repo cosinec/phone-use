@@ -25,3 +25,13 @@ Use the real gateway fixture with a delayed model response and an awaiting-confi
 ## Upstream PR 42
 
 Reviewed https://github.com/Derrors/iphone-control/pull/42 (merged head `4b865e5864216e4527269e2ccb09d1e6c73fa72c`). Its key change is device HEVC on iOS 27+, with host H.264/MJPEG alternatives; it does not update our pinned Rust `image` dependency. The reported `cpu_resource_fatal` incident is a hypothesis to verify against this phone's crash reports, not a diagnosis of our socket failures. The last observed phone runs iOS 26.5.2. Host encoding on the VPS would happen after JPEG crosses our browser-to-VPS link, so it cannot cure that uplink load. Keep on-demand bounded capture; do not import the new video stack in this change.
+
+## Implemented contract and compatibility
+
+The gateway forces `ICTL_CAPTURE_POLICY=bounded-remote` for its native process even when low-latency timing is disabled. The WDA client carries capture policy through hidden unlock/settle reads, and the daemon shared CoreDevice entry rejects orientation PNG too. Local native processes keep their fallback.
+
+`Request::requires_control` supplies canonical admission classification, including auto-unlocking screenshot/observe/list-elements/wait-for reads. HTTP control ingress is stamped before body collection or session readiness; task commands stamp their internal entry. The original same-host CLOCK_MONOTONIC nanoseconds survive cached request IDs and IPC, with checks after each queue/readiness boundary and the daemon lock. The separate native resign lock path also checks expiry. Invalid metadata or clock failure fails closed; deadlines more than 30 seconds ahead are rejected. Gateway/native need a paired upgrade and a shared host/container monotonic clock. The packaged image already bundles both; mixed-version negotiation is outside this change.
+
+An atomic session arbiter holds manual permits with queued jobs and typed task leases with the task runner and its jobs. Cancelled task jobs keep the ownership generation until they are dropped, while their cancelled authority cannot dispatch. Status and cached previews remain usable. Setup/input and WebSocket StartPairing setup share manual admission; the setup child retains its permit while waiting for input. A denied WebSocket setup emits a fixed Error frame without cancelling the session/task. Reading an existing pair record stays allowed.
+
+Regression evidence and exact verification outputs are recorded in `.superpowers/sdd/boundaries-report.md`. The tests use local synthetic fixtures; no VPS or real-device acceptance is claimed. The original pinned image dependency and PR 42/video-stack scope remain unchanged.

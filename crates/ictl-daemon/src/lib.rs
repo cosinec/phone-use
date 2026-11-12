@@ -116,12 +116,15 @@ async fn serve_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) {
             protocol::Response::error(ictl_l10n::tr!("请求太长", "request too long"))
         } else {
             match parse_request(&line) {
-                Ok((req, false, expect_udid, lang, diagnostic_id)) => {
-                    let handling =
-                        daemon.handle(req, queued_at, core::CallCtx { gone: None, expect_udid, diagnostic_id });
+                Ok((req, false, expect_udid, lang, diagnostic_id, action_deadline)) => {
+                    let handling = daemon.handle(
+                        req,
+                        queued_at,
+                        core::CallCtx { gone: None, expect_udid, diagnostic_id, action_deadline },
+                    );
                     ictl_l10n::scope(lang, handling).await
                 }
-                Ok((req, true, expect_udid, lang, diagnostic_id)) => {
+                Ok((req, true, expect_udid, lang, diagnostic_id, action_deadline)) => {
                     // 调用方断开（取消、超时）就告诉 handle：还在排队的话不再执行
                     let (gone_tx, gone_rx) = tokio::sync::oneshot::channel();
                     let mut gone_tx = Some(gone_tx);
@@ -130,7 +133,7 @@ async fn serve_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) {
                         daemon.handle(
                             req,
                             queued_at,
-                            core::CallCtx { gone: Some(gone_rx), expect_udid, diagnostic_id },
+                            core::CallCtx { gone: Some(gone_rx), expect_udid, diagnostic_id, action_deadline },
                         ),
                     );
                     tokio::pin!(handling);
@@ -158,12 +161,19 @@ async fn serve_conn(daemon: Arc<Daemon>, stream: tokio::net::UnixStream) {
     }
 }
 
-type ParsedRequest = (protocol::Request, bool, Option<String>, ictl_l10n::Lang, Option<u64>);
+type ParsedRequest =
+    (protocol::Request, bool, Option<String>, ictl_l10n::Lang, Option<u64>, Option<protocol::ActionDeadline>);
 
 /// 解析一行请求，并取出 [`protocol::CANCEL_ON_CLOSE`]、[`protocol::EXPECT_UDID`]、[`protocol::LANG`]。
 /// No language (an older client) means Chinese, which is what those clients expect and parse
 fn parse_request(line: &[u8]) -> serde_json::Result<ParsedRequest> {
     let mut v: serde_json::Value = serde_json::from_slice(line)?;
+    let diagnostic_id = v[protocol::DIAGNOSTIC_ID].as_u64();
+    let deadline = v.as_object_mut().and_then(|o| o.remove(protocol::ACTION_DEADLINE))
+        .map(protocol::ActionDeadline::parse).transpose().map_err(|error| {
+            tracing::warn!(event = "action_rejected", category = "invalid_metadata", stage = "native_parse", diagnostic_id = ?diagnostic_id, budget_ms = 30000);
+            <serde_json::Error as serde::de::Error>::custom(error)
+        })?;
     let (cancel, expect, lang, diagnostic_id) = match v.as_object_mut() {
         Some(o) => (
             o.remove(protocol::CANCEL_ON_CLOSE).is_some_and(|c| c == true),
@@ -173,7 +183,7 @@ fn parse_request(line: &[u8]) -> serde_json::Result<ParsedRequest> {
         ),
         None => (false, None, None, None),
     };
-    Ok((serde_json::from_value(v)?, cancel, expect, lang.unwrap_or(ictl_l10n::Lang::Zh), diagnostic_id))
+    Ok((serde_json::from_value(v)?, cancel, expect, lang.unwrap_or(ictl_l10n::Lang::Zh), diagnostic_id, deadline))
 }
 
 /// 等到调用方关掉连接（读到 EOF 或出错）。带 cancel_on_close 的客户端一个连接只发一个请求，之后不会再写
@@ -189,9 +199,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_deadline_is_rejected_not_treated_as_absent() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("bad"),
+            serde_json::json!(-1),
+            serde_json::json!(1.2),
+            serde_json::json!(true),
+            serde_json::json!(u64::MAX),
+        ] {
+            let line = serde_json::json!({"op":"tap","x":1,"y":2,protocol::ACTION_DEADLINE:value}).to_string();
+            assert!(parse_request(line.as_bytes()).is_err(), "accepted {value}");
+        }
+        assert!(parse_request(br#"{"op":"tap","x":1,"y":2}"#).is_ok());
+    }
+
+    #[test]
     fn request_options_are_taken_out_before_parsing() {
         use ictl_l10n::Lang;
-        let (req, cancel, expect, lang, diagnostic_id) = parse_request(
+        let (req, cancel, expect, lang, diagnostic_id, deadline) = parse_request(
             br#"{"op":"tap","x":1.0,"y":2.0,"cancel_on_close":true,"expect_udid":"U1","lang":"en","diagnostic_id":7}"#,
         )
         .unwrap();
@@ -200,12 +226,17 @@ mod tests {
         assert_eq!(expect.as_deref(), Some("U1"));
         assert_eq!(lang, Lang::En);
         assert_eq!(diagnostic_id, Some(7));
+        assert!(deadline.is_none());
+        let deadline = protocol::ActionDeadline::admit().unwrap();
+        let line = serde_json::json!({"op":"tap","x":1,"y":2,protocol::ACTION_DEADLINE:deadline.wire_ns()}).to_string();
+        let (_, _, _, _, _, parsed) = parse_request(line.as_bytes()).unwrap();
+        assert_eq!(parsed, Some(deadline));
         // 旧版本客户端：没有这几个键；没说语言就是中文（它们按中文的固定写法认结果）
-        let (_, cancel, expect, lang, diagnostic_id) = parse_request(br#"{"op":"status"}"#).unwrap();
+        let (_, cancel, expect, lang, diagnostic_id, _) = parse_request(br#"{"op":"status"}"#).unwrap();
         assert!(!cancel && expect.is_none());
         assert_eq!(lang, Lang::Zh);
         assert!(diagnostic_id.is_none());
-        let (_, _, _, lang, _) = parse_request(br#"{"op":"status","lang":"klingon"}"#).unwrap();
+        let (_, _, _, lang, _, _) = parse_request(br#"{"op":"status","lang":"klingon"}"#).unwrap();
         assert_eq!(lang, Lang::Zh);
         assert!(parse_request(b"{").is_err());
     }

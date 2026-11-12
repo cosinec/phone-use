@@ -151,6 +151,7 @@ impl NativeController {
             .env("ICTL_DATA_DIR", &self.0.data_dir)
             .env("ICTL_SOCKET", &self.0.socket_path)
             .env("ICTL_MANAGE_USBMUXD", "0")
+            .env("ICTL_CAPTURE_POLICY", "bounded-remote")
             .env("ICTL_LOW_LATENCY", std::env::var("ICTL_LOW_LATENCY").unwrap_or_else(|_| "1".into()))
             .env("USBMUXD_SOCKET_ADDRESS", &self.0.mux_address)
             .stdin(if mode == "setup" { Stdio::piped() } else { Stdio::null() })
@@ -256,16 +257,32 @@ impl NativeController {
         }
     }
 
-    pub async fn request(&self, mut request: Value, timeout: Duration, cancel: CancellationToken) -> Result<Value> {
+    pub async fn request(&self, request: Value, timeout: Duration, cancel: CancellationToken) -> Result<Value> {
+        self.request_with_deadline(request, timeout, cancel, None).await
+    }
+
+    pub async fn request_with_deadline(
+        &self,
+        mut request: Value,
+        timeout: Duration,
+        cancel: CancellationToken,
+        deadline: Option<ictl_protocol::ActionDeadline>,
+    ) -> Result<Value> {
         let mut trace =
             RequestTrace::new(self.0.data_dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
         let object = request.as_object_mut().ok_or_else(|| anyhow!("Invalid native request"))?;
+        object.remove(ictl_protocol::ACTION_DEADLINE);
+        if let Some(deadline) = deadline {
+            object.insert(ictl_protocol::ACTION_DEADLINE.into(), json!(deadline.wire_ns()));
+        }
         object.insert(ictl_protocol::DIAGNOSTIC_ID.into(), json!(trace.id));
         object.insert("expect_udid".into(), json!(self.0.device.serial_number));
         object.insert("cancel_on_close".into(), json!(true));
         object.insert("lang".into(), json!("en"));
         let operation = async {
+            check_deadline(deadline, trace.id, "ipc_connect")?;
             let mut socket = UnixStream::connect(&self.0.socket_path).await?;
+            check_deadline(deadline, trace.id, "ipc_write")?;
             trace.phase("ipc_write");
             let mut request = serde_json::to_vec(&request)?;
             request.push(b'\n');
@@ -318,7 +335,21 @@ impl NativeController {
         json!({"ready":state.ready,"daemon":state.daemon,"setup":setup})
     }
 
+    pub(crate) async fn start_setup_admitted(
+        &self,
+        admission: crate::control::Admission,
+        deadline: ictl_protocol::ActionDeadline,
+    ) -> Result<()> {
+        self.start_setup_inner(Some(admission), Some(deadline)).await
+    }
     pub async fn start_setup(&self) -> Result<()> {
+        self.start_setup_inner(None, None).await
+    }
+    async fn start_setup_inner(
+        &self,
+        admission: Option<crate::control::Admission>,
+        deadline: Option<ictl_protocol::ActionDeadline>,
+    ) -> Result<()> {
         let _setup = self.0.setup_lock.lock().await;
         if self.0.cancel.is_cancelled() {
             bail!("Controller closed");
@@ -334,6 +365,7 @@ impl NativeController {
                 stop_group(&group).await?;
             }
         }
+        check_deadline(deadline, 0, "setup_spawn")?;
         let (mut child, group) = self.spawn("setup").await?;
         let pid = group.pid;
         {
@@ -351,6 +383,8 @@ impl NativeController {
         }
         let controller = self.clone();
         tokio::spawn(async move {
+            // The pending setup child is manual work until it exits or is cancelled.
+            let _admission = admission;
             let started = Instant::now();
             let mut timed_out = false;
             let status = tokio::select! {
@@ -425,6 +459,13 @@ impl NativeController {
     }
 
     pub async fn setup_input(&self, line: &str) -> Result<()> {
+        self.setup_input_with_deadline(line, None).await
+    }
+    pub(crate) async fn setup_input_with_deadline(
+        &self,
+        line: &str,
+        deadline: Option<ictl_protocol::ActionDeadline>,
+    ) -> Result<()> {
         if line.encode_utf16().count() > 4096 || line.contains(['\r', '\n', '\0']) {
             bail!("Invalid setup input");
         }
@@ -432,6 +473,7 @@ impl NativeController {
             bail!("Setup is not running");
         }
         let mut input = self.0.stdin.lock().await;
+        check_deadline(deadline, 0, "setup_input")?;
         let Some((_, stdin)) = input.as_mut() else { bail!("Setup is not running") };
         let bytes = format!("{line}\n");
         tokio::select! {
@@ -508,6 +550,17 @@ async fn stop_group(group: &Group) -> Result<()> {
     Ok(())
 }
 
+fn check_deadline(deadline: Option<ictl_protocol::ActionDeadline>, diagnostic_id: u64, stage: &str) -> Result<()> {
+    if deadline.is_some_and(|d| d.expired().unwrap_or(true)) {
+        eprintln!(
+            "{} event=action_rejected diagnostic_id={diagnostic_id} category=expired stage={stage} budget_ms=30000",
+            chrono::Utc::now().to_rfc3339()
+        );
+        bail!("Action expired before native dispatch; request was not sent");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +615,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_native_deadline_never_writes_ipc_and_fresh_keeps_exact_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ctl.sock");
+        let server = UnixListener::bind(&socket).unwrap();
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = received.clone();
+        let peer = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = server.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut line = Vec::new();
+                loop {
+                    let byte = stream.read_u8().await.unwrap();
+                    if byte == b'\n' {
+                        break;
+                    }
+                    line.push(byte);
+                }
+                let request: Value = serde_json::from_slice(&line).unwrap();
+                stream
+                    .write_all(format!("{}\n", json!({"kind":"text","text":request.to_string()})).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let native = controller(socket, CancellationToken::new());
+        let expired = ictl_protocol::ActionDeadline::parse(json!(ictl_protocol::monotonic_ns().unwrap() - 1)).unwrap();
+        let result = native
+            .request_with_deadline(
+                json!({"op":"tap","x":1,"y":1}),
+                Duration::from_secs(1),
+                CancellationToken::new(),
+                Some(expired),
+            )
+            .await;
+        assert!(matches!(&result, Err(error) if error.to_string().contains("expired")), "{result:?}");
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let deadline = ictl_protocol::ActionDeadline::admit().unwrap();
+        let result = native
+            .request_with_deadline(
+                json!({"op":"tap","x":1,"y":1}),
+                Duration::from_secs(1),
+                CancellationToken::new(),
+                Some(deadline),
+            )
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+        assert_eq!(request[ictl_protocol::ACTION_DEADLINE], deadline.wire_ns());
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
+        peer.abort();
+    }
+
+    #[tokio::test]
     async fn setup_accepts_one_line_without_recording_it() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("native-fixture");
@@ -586,7 +693,11 @@ mod tests {
             "127.0.0.1:1".into(),
             CancellationToken::new(),
         );
-        ctl.start_setup().await.unwrap();
+        let control = crate::control::Control::default();
+        ctl.start_setup_admitted(control.manual().unwrap(), ictl_protocol::ActionDeadline::admit().unwrap())
+            .await
+            .unwrap();
+        assert!(control.task().is_err(), "setup child must retain manual admission while waiting for input");
         tokio::time::timeout(Duration::from_secs(2), async {
             while !ctl.snapshot().await["setup"]["transcript"].as_str().unwrap().contains("fixture prompt") {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -605,6 +716,13 @@ mod tests {
         .unwrap();
         let snapshot = ctl.snapshot().await;
         assert_eq!(snapshot["setup"]["state"], "complete");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control.task().is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(!snapshot.to_string().contains("private input"));
         ctl.close().await.unwrap();
     }

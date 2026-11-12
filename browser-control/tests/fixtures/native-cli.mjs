@@ -25,7 +25,7 @@ if (process.argv[2] === 'descendant') {
   let wdaUnavailableUntil = 0;
   let recoveryObservationFailures = Number(process.env.FIXTURE_RECOVERY_OBSERVATION_FAILURES || 0);
   let initialObservationFailures = Number(process.env.FIXTURE_INITIAL_OBSERVATION_WDA_FAILURES || 0);
-  const counts = { screenshot: 0, list_elements: 0 };
+  const counts = { screenshot: 0, list_elements: 0, launch_app: 0, terminate_app: 0, press_button: 0 };
   const sockets = new Set();
   const server = net.createServer(socket => {
     sockets.add(socket);
@@ -64,6 +64,7 @@ if (process.argv[2] === 'descendant') {
         ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }
         : request.op === 'list_apps' ? { kind: 'text', text: 'Fixture App: com.example.fixture' }
         : { kind: 'text', text: JSON.stringify({ request, taps, counts, typeRequests, env: {
+          ICTL_CAPTURE_POLICY: process.env.ICTL_CAPTURE_POLICY, ICTL_LOW_LATENCY: process.env.ICTL_LOW_LATENCY,
           ICTL_ANISETTE_URL: process.env.ICTL_ANISETTE_URL, IPHONE_UDID: process.env.IPHONE_UDID, ICTL_SOCKET: process.env.ICTL_SOCKET,
           ICTL_DATA_DIR: process.env.ICTL_DATA_DIR, ICTL_MANAGE_USBMUXD: process.env.ICTL_MANAGE_USBMUXD,
           USBMUXD_SOCKET_ADDRESS: process.env.USBMUXD_SOCKET_ADDRESS,

@@ -113,14 +113,14 @@ async function modelReplyTask(t, respond, env = {}) {
     LLM_MODEL: 'fixture-replies', LLM_API_KEY: 'fixture-reply-key', ...env,
   });
   const session = await app.session();
-  await peer(t, session);
+  const usb = await peer(t, session);
   await ready(app, session);
   const route = `/api/sessions/${session.id}`;
   const response = await app.api(route + '/tasks', session.token, { instruction: 'Inspect the fixture safely' });
   assert.equal(response.status, 201);
   const task = await response.json();
   const snapshot = async () => (await app.api(route, session.token)).json();
-  return { app, session, route, task, requests, snapshot };
+  return { app, session, route, task, requests, snapshot, usb };
 }
 
 function modelCompletion(content, finish_reason = 'stop') {
@@ -633,7 +633,7 @@ contract('preview avoids accessibility snapshots and observation bounds slow ele
   assert.equal(preview.status, 200);
   const frame = await preview.json(); assert.equal(frame.imageBase64, 'aW1hZ2U=');
   const stats = await (await app.api(route + '/command', s.token, { requestId: 'counts', deviceId: s.deviceId, tool: 'iphone_status' })).json();
-  assert.deepEqual(JSON.parse(stats.text).counts, { screenshot: 1, list_elements: 0 });
+  assert.deepEqual(JSON.parse(stats.text).counts, { screenshot: 1, list_elements: 0, launch_app: 0, terminate_app: 0, press_button: 0 });
   const observation = await (await app.api(route + '/screen', s.token)).json();
   assert.equal(observation.imageBase64, 'aW1hZ2U='); assert.ok(observation.elementsError);
   assert.ok(observation.timings.elementsMs >= 1000 && observation.timings.elementsMs < 3000, JSON.stringify(observation.timings));
@@ -675,7 +675,7 @@ contract('AI previews reuse its observation and query text plus screenshot crops
   assert.match(second.recentHistory[0].result.text, /com.example.fixture/);
   assert.equal(bodies[1].messages[1].content.filter(p => p.type === 'image_url').length, 0, 'read-only text lookup needs no new image');
   assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length, 1, 'crop replaces redundant full-screen recapture');
-  assert.deepEqual(await count('final-counts'), { screenshot: 2, list_elements: 1 });
+  assert.deepEqual(await count('final-counts'), { screenshot: 2, list_elements: 1, launch_app: 0, terminate_app: 0, press_button: 0 });
   assert.ok(!JSON.stringify(state.task).includes('com.example.fixture'), 'tool contents stay out of polled UI snapshots');
   assert.ok(state.task.timings.modelMs >= 0);
   assert.ok(state.task.steps[0].timings.actionMs >= 0);
@@ -1082,4 +1082,131 @@ contract('MJPEG preview receives independent USB frames while model is thinking 
   ws.close(); await once(ws, 'close');
   for (let i = 0; i < 10; i++) { if ((await resumedReader.read()).done) return; }
   assert.fail('preview did not close with its owning session');
+});
+
+contract('control boundaries force bounded capture despite low latency opt-out', async t => {
+  const app = await harness(t, { ICTL_LOW_LATENCY: '0', ICTL_CAPTURE_POLICY: 'local' });
+  const session = await app.session(); await peer(t, session); await ready(app, session);
+  const response = await app.api(`/api/sessions/${session.id}/command`, session.token, { deviceId: session.deviceId, requestId: 'capture-policy', tool: 'iphone_status' });
+  const echo = JSON.parse((await response.json()).text);
+  assert.equal(echo.env.ICTL_LOW_LATENCY, '0');
+  assert.equal(echo.env.ICTL_CAPTURE_POLICY, 'bounded-remote');
+});
+
+contract('control boundaries hold task ownership through model and confirmation waits', async t => {
+  for (const confirmation of [false, true]) await t.test(confirmation ? 'confirmation wait' : 'model wait', async t => {
+    let release;
+    const modelGate = new Promise(resolve => { release = resolve; });
+    const action = { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen', requiresConfirmation: confirmation };
+    const fixture = await modelReplyTask(t, async call => {
+      if (call === 1 && !confirmation) await modelGate;
+      return modelCompletion(JSON.stringify(call === 1 ? action : { type: 'done', message: 'Verified fixture' }));
+    });
+    let state;
+    await until(async () => { state = await fixture.snapshot(); return confirmation ? state.task?.state === 'awaiting_confirmation' : fixture.requests.length === 1; });
+    const command = (requestId, tool, args = {}) => fixture.app.api(fixture.route + '/command', fixture.session.token, { requestId, deviceId: fixture.session.deviceId, tool, args, taskId: fixture.task.id, action_deadline_monotonic_ns: Number.MAX_SAFE_INTEGER });
+    const before = JSON.parse((await (await command('before', 'iphone_status')).json()).text);
+    for (const [tool, args] of [ ['iphone_tap', { x: 5, y: 7 }], ['iphone_launch_app', { app: 'com.example.fixture' }], ['iphone_screenshot', {}], ['iphone_list_elements', {}], ['iphone_wait_for', { text: 'fixture' }] ]) {
+      const denied = await command('denied-' + tool, tool, args);
+      assert.equal(denied.status, 409, await denied.clone().text());
+    }
+    const setup = await fixture.app.api(fixture.route + '/setup', fixture.session.token, {});
+    assert.equal(setup.status, 409, await setup.clone().text());
+    assert.match((await setup.json()).error, /owns session control/i);
+    const setupInput = await fixture.app.api(fixture.route + '/setup/input', fixture.session.token, { line: 'fixture input' });
+    assert.equal(setupInput.status, 409);
+    assert.match((await setupInput.json()).error, /owns session control/i);
+    assert.equal((await fixture.app.api(fixture.route + '/screen', fixture.session.token)).status, 409);
+    assert.equal((await fixture.app.api(fixture.route + '/preview', fixture.session.token)).status, 200);
+    const after = JSON.parse((await (await command('after', 'iphone_status')).json()).text);
+    assert.equal(after.taps, before.taps);
+    assert.deepEqual(after.counts, before.counts);
+    if (confirmation) {
+      assert.equal((await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/confirm`, fixture.session.token, { actionId: state.task.confirmation.actionId, approved: true })).status, 200);
+    } else release();
+    await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+    assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+    const fresh = await command('manual-after-release', 'iphone_tap', { x: 3, y: 4 });
+    assert.equal(fresh.status, 200, await fresh.clone().text());
+    const result = await fresh.json();
+    assert.equal(JSON.parse(result.text).taps, 2);
+    const duplicate = await command('manual-after-release', 'iphone_tap', { x: 3, y: 4 });
+    assert.deepEqual(await duplicate.json(), result);
+  });
+});
+
+contract('control boundaries prevent task claim from overtaking admitted manual observation', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fixture = await modelReplyTask(t, async () => { await gate; return modelCompletion(JSON.stringify({ type: 'done', message: 'Cancelled initial fixture' })); }, { FIXTURE_ELEMENTS_DELAY_MS: '700' });
+  await until(() => fixture.requests.length === 1);
+  await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/stop`, fixture.session.token, {});
+  release();
+  await pause(30);
+  const screen = fixture.app.api(fixture.route + '/screen', fixture.session.token);
+  await pause(80);
+  const blocked = await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Inspect queued control fairly' });
+  assert.equal(blocked.status, 409, await blocked.clone().text());
+  assert.equal((await screen).status, 200);
+  const fresh = await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Inspect after manual completion' });
+  assert.equal(fresh.status, 201, await fresh.clone().text());
+});
+
+contract('control boundaries anchor action age before reading the HTTP body', async t => {
+  const app = await harness(t); const session = await app.session();
+  await peer(t, session); await ready(app, session);
+  const payload = JSON.stringify({ deviceId: session.deviceId, requestId: 'slow-http-body', tool: 'iphone_tap', args: { x: 5, y: 7 } });
+  const response = await new Promise((resolve, reject) => {
+    const request = http.request(app.base + `/api/sessions/${session.id}/command`, { method: 'POST', headers: { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' } }, res => {
+      let body = ''; res.on('data', bytes => { body += bytes; }); res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
+    });
+    request.on('error', reject); request.write(payload.slice(0, 12));
+    setTimeout(() => request.end(payload.slice(12)), 150);
+  });
+  assert.equal(response.status, 200);
+  assert.ok(response.body.timings.queueMs >= 100, `HTTP body wait missing from action age: ${JSON.stringify(response.body.timings)}`);
+});
+
+contract('control boundaries keep setup child admission until input and completion', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'done', message: 'Initial task complete' })));
+  await until(async () => (await fixture.snapshot()).task?.state === 'completed');
+  await pause(30);
+  assert.equal((await fixture.app.api(fixture.route + '/setup', fixture.session.token, {})).status, 200);
+  const blocked = await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Inspect while setup waits' });
+  assert.equal(blocked.status, 409, await blocked.clone().text());
+  assert.equal((await fixture.app.api(fixture.route + '/setup/input', fixture.session.token, { line: 'fixture input' })).status, 200);
+  await until(async () => (await fixture.snapshot()).setup?.state === 'complete');
+  const fresh = await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Inspect after setup completion' });
+  assert.equal(fresh.status, 201, await fresh.clone().text());
+});
+
+contract('control boundaries retain task ownership during WDA recovery and release on stop', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Inspect fixture screen' })), { FIXTURE_TAP_WDA_FAILURES: '1', FIXTURE_WDA_RECOVERY_MS: '300000' });
+  await until(async () => (await fixture.snapshot()).task?.state === 'recovering');
+  const command = (requestId, tool, args = {}) => fixture.app.api(fixture.route + '/command', fixture.session.token, { requestId, deviceId: fixture.session.deviceId, tool, args });
+  const blocked = await command('during-recovery', 'iphone_tap', { x: 3, y: 4 });
+  assert.equal(blocked.status, 409);
+  assert.equal(JSON.parse((await (await command('recovery-status', 'iphone_status')).json()).text).taps, 1);
+  await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/stop`, fixture.session.token, {});
+  await pause(30);
+  const fresh = await command('after-recovery-stop', 'iphone_tap', { x: 3, y: 4 });
+  assert.equal(fresh.status, 200, await fresh.clone().text());
+  assert.equal(JSON.parse((await fresh.json()).text).taps, 2);
+  assert.equal(fixture.requests.length, 1);
+});
+
+contract('control boundaries block websocket pairing setup while a task owns control', async t => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const fixture = await modelReplyTask(t, async () => { await gate; return modelCompletion(JSON.stringify({ type: 'done', message: 'Fixture done' })); });
+  await until(() => fixture.requests.length === 1);
+  const errors = [];
+  fixture.usb.ws.on('message', bytes => { const frame = decodeFrame(bytes); if (frame.type === F.Error && frame.requestId === 55) errors.push(JSON.parse(frame.payload.toString())); });
+  fixture.usb.ws.send(encodeFrame({ type: F.StartPairing, requestId: 55 }));
+  await pause(150);
+  assert.equal((await fixture.snapshot()).setup.state, 'idle', 'pairing must not start native setup while task owns session');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].error, /control/i);
+  assert.equal(fixture.usb.ws.readyState, WebSocket.OPEN);
+  release();
+  await until(async () => (await fixture.snapshot()).task?.state === 'completed');
 });

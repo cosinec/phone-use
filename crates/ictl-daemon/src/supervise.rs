@@ -169,7 +169,7 @@ impl Daemon {
             if g.device.is_some() && g.persisted.wda_bundle.is_some() {
                 let d = self.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = d.resign_now(false).await {
+                    if let Err(e) = d.resign_now(false, None).await {
                         let mut g = d.inner.lock().await;
                         d.notify(&mut g, Event::ResignFailed(e));
                     }
@@ -404,7 +404,11 @@ impl Daemon {
                 }
                 g.ddi_failures = 0;
                 g.runner = Some(runner);
-                g.wda = Some(client.with_low_latency(self.cfg.low_latency));
+                g.wda = Some(
+                    client
+                        .with_low_latency(self.cfg.low_latency)
+                        .with_bounded_capture(self.cfg.capture_policy == crate::config::CapturePolicy::BoundedRemote),
+                );
                 // 状态在下面 online() 的健康检查里变成 Ready
             }
             StartOutcome::NeedsUnlock => {
@@ -467,9 +471,16 @@ impl Daemon {
     }
 
     /// 检查描述文件并按需重签（`force` 立即重签）。分三段：持锁取参数 → 不持锁签名、安装（几十秒）→ 持锁写结果
-    pub(crate) async fn resign_now(self: &Arc<Self>, force: bool) -> Result<String, String> {
+    pub(crate) async fn resign_now(
+        self: &Arc<Self>,
+        force: bool,
+        admission: Option<(Instant, Option<ictl_protocol::ActionDeadline>)>,
+    ) -> Result<String, String> {
         let (device, name) = {
             let mut g = self.inner.lock().await;
+            if let Some((queued_at, deadline)) = admission {
+                crate::core::check_action_admission(queued_at, deadline, "daemon_resign_lock")?;
+            }
             let g = &mut *g;
             // 看这台手机上装的那份，不看最近一次签名：给别的手机签过之后，这台装的还是更早签的、更早到期
             if !force && g.persisted.wda_bundle.is_some() {

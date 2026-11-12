@@ -5,8 +5,16 @@ use std::time::Duration;
 
 use ictl_device::ScreenSize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapturePolicy {
+    #[default]
+    Local,
+    BoundedRemote,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub capture_policy: CapturePolicy,
     pub low_latency: bool,
     pub data_dir: PathBuf,
     pub socket: PathBuf,
@@ -68,6 +76,11 @@ impl Config {
                 _ => None,
             };
         Self {
+            capture_policy: if env("ICTL_CAPTURE_POLICY").as_deref() == Some("bounded-remote") {
+                CapturePolicy::BoundedRemote
+            } else {
+                CapturePolicy::Local
+            },
             low_latency: env("ICTL_LOW_LATENCY").is_some_and(|v| v == "1" || v == "true"),
             data_dir: data_dir.to_owned(),
             // 实际值由命令行给（--socket / ICTL_SOCKET，见 apps/iphone-control）

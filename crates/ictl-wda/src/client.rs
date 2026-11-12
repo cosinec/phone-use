@@ -118,6 +118,7 @@ pub struct WdaClient<T> {
     idle_baseline: Option<IdleSettings>,
     idle_current: Option<IdleSettings>,
     low_latency: bool,
+    bounded_capture: bool,
     profile_applied: bool,
 }
 
@@ -131,12 +132,20 @@ impl<T: Transport> WdaClient<T> {
             idle_baseline: None,
             idle_current: None,
             low_latency: false,
+            bounded_capture: false,
             profile_applied: false,
         }
     }
     /// Dedicated browser-control session. Ordinary MCP clients retain their defaults.
     pub fn with_low_latency(mut self, enabled: bool) -> Self {
         self.low_latency = enabled;
+        self
+    }
+
+    /// Require bounded MJPEG for every capture, including hidden unlock/settle reads.
+    /// Independent of gesture timing and other low-latency settings.
+    pub fn with_bounded_capture(mut self, enabled: bool) -> Self {
+        self.bounded_capture = enabled;
         self
     }
 
@@ -387,18 +396,20 @@ impl<T: Transport> WdaClient<T> {
 
     /// Encoded screenshot bytes. The legacy method name is retained; low-latency sessions may return JPEG.
     pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
-        if self.low_latency {
+        if self.low_latency || self.bounded_capture {
             self.session_id().await?;
             // WDA 16.15.3 converts /screenshot back to PNG even when the source
             // quality is JPEG. Capture one MJPEG frame before the WAN instead.
             // A failed read must not trigger a multi-megabyte PNG fallback.
-            if let Some(jpeg) = self
-                .transport
-                .screenshot_jpeg()
-                .await
-                .map_err(|error| WdaError::Unavailable(format!("MJPEG capture failed: {error}")))?
-            {
+            if let Some(jpeg) = self.transport.screenshot_jpeg().await.map_err(|error| {
+                tracing::warn!(event = "capture_rejected", category = "mjpeg_failed");
+                WdaError::Unavailable(format!("MJPEG capture failed: {error}"))
+            })? {
                 return Ok(jpeg);
+            }
+            if self.bounded_capture {
+                tracing::warn!(event = "capture_rejected", category = "mjpeg_unsupported");
+                return Err(WdaError::Unavailable("bounded MJPEG capture is unsupported".into()));
             }
         }
         // base64 约 11MB：从 JSON 里直接拿走字符串，原地去掉换行，不再另外复制
@@ -902,6 +913,45 @@ mod tests {
         assert_eq!(client.screenshot_png().await.unwrap(), b"png");
         assert_eq!(transport.captures.load(Ordering::Relaxed), 0);
         assert_eq!(transport.http.seen.lock().unwrap()[0].1, "/screenshot");
+    }
+
+    #[tokio::test]
+    async fn bounded_capture_is_independent_of_latency_and_preserves_mjpeg_failure() {
+        for fail in [false, true] {
+            let transport = JpegTransport {
+                http: Mock::with(&[(200, r#"{"sessionId":"A"}"#), (200, r#"{"value":"cG5n"}"#)]),
+                fail,
+                captures: AtomicU64::new(0),
+            };
+            let mut client = WdaClient::new(&transport).with_low_latency(false).with_bounded_capture(true);
+            let result = client.screenshot_png().await;
+            assert_eq!(
+                transport.captures.load(Ordering::Relaxed),
+                1,
+                "bounded capture must use MJPEG even with latency disabled"
+            );
+            if fail {
+                assert!(
+                    matches!(result, Err(WdaError::Unavailable(ref e)) if e.contains("slow capture")),
+                    "{result:?}"
+                );
+            } else {
+                assert_eq!(result.unwrap(), [255, 216, 255, 217]);
+            }
+            assert!(!transport.http.seen.lock().unwrap().iter().any(|r| r.1 == "/screenshot"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_capture_rejects_unsupported_transport_without_png() {
+        let transport = Mock::with(&[(200, r#"{"sessionId":"A"}"#)]);
+        let mut client = WdaClient::new(&transport).with_bounded_capture(true);
+        let result = client.screenshot_png().await;
+        assert!(
+            matches!(result, Err(WdaError::Unavailable(ref e)) if e.contains("bounded MJPEG capture is unsupported")),
+            "{result:?}"
+        );
+        assert!(!transport.seen.lock().unwrap().iter().any(|r| r.1 == "/screenshot"));
     }
 
     #[tokio::test]

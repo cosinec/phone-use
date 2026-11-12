@@ -11,10 +11,30 @@ use ictl_wda::http::DeviceTransport;
 use ictl_wda::timing::StepTimer;
 use ictl_wda::{Launch, WdaClient, WdaError};
 
+use crate::config::CapturePolicy;
 use crate::core::{Daemon, Inner, drop_tunnel, hid_supported, wda_down};
 use crate::imaging::{self, fmt_g};
 use crate::notify::Event;
 use crate::protocol::{ALERT_BLOCKING, Response, TAP_MISSED};
+
+async fn capture_with_fallback<F, Fut>(
+    policy: CapturePolicy,
+    wda: Result<Vec<u8>, String>,
+    fallback: F,
+) -> Result<(Vec<u8>, &'static str), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    match wda {
+        Ok(bytes) => Ok((bytes, "WDA")),
+        Err(error) if policy == CapturePolicy::BoundedRemote => {
+            tracing::warn!(event = "capture_rejected", category = "remote_fallback_forbidden");
+            Err(error)
+        }
+        Err(_) => fallback().await.map(|bytes| (bytes, "HID")),
+    }
+}
 
 /// 锁屏后至少等这么久再自动解锁：锁屏过渡没走完就唤醒，WDA 第一下上滑卡约 16 秒后报 `point.x != INFINITY`
 pub(crate) const LOCK_SETTLE: Duration = Duration::from_secs(3);
@@ -117,6 +137,10 @@ impl Daemon {
 
     /// 经隧道截图（WDA 不可用时）。失败就丢掉隧道，下次重建
     async fn hid_screenshot(&self, g: &mut Inner) -> Result<Vec<u8>, String> {
+        if self.cfg.capture_policy == CapturePolicy::BoundedRemote {
+            tracing::warn!(event = "capture_rejected", category = "coredevice_png_forbidden");
+            return Err("CoreDevice PNG is forbidden by bounded remote capture policy".into());
+        }
         let device = g.device.clone().ok_or(ictl_l10n::tr!("手机未连接", "Phone not connected"))?;
         let t = self.ensure_tunnel(g, &device).await.map_err(|e| e.to_string())?;
         match t.screenshot_png().await {
@@ -272,31 +296,24 @@ impl Daemon {
         region: Option<(f64, f64, f64, f64)>,
     ) -> Result<CapturedFrame, String> {
         let fetching = StepTimer::new("screenshot_fetch");
-        let wda_png = match self.wda(g) {
-            Some(w) => w.screenshot_png().await.ok(),
-            None => None,
+        let wda_frame = match self.wda(g) {
+            Some(w) => w.screenshot_png().await.map_err(|error| error.to_string()),
+            None => Err(wda_down(&g.state, g.info.as_ref())),
         };
-        fetching.finish(wda_png.is_some());
-        // 给短暂 WDA 掉线时的 HID 留一份近期方向；不把方向永久缓存到磁盘。
-        if wda_png.is_some() {
+        fetching.finish(wda_frame.is_ok());
+        // Keep recent orientation for local HID without masking the capture error.
+        if wda_frame.is_ok() {
             let rotation = StepTimer::new("screenshot_rotation");
             self.refresh_hid_rotation(g).await;
             rotation.finish(true);
         }
-        let (png, via) = match wda_png {
-            Some(p) => (p, "WDA"),
-            None => {
-                if !hid_supported(g.info.as_ref()) {
-                    return Err(wda_down(&g.state, g.info.as_ref()));
-                }
-                (
-                    self.hid_screenshot(g)
-                        .await
-                        .map_err(|e| ictl_l10n::trf!("HID 命令失败: {e}", "HID command failed: {e}"))?,
-                    "HID",
-                )
+        let (png, via) = capture_with_fallback(self.cfg.capture_policy, wda_frame, || async {
+            if !hid_supported(g.info.as_ref()) {
+                return Err(wda_down(&g.state, g.info.as_ref()));
             }
-        };
+            self.hid_screenshot(g).await.map_err(|e| ictl_l10n::trf!("HID 命令失败: {e}", "HID command failed: {e}"))
+        })
+        .await?;
         let measuring = StepTimer::new("screenshot_view");
         let view = match self.wda(g) {
             Some(w) => w.view().await.ok(),
@@ -1199,6 +1216,49 @@ async fn verify_typed(w: &mut WdaClient<DeviceTransport>, text: &str) -> Typed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_capture_never_calls_coredevice_fallback_and_preserves_error() {
+        let calls = std::cell::Cell::new(0);
+        let result = capture_with_fallback(
+            CapturePolicy::BoundedRemote,
+            Err("MJPEG capture failed: slow capture".into()),
+            || async {
+                calls.set(calls.get() + 1);
+                Ok(b"large PNG".to_vec())
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 0, "remote capture must not fetch CoreDevice PNG");
+        assert_eq!(result, Err("MJPEG capture failed: slow capture".into()));
+    }
+
+    #[tokio::test]
+    async fn local_capture_keeps_coredevice_fallback() {
+        let calls = std::cell::Cell::new(0);
+        let result = capture_with_fallback(CapturePolicy::Local, Err("WDA unavailable".into()), || async {
+            calls.set(calls.get() + 1);
+            Ok(b"local PNG".to_vec())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result, (b"local PNG".to_vec(), "HID"));
+    }
+
+    #[tokio::test]
+    async fn bounded_shared_hid_capture_rejects_before_device_or_tunnel_and_orientation_touch() {
+        let dir = std::env::temp_dir().join(format!("ictl-bounded-hid-{}", std::process::id()));
+        let mut cfg = crate::config::Config::from_env(&dir);
+        cfg.capture_policy = CapturePolicy::BoundedRemote;
+        let daemon = Daemon::new(cfg);
+        let mut inner = daemon.inner.lock().await;
+        let error = daemon.hid_screenshot(&mut inner).await.unwrap_err();
+        assert!(error.contains("bounded remote capture"), "{error}");
+        let error = daemon.hid_touch_rotation(&mut inner).await.unwrap_err();
+        assert!(error.contains("bounded remote capture"), "{error}");
+        assert!(inner.tunnel.is_none());
+    }
 
     #[test]
     fn hid_rotation_requires_fresh_matching_landscape() {

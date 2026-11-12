@@ -71,6 +71,8 @@ struct Job {
     result: watch::Sender<Option<Result<Value>>>,
     cancel: CancellationToken,
     queued_at: Instant,
+    deadline: Option<ictl_protocol::ActionDeadline>,
+    admission: Option<crate::control::Admission>,
 }
 enum JobRequest {
     Command(Value),
@@ -99,6 +101,7 @@ pub struct Session {
     socket_dir: PathBuf,
     data_dir: PathBuf,
     commands: Mutex<Commands>,
+    pub(crate) control: crate::control::Control,
     jobs: mpsc::Sender<Job>,
     latest_screen: Mutex<Option<CapturedScreen>>,
     preview_lock: Mutex<()>,
@@ -257,6 +260,7 @@ impl Gateway {
             socket_dir,
             data_dir: self.config.runtime.join("data").join(&namespace),
             commands: Mutex::new(Commands::default()),
+            control: crate::control::Control::default(),
             jobs,
             latest_screen: Mutex::new(None),
             preview_lock: Mutex::new(()),
@@ -292,6 +296,7 @@ impl Session {
     }
     pub async fn close_with_reason(&self, reason: &'static str) {
         self.close_reason.record(reason);
+        self.control.close();
         self.cancel.cancel();
         let mut done = self.close_lock.lock().await;
         if *done {
@@ -371,6 +376,62 @@ impl Session {
         }
     }
     pub async fn run_command(&self, input: Value, cancel: CancellationToken) -> Result<Value> {
+        self.run_command_at(
+            input,
+            cancel,
+            Instant::now(),
+            ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?,
+        )
+        .await
+    }
+    async fn run_command_at(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+        entered: Instant,
+        deadline: ictl_protocol::ActionDeadline,
+    ) -> Result<Value> {
+        self.run_command_admitted(input, cancel, entered, deadline, None).await
+    }
+    pub(crate) async fn run_task_command(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+        lease: &crate::control::TaskLease,
+    ) -> Result<Value> {
+        let entered = Instant::now();
+        let deadline =
+            ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+        self.run_command_admitted(input, cancel, entered, deadline, Some(lease)).await
+    }
+    fn manual_admission(&self) -> Result<crate::control::Admission> {
+        self.control.manual().inspect_err(|_| {
+            eprintln!(
+                "{} event=control_rejected session={} namespace={} category=control_busy stage=manual_admission",
+                chrono::Utc::now().to_rfc3339(),
+                self.id,
+                self.namespace
+            );
+        })
+    }
+    pub(crate) fn claim_task(&self) -> Result<crate::control::TaskLease> {
+        self.control.task().inspect_err(|_| {
+            eprintln!(
+                "{} event=control_rejected session={} namespace={} category=control_busy stage=task_admission",
+                chrono::Utc::now().to_rfc3339(),
+                self.id,
+                self.namespace
+            );
+        })
+    }
+    async fn run_command_admitted(
+        &self,
+        input: Value,
+        cancel: CancellationToken,
+        entered: Instant,
+        deadline: ictl_protocol::ActionDeadline,
+        task: Option<&crate::control::TaskLease>,
+    ) -> Result<Value> {
         if device_uid(self.device.platform, input["deviceId"].as_str().unwrap_or("")).ok().as_deref()
             != Some(self.device.serial_number.as_str())
         {
@@ -386,6 +447,9 @@ impl Session {
         if self.device.platform == Platform::Ios && request["op"] == "press_button" && request["button"] == "back" {
             return Err(ApiError::new(400, "Back is supported on Android only"));
         }
+        let typed: ictl_protocol::Request =
+            serde_json::from_value(request.clone()).map_err(|_| ApiError::new(400, "Invalid command"))?;
+        let deadline = typed.requires_control().then_some(deadline);
         let fingerprint = request.to_string();
         let mut commands = self.commands.lock().await;
         let receiver = if let Some(entry) = commands.cached.get(request_id) {
@@ -410,13 +474,22 @@ impl Session {
                 commands.cached.remove(&expired);
                 commands.order.retain(|k| k != &expired);
             }
+            let admission = if let Some(task) = task {
+                Some(self.control.task_job(task)?)
+            } else if typed.requires_control() {
+                Some(self.manual_admission()?)
+            } else {
+                None
+            };
             let (sender, receiver) = watch::channel(None);
             self.jobs
                 .try_send(Job {
                     request: JobRequest::Command(request),
                     result: sender.clone(),
                     cancel: cancel.clone(),
-                    queued_at: Instant::now(),
+                    queued_at: entered,
+                    deadline,
+                    admission,
                 })
                 .map_err(|_| ApiError::new(429, "Command queue full"))?;
             commands.used.insert(request_id.to_owned());
@@ -428,20 +501,59 @@ impl Session {
         self.wait_result(receiver, cancel).await
     }
     pub async fn screen(&self, cancel: CancellationToken) -> Result<Value> {
+        let entered = Instant::now();
+        let deadline =
+            ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+        self.screen_admitted(cancel, None, entered, deadline).await
+    }
+    pub(crate) async fn task_screen(
+        &self,
+        cancel: CancellationToken,
+        lease: &crate::control::TaskLease,
+    ) -> Result<Value> {
+        let entered = Instant::now();
+        let deadline =
+            ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+        self.screen_admitted(cancel, Some(lease), entered, deadline).await
+    }
+    async fn screen_admitted(
+        &self,
+        cancel: CancellationToken,
+        task: Option<&crate::control::TaskLease>,
+        queued_at: Instant,
+        deadline: ictl_protocol::ActionDeadline,
+    ) -> Result<Value> {
+        let admission = Some(match task {
+            Some(task) => self.control.task_job(task)?,
+            None => self.manual_admission()?,
+        });
         let (result, receiver) = watch::channel(None);
         self.jobs
-            .try_send(Job { request: JobRequest::Observe, result, cancel: cancel.clone(), queued_at: Instant::now() })
+            .try_send(Job {
+                request: JobRequest::Observe,
+                result,
+                cancel: cancel.clone(),
+                queued_at,
+                deadline: Some(deadline),
+                admission,
+            })
             .map_err(|_| ApiError::new(429, "Command queue full"))?;
         self.wait_result(receiver, cancel).await
     }
     // During a task, display its latest real observation without touching the device.
     // Null means the first task observation has not arrived yet.
     pub async fn preview(&self) -> Result<Value> {
-        if self.tasks.active().await {
+        let entered = Instant::now();
+        let deadline =
+            ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+        self.preview_at(entered, deadline).await
+    }
+    async fn preview_at(&self, queued_at: Instant, deadline: ictl_protocol::ActionDeadline) -> Result<Value> {
+        if self.control.task_owned() {
             return Ok(self.cached_preview().await);
         }
         let _guard = self.preview_lock.lock().await;
-        if self.tasks.active().await {
+        if self.control.task_owned() {
             return Ok(self.cached_preview().await);
         }
         if let Some(frame) = self.latest_screen.lock().await.as_ref()
@@ -450,13 +562,20 @@ impl Session {
         {
             return Ok(frame.image.clone());
         }
+        let admission = match self.manual_admission() {
+            Ok(admission) => Some(admission),
+            Err(error) if error.status == 409 => return Ok(self.cached_preview().await),
+            Err(error) => return Err(error),
+        };
         let (result, receiver) = watch::channel(None);
         self.jobs
             .try_send(Job {
                 request: JobRequest::Preview,
                 result,
                 cancel: self.cancel.clone(),
-                queued_at: Instant::now(),
+                queued_at,
+                deadline: Some(deadline),
+                admission,
             })
             .map_err(|_| ApiError::new(429, "Command queue full"))?;
         self.wait_result(receiver, self.cancel.clone()).await
@@ -468,11 +587,12 @@ impl Session {
         loop {
             let job = tokio::select! {biased;_=self.cancel.cancelled()=>break,job=jobs.recv()=>match job{Some(j)=>j,None=>break}};
             let queue_ms = job.queued_at.elapsed().as_millis() as u64;
-            let mut result = if job.cancel.is_cancelled() {
-                Err(ApiError::new(409, "Request cancelled; sent action is not retried"))
-            } else {
-                self.execute(job.request, job.cancel).await
-            };
+            let mut result =
+                if job.cancel.is_cancelled() || job.admission.as_ref().is_some_and(|a| !a.valid(&self.control)) {
+                    Err(ApiError::new(409, "Request cancelled; sent action is not retried"))
+                } else {
+                    self.execute(job.request, job.cancel, job.deadline, job.queued_at).await
+                };
             if let Ok(value) = &mut result
                 && value.is_object()
             {
@@ -484,13 +604,42 @@ impl Session {
             job.result.send_replace(Some(Err(ApiError::new(410, "Session closed"))));
         }
     }
-    async fn execute(&self, request: JobRequest, cancel: CancellationToken) -> Result<Value> {
+    fn check_deadline(
+        &self,
+        deadline: Option<ictl_protocol::ActionDeadline>,
+        entered: Instant,
+        stage: &str,
+    ) -> Result<()> {
+        if deadline.is_some_and(|deadline| {
+            entered.elapsed() >= ictl_protocol::ACTION_LIFETIME || deadline.expired().unwrap_or(true)
+        }) {
+            eprintln!(
+                "{} event=action_rejected session={} namespace={} category=expired stage={stage} queue_age_ms={} budget_ms=30000",
+                chrono::Utc::now().to_rfc3339(),
+                self.id,
+                self.namespace,
+                entered.elapsed().as_millis()
+            );
+            return Err(ApiError::new(409, "Action expired before dispatch; request was not sent"));
+        }
+        Ok(())
+    }
+    async fn execute(
+        &self,
+        request: JobRequest,
+        cancel: CancellationToken,
+        deadline: Option<ictl_protocol::ActionDeadline>,
+        entered: Instant,
+    ) -> Result<Value> {
+        self.check_deadline(deadline, entered, "gateway_queue")?;
         let observe = matches!(request, JobRequest::Observe);
-        if matches!(request, JobRequest::Preview) && self.tasks.active().await {
+        if matches!(request, JobRequest::Preview) && self.control.task_owned() {
             return Ok(self.cached_preview().await);
         }
-        let controller = self.ready().await?;
-        let native = |r| controller.request(r, Duration::from_secs(45), cancel.clone());
+        let controller = self.ready().await;
+        self.check_deadline(deadline, entered, "gateway_ready")?;
+        let controller = controller?;
+        let native = |r| controller.request_with_deadline(r, Duration::from_secs(45), cancel.clone(), deadline);
         if let JobRequest::Command(request) = request {
             if let Some(frame) = self.latest_screen.lock().await.as_mut() {
                 frame.fresh = false;
@@ -719,19 +868,40 @@ impl Session {
                             .map_err(|_| anyhow::anyhow!("Relay closed")),
                         9 => Ok(()),
                         10 if self.device.platform == Platform::Ios => {
+                            let entered = Instant::now();
+                            let deadline = ictl_protocol::ActionDeadline::admit();
                             if let Some(record) = self.pair.lock().await.clone() {
                                 outbound
                                     .send(Frame::json(12, 0, 0, &serde_json::to_value(record).unwrap()))
                                     .await
                                     .map_err(|_| anyhow::anyhow!("Relay closed"))
                             } else {
-                                let session = self.clone();
-                                tokio::spawn(async move {
-                                    if let Ok(c) = session.ready().await {
-                                        let _ = c.start_setup().await;
-                                    }
+                                let admitted = self.manual_admission().and_then(|admission| {
+                                    deadline
+                                        .map(|deadline| (admission, deadline))
+                                        .map_err(|_| ApiError::unavailable("Control admission unavailable"))
                                 });
-                                Ok(())
+                                match admitted {
+                                    Err(_) => outbound.send(Frame::json(7, frame.request_id, 0, &json!({"error":"Session control is busy or unavailable; stop the task before setup"}))).await
+                                        .map_err(|_| anyhow::anyhow!("Relay closed")),
+                                    Ok((admission, deadline)) => {
+                                        let session = self.clone(); let response = outbound.clone(); let request_id = frame.request_id;
+                                        tokio::spawn(async move {
+                                            let result = async {
+                                                let controller = session.ready().await?;
+                                                session.check_deadline(Some(deadline), entered, "pairing_ready")?;
+                                                controller.start_setup_admitted(admission, deadline).await.map_err(native_error)
+                                            }.await;
+                                            if result.is_err() {
+                                                eprintln!("{} event=control_rejected session={} namespace={} category=setup_unavailable stage=pairing_setup", chrono::Utc::now().to_rfc3339(), session.id, session.namespace);
+                                                if response.try_send(Frame::json(7, request_id, 0, &json!({"error":"Native setup unavailable; request was not retried"}))).is_err() {
+                                                    eprintln!("{} event=control_response_dropped session={} category=relay_unavailable", chrono::Utc::now().to_rfc3339(), session.id);
+                                                }
+                                            }
+                                        });
+                                        Ok(())
+                                    }
+                                }
                             }
                         }
                         11 => outbound
@@ -819,6 +989,14 @@ async fn handle(State(gateway): State<Arc<Gateway>>, request: Request<Body>) -> 
     response
 }
 async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
+    let entered = Instant::now();
+    let control_path = request.method() == Method::POST
+        && (request.uri().path().ends_with("/command")
+            || request.uri().path().ends_with("/setup")
+            || request.uri().path().ends_with("/setup/input"))
+        || request.method() == Method::GET
+            && (request.uri().path().ends_with("/screen") || request.uri().path().ends_with("/preview"));
+    let control_deadline = control_path.then(ictl_protocol::ActionDeadline::admit);
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
     if path == "/ios/device/ws" || path == "/device/ws" {
@@ -996,16 +1174,41 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             s.close_with_reason("api_deleted").await;
             Ok(reply(200, json!({"state":"closed"})))
         }
-        (Method::POST, ["command"]) => Ok(reply(200, s.run_command(body(request).await?, s.cancel.clone()).await?)),
-        (Method::GET, ["screen"]) => Ok(reply(200, s.screen(s.cancel.clone()).await?)),
-        (Method::GET, ["preview"]) => Ok(reply(200, s.preview().await?)),
+        (Method::POST, ["command"]) => {
+            let deadline = control_deadline
+                .expect("control route captured admission")
+                .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+            let input = body(request).await?;
+            Ok(reply(200, s.run_command_at(input, s.cancel.clone(), entered, deadline).await?))
+        }
+        (Method::GET, ["screen"]) => {
+            let deadline = control_deadline
+                .expect("control route captured admission")
+                .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+            Ok(reply(200, s.screen_admitted(s.cancel.clone(), None, entered, deadline).await?))
+        }
+        (Method::GET, ["preview"]) => {
+            let deadline = control_deadline
+                .expect("control route captured admission")
+                .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+            Ok(reply(200, s.preview_at(entered, deadline).await?))
+        }
         (Method::POST, ["setup"]) => {
+            let deadline = control_deadline
+                .expect("control route captured admission")
+                .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+            let admission = s.manual_admission()?;
             body(request).await?;
             let c = s.ready().await?;
-            c.start_setup().await.map_err(native_error)?;
+            s.check_deadline(Some(deadline), entered, "setup_ready")?;
+            c.start_setup_admitted(admission, deadline).await.map_err(native_error)?;
             Ok(reply(200, c.snapshot().await["setup"].clone()))
         }
         (Method::POST, ["setup", "input"]) => {
+            let deadline = control_deadline
+                .expect("control route captured admission")
+                .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+            let _admission = s.manual_admission()?;
             let input = body(request).await?;
             let line = input["line"]
                 .as_str()
@@ -1015,7 +1218,8 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             if c.snapshot().await["setup"]["state"] != "running" {
                 return Err(ApiError::new(409, "Setup is not running"));
             }
-            c.setup_input(line).await.map_err(native_error)?;
+            s.check_deadline(Some(deadline), entered, "setup_input_ready")?;
+            c.setup_input_with_deadline(line, deadline).await.map_err(native_error)?;
             Ok(reply(200, json!({"accepted":true})))
         }
         (Method::POST, ["tasks"]) => {
@@ -1054,5 +1258,122 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             ))
         }
         _ => Err(ApiError::new(404, "Route not found")),
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::android::AndroidController;
+    use std::sync::atomic::AtomicUsize;
+
+    async fn fixture() -> (Arc<Gateway>, Arc<Session>, Arc<AtomicUsize>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = Gateway::new(
+            Config {
+                token: "fixture".into(),
+                origins: HashSet::from(["http://localhost".into()]),
+                public_url: None,
+                runtime: dir.path().into(),
+                native: "/bin/false".into(),
+                web_dist: dir.path().into(),
+            },
+            Model::new(&HashMap::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let device = Device {
+            platform: Platform::Android,
+            serial_number: "android:fixture".into(),
+            vendor_id: 1,
+            product_id: 1,
+            product_name: None,
+        };
+        let session = gateway.create_session(device, None).await.unwrap();
+        let (outbound, mut frames) = mpsc::channel(10);
+        let controller = AndroidController::new(session.device.serial_number.clone(), outbound, session.cancel.clone());
+        assert!(session.controller.set(Controller::Android(controller.clone())).is_ok());
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counter = sent.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = frames.recv().await {
+                if frame.kind == 14 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    controller
+                        .handle(crate::relay::Frame::json(
+                            15,
+                            frame.request_id,
+                            0,
+                            &json!({"deviceId":"android:fixture","result":{"kind":"text","text":"dispatched"}}),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        (gateway, session, sent, dir)
+    }
+    #[tokio::test]
+    async fn deadline_is_rechecked_after_readiness_wait_without_reset() {
+        let (gateway, _manual_session, _, _dir) = fixture().await;
+        let device = Device {
+            platform: Platform::Ios,
+            serial_number: "b".repeat(40),
+            vendor_id: 1452,
+            product_id: 4776,
+            product_name: None,
+        };
+        let session = gateway.create_session(device.clone(), None).await.unwrap();
+        let native = NativeController::new(
+            "/bin/false".into(),
+            device,
+            "/tmp/unused-boundary".into(),
+            session.socket_dir.join("unused.sock"),
+            "127.0.0.1:1".into(),
+            session.cancel.clone(),
+        );
+        assert!(session.controller.set(Controller::Ios(native)).is_ok());
+        let deadline =
+            ictl_protocol::ActionDeadline::parse(json!(ictl_protocol::monotonic_ns().unwrap() + 40_000_000)).unwrap();
+        tokio::time::pause();
+        let running = session.clone();
+        let operation = tokio::spawn(async move {
+            running
+                .execute(
+                    JobRequest::Command(json!({"op":"tap","x":1,"y":2})),
+                    running.cancel.clone(),
+                    Some(deadline),
+                    Instant::now(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        // Only a short monotonic deadline elapses; the 30s readiness timer is virtual.
+        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let result = operation.await.unwrap();
+        assert!(matches!(&result, Err(e) if e.status == 409 && e.message.contains("expired")), "{result:?}");
+        gateway.cancel.cancel();
+    }
+
+    fn tap(id: &str) -> Value {
+        json!({"deviceId":"android:fixture","requestId":id,"tool":"iphone_tap","args":{"x":1,"y":2}})
+    }
+
+    #[tokio::test]
+    async fn expired_gateway_admission_never_dispatches_or_renews_duplicate() {
+        let (_gateway, session, sent, _dir) = fixture().await;
+        let deadline =
+            ictl_protocol::ActionDeadline::admit_at(ictl_protocol::monotonic_ns().unwrap() - 31_000_000_000).unwrap();
+        let entered = Instant::now() - Duration::from_secs(31);
+        let first = session.run_command_at(tap("expired"), session.cancel.clone(), entered, deadline).await;
+        assert!(matches!(&first, Err(error) if error.status == 409 && error.message.contains("expired")), "{first:?}");
+        let retry = session.run_command(tap("expired"), session.cancel.clone()).await;
+        assert!(matches!(&retry, Err(error) if error.message.contains("expired")), "{retry:?}");
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        let fresh = session.run_command(tap("fresh"), session.cancel.clone()).await.unwrap();
+        assert_eq!(session.run_command(tap("fresh"), session.cancel.clone()).await.unwrap(), fresh);
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        session.cancel.cancel();
     }
 }

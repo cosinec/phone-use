@@ -1,6 +1,7 @@
 pub mod android;
 pub mod attachments;
 pub mod commands;
+mod control;
 pub mod controller;
 pub mod error;
 pub mod gateway;

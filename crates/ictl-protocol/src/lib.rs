@@ -179,6 +179,20 @@ impl Response {
 }
 
 impl Request {
+    /// Commands that can change the device, including reads that automatically unlock.
+    pub fn requires_control(&self) -> bool {
+        self.is_device_action()
+            || matches!(
+                self,
+                Self::Screenshot { .. }
+                    | Self::Observe { .. }
+                    | Self::ListElements { .. }
+                    | Self::WaitFor { .. }
+                    | Self::UnlockReset
+                    | Self::Resign { .. }
+            )
+    }
+
     /// 会改变手机状态的操作。守护进程忙时排队太久就放弃，免得点击落到已经变了的屏幕上
     pub fn is_device_action(&self) -> bool {
         matches!(
@@ -231,6 +245,59 @@ pub const CANCEL_ON_CLOSE: &str = "cancel_on_close";
 pub const EXPECT_UDID: &str = "expect_udid";
 /// Optional numeric correlation ID for gateway and daemon diagnostics.
 pub const DIAGNOSTIC_ID: &str = "diagnostic_id";
+
+/// Internal gateway/native deadline; same-host CLOCK_MONOTONIC nanoseconds.
+pub const ACTION_DEADLINE: &str = "action_deadline_monotonic_ns";
+pub const ACTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionDeadline(u64);
+impl ActionDeadline {
+    pub fn admit() -> std::io::Result<Self> {
+        Self::admit_at(monotonic_ns()?)
+    }
+    pub fn admit_at(now_ns: u64) -> std::io::Result<Self> {
+        now_ns
+            .checked_add(ACTION_LIFETIME.as_nanos() as u64)
+            .map(Self)
+            .ok_or_else(|| std::io::Error::other("Action deadline overflow"))
+    }
+    pub fn parse(value: serde_json::Value) -> std::io::Result<Self> {
+        Self::parse_at(value, monotonic_ns()?)
+    }
+    pub fn parse_at(value: serde_json::Value, now_ns: u64) -> std::io::Result<Self> {
+        let ns = value.as_u64().ok_or_else(|| std::io::Error::other("Invalid action deadline metadata"))?;
+        let latest = Self::admit_at(now_ns)?;
+        if ns > latest.0 {
+            return Err(std::io::Error::other("Action deadline exceeds local maximum"));
+        }
+        Ok(Self(ns))
+    }
+    pub fn wire_ns(self) -> u64 {
+        self.0
+    }
+    pub fn expired(self) -> std::io::Result<bool> {
+        Ok(self.expired_at(monotonic_ns()?))
+    }
+    pub fn expired_at(self, now_ns: u64) -> bool {
+        now_ns >= self.0
+    }
+}
+
+pub fn monotonic_ns() -> std::io::Result<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime writes an initialized timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the successful clock_gettime call initialized time.
+    let time = unsafe { time.assume_init() };
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|s| s.checked_mul(1_000_000_000))
+        .and_then(|ns| u64::try_from(time.tv_nsec).ok().filter(|n| *n < 1_000_000_000).and_then(|n| ns.checked_add(n)))
+        .ok_or_else(|| std::io::Error::other("Invalid monotonic clock"))
+}
 
 /// Request key carrying the client's language (`zh` / `en`). The daemon answers in it; requests without it
 /// (older clients) get Chinese, as before. Older daemons ignore the extra key
@@ -286,6 +353,46 @@ pub async fn call_expecting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_deadline_rejects_malformed_future_and_expired_metadata_without_renewing() {
+        let now = 100_000_000_000;
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("130000000000"),
+            serde_json::json!(-1),
+            serde_json::json!(1.2),
+            serde_json::json!(true),
+            serde_json::json!(u64::MAX),
+        ] {
+            assert!(ActionDeadline::parse_at(value.clone(), now).is_err(), "accepted {value}");
+        }
+        let deadline = ActionDeadline::admit_at(now).unwrap();
+        assert!(!deadline.expired_at(now + 29_999_999_999));
+        assert!(deadline.expired_at(now + 30_000_000_000));
+        let forwarded = ActionDeadline::parse_at(serde_json::json!(deadline.wire_ns()), now + 20_000_000_000).unwrap();
+        assert_eq!(forwarded, deadline);
+        assert!(forwarded.expired_at(now + 30_000_000_001));
+        assert!(ActionDeadline::admit_at(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn control_classification_includes_automatic_unlock_reads() {
+        for req in [
+            Request::Screenshot { region: None },
+            Request::Observe { limit: 0, snapshot_timeout_ms: 0 },
+            Request::ListElements { filter: String::new(), limit: 0, max_age_ms: 0, snapshot_timeout_ms: 0 },
+            Request::WaitFor { text: String::new(), timeout_ms: 0 },
+            Request::UnlockReset,
+            Request::Resign { force: false },
+        ] {
+            assert!(req.requires_control(), "{req:?} can change device state");
+        }
+        for req in [Request::Daemon, Request::Status, Request::ListApps { include_system: false }, Request::ListDevices]
+        {
+            assert!(!req.requires_control());
+        }
+    }
 
     #[test]
     fn requests_round_trip_as_tagged_json() {

@@ -20,6 +20,7 @@ struct Task {
     snapshot: Value,
     cancel: CancellationToken,
     confirmation: Option<oneshot::Sender<()>>,
+    lease: Option<crate::control::TaskLease>,
 }
 pub struct TaskManager {
     task: Mutex<Option<Task>>,
@@ -62,6 +63,7 @@ impl TaskManager {
         if session.cancel.is_cancelled() {
             return Err(ApiError::new(410, "Session closed"));
         }
+        let lease = session.claim_task()?;
         let id = uuid::Uuid::new_v4().to_string();
         let cancel = session.cancel.child_token();
         let snapshot = json!({
@@ -69,14 +71,19 @@ impl TaskManager {
             "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
             "attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100
         });
-        *guard = Some(Task { snapshot: snapshot.clone(), cancel: cancel.clone(), confirmation: None });
+        *guard = Some(Task {
+            snapshot: snapshot.clone(),
+            cancel: cancel.clone(),
+            confirmation: None,
+            lease: Some(lease.clone()),
+        });
         drop(guard);
         tokio::spawn(async move {
             tokio::select! {biased;
                 _=session.cancel.cancelled()=>session.tasks.finish(&id,"stopped",Some("Session disconnected. Already sent actions cannot be undone.".into()),None).await,
                 _=cancel.cancelled()=>{},
                 _=tokio::time::sleep(Duration::from_secs(1800))=>session.tasks.finish(&id,"failed",None,Some("任务已达到 30 分钟时限".into())).await,
-                result=run(session.clone(),&id,model,images,cancel.clone())=>match result{
+                result=run(session.clone(),&id,model,images,cancel.clone(),&lease)=>match result{
                     Ok(message)=>session.tasks.finish(&id,"completed",Some(message),None).await,
                     Err(error)=>session.tasks.finish(&id,"failed",None,Some(error.message)).await,
                 }
@@ -110,6 +117,9 @@ impl TaskManager {
         task.snapshot["confirmation"] = Value::Null;
         task.confirmation = None;
         task.cancel.cancel();
+        if let Some(lease) = task.lease.take() {
+            lease.cancel();
+        }
     }
     pub async fn disconnect(&self) {
         let id = self.snapshot().await["id"].as_str().map(str::to_owned);
@@ -184,7 +194,13 @@ fn confirmation_required(action: &Value, request: &Value) -> bool {
             )))
 }
 
-async fn recover_observation(s: &Session, id: &str, episode: u32, cancel: CancellationToken) -> Result<Value> {
+async fn recover_observation(
+    s: &Session,
+    id: &str,
+    episode: u32,
+    cancel: CancellationToken,
+    lease: &crate::control::TaskLease,
+) -> Result<Value> {
     if episode > MAX_RECOVERIES {
         return Err(ApiError::unavailable("任务已达到 2 次恢复次数上限，请检查设备后重新开始。"));
     }
@@ -214,7 +230,7 @@ async fn recover_observation(s: &Session, id: &str, episode: u32, cancel: Cancel
                 .and_then(|response| serde_json::from_str::<Value>(response["text"].as_str()?).ok())
                 .is_some_and(|state| state["state"]["state"] == "ready");
             if ready {
-                match s.screen(attempt).await {
+                match s.task_screen(attempt, lease).await {
                     Ok(observation) => return Ok(observation),
                     Err(error) if recoverable_observation_error(&error.message) => {}
                     Err(error) => return Err(error),
@@ -251,6 +267,7 @@ async fn run(
     model: Model,
     images: Vec<crate::attachments::ReferenceImage>,
     cancel: CancellationToken,
+    lease: &crate::control::TaskLease,
 ) -> Result<String> {
     // Keep bounded tool content private to the inference loop, out of polled UI snapshots.
     let mut history: Vec<Value> = Vec::new();
@@ -273,14 +290,14 @@ async fn run(
         } else if let Some(observation) = next_observation.take() {
             observation
         } else {
-            match s.screen(cancel.clone()).await {
+            match s.task_screen(cancel.clone(), lease).await {
                 Ok(observation) => observation,
                 Err(error)
                     if s.device.platform == crate::identity::Platform::Ios
                         && recoverable_observation_error(&error.message) =>
                 {
                     recoveries += 1;
-                    recover_observation(&s, id, recoveries, cancel.clone()).await?
+                    recover_observation(&s, id, recoveries, cancel.clone(), lease).await?
                 }
                 Err(error) => return Err(error),
             }
@@ -376,7 +393,7 @@ async fn run(
             "tool": action["tool"], "args": action["args"]
         });
         let executing = Instant::now();
-        let result = match s.run_command(command, cancel.clone()).await {
+        let result = match s.run_task_command(command, cancel.clone(), lease).await {
             Ok(result) => result,
             Err(error)
                 if s.device.platform == crate::identity::Platform::Ios && recoverable_wda_error(&error.message) =>
@@ -436,7 +453,7 @@ async fn run(
         if failed {
             if recoverable {
                 recoveries += 1;
-                next_observation = Some(recover_observation(&s, id, recoveries, cancel.clone()).await?);
+                next_observation = Some(recover_observation(&s, id, recoveries, cancel.clone(), lease).await?);
                 if needs_confirmation || request["op"] == "type_text" {
                     return Err(ApiError::unavailable(
                         "设备已恢复，但上一步操作结果不确定。请先核对手机上的实际结果，再重新开始任务。",
