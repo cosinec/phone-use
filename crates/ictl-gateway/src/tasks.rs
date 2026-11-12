@@ -15,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 const RECOVERY_WAIT: Duration = Duration::from_secs(120);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECOVERIES: u32 = 2;
+/// OCR text often differs from accessibility labels, so in OCR mode a missed
+/// element tap (nothing was tapped, no side effect) is reported back to the
+/// model instead of halting, at most this many times per task.
+const MAX_OCR_ELEMENT_MISSES: u32 = 2;
 
 struct TaskStage<'a> {
     session_id: &'a str,
@@ -318,6 +322,7 @@ async fn run(
     let mut history: Vec<Value> = Vec::new();
     let mut next_observation: Option<Value> = None;
     let mut focus_recoveries = 0;
+    let mut element_misses = 0;
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
@@ -556,9 +561,13 @@ async fn run(
             return Err(ApiError::unavailable(cause));
         }
         if missed {
-            return Err(ApiError::new(409, "Element tap missed; task halted"));
+            element_misses += 1;
+            if !continue_after_element_miss(model.observation_mode(), element_misses) {
+                return Err(ApiError::new(409, "Element tap missed; task halted"));
+            }
         }
-        if matches!(request["op"].as_str(), Some("tap" | "tap_element")) {
+        // A missed element tap changed nothing, so it cannot have focused a field.
+        if !missed && matches!(request["op"].as_str(), Some("tap" | "tap_element")) {
             typing_blocked = false;
         }
         if request["op"] == "type_text" {
@@ -591,6 +600,10 @@ fn direct_command(instruction: &str) -> Option<Value> {
         json!({"type":"action","tool":tool,"args":args,"reason":"执行用户明确指定的单步操作，随后观察并验证结果","requiresConfirmation":false}),
     )
 }
+fn continue_after_element_miss(mode: crate::model::ObservationMode, misses: u32) -> bool {
+    mode == crate::model::ObservationMode::Ocr && misses <= MAX_OCR_ELEMENT_MISSES
+}
+
 fn inference_result(result: &Value) -> Value {
     let mut summary = json!({"kind":result["kind"]});
     for key in ["text", "caption", "message"] {
@@ -625,6 +638,16 @@ mod tests {
             vec!["at", "elapsed_ms", "event", "observation_id", "phase", "session_id", "stage", "status", "task_id"]
         );
         stage.finish("error");
+    }
+
+    #[test]
+    fn only_ocr_mode_continues_after_a_bounded_number_of_element_misses() {
+        use crate::model::ObservationMode::{Hybrid, Image, Ocr};
+        assert!(continue_after_element_miss(Ocr, 1));
+        assert!(continue_after_element_miss(Ocr, MAX_OCR_ELEMENT_MISSES));
+        assert!(!continue_after_element_miss(Ocr, MAX_OCR_ELEMENT_MISSES + 1));
+        assert!(!continue_after_element_miss(Image, 1));
+        assert!(!continue_after_element_miss(Hybrid, 1));
     }
 
     #[test]

@@ -871,6 +871,9 @@ for line in sys.stdin:
         let image = ObservationMode::Image.system_prompt();
         let hybrid = ObservationMode::Hybrid.system_prompt();
         assert!(ocr.contains("You receive no visual image") && !ocr.contains("phoneImageUrl"));
+        // OCR text is not an accessibility label: steer taps to OCR coordinates.
+        assert!(ocr.contains("iphone_tap at the center of its phonePolygon"));
+        assert!(ocr.contains("exact label taken from a fresh iphone_list_elements result"));
         assert!(image.contains("phoneImageUrl") && !image.contains("phonePolygon"));
         assert!(hybrid.contains("phoneImageUrl") && hybrid.contains("phonePolygon"));
         for prompt in [ocr, image, hybrid] {
