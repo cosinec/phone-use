@@ -49,6 +49,7 @@ async fn run() -> anyhow::Result<()> {
         web_dist: PathBuf::from(value("WEB_DIST_DIR", default_dist)),
     };
     let model = Model::new(&env)?;
+    model.warm_ocr();
     let gateway = Gateway::new(config, model).await?;
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     println!("Gateway listening http://{}", listener.local_addr()?);

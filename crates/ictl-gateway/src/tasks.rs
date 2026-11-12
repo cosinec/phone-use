@@ -16,35 +16,6 @@ const RECOVERY_WAIT: Duration = Duration::from_secs(120);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECOVERIES: u32 = 2;
 
-#[derive(Default)]
-struct ObservationBackoff {
-    previous_screenshot: Option<Value>,
-    delay: Duration,
-}
-impl ObservationBackoff {
-    fn delay_for(&mut self, request: &Value) -> Duration {
-        if request["op"] != "screenshot" {
-            *self = Self::default();
-            return Duration::ZERO;
-        }
-        if self.previous_screenshot.as_ref() == Some(request) {
-            self.delay = (self.delay * 2).max(Duration::from_millis(250)).min(Duration::from_secs(2));
-        } else {
-            self.previous_screenshot = Some(request.clone());
-            self.delay = Duration::ZERO;
-        }
-        self.delay
-    }
-}
-
-async fn wait_for_observation_backoff(delay: Duration, cancel: &CancellationToken) -> Result<()> {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(ApiError::new(409, "Task cancelled")),
-        _ = tokio::time::sleep(delay) => Ok(()),
-    }
-}
-
 struct TaskStage<'a> {
     session_id: &'a str,
     task_id: &'a str,
@@ -273,6 +244,7 @@ async fn recover_observation(
     episode: u32,
     cancel: CancellationToken,
     lease: &crate::control::TaskLease,
+    elements: bool,
 ) -> Result<Value> {
     if episode > MAX_RECOVERIES {
         return Err(ApiError::unavailable("任务已达到 2 次恢复次数上限，请检查设备后重新开始。"));
@@ -303,7 +275,7 @@ async fn recover_observation(
                 .and_then(|response| serde_json::from_str::<Value>(response["text"].as_str()?).ok())
                 .is_some_and(|state| state["state"]["state"] == "ready");
             if ready {
-                match s.task_screen(attempt, lease).await {
+                match s.task_screen(attempt, lease, elements).await {
                     Ok(observation) => return Ok(observation),
                     Err(error) if recoverable_observation_error(&error.message) => {}
                     Err(error) => return Err(error),
@@ -349,7 +321,6 @@ async fn run(
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
-    let mut observation_backoff = ObservationBackoff::default();
     loop {
         let observation_id = uuid::Uuid::new_v4().to_string();
         let snapshot = s
@@ -373,14 +344,14 @@ async fn run(
             } else if let Some(observation) = next_observation.take() {
                 Ok(observation)
             } else {
-                match s.task_screen(cancel.clone(), lease).await {
+                match s.task_screen(cancel.clone(), lease, model.wants_elements()).await {
                     Ok(observation) => Ok(observation),
                     Err(error)
                         if s.device.platform == crate::identity::Platform::Ios
                             && recoverable_observation_error(&error.message) =>
                     {
                         recoveries += 1;
-                        recover_observation(&s, id, recoveries, cancel.clone(), lease).await
+                        recover_observation(&s, id, recoveries, cancel.clone(), lease, model.wants_elements()).await
                     }
                     Err(error) => Err(error),
                 }
@@ -472,12 +443,6 @@ async fn run(
         if needs_confirmation {
             tokio::select! {biased;_=cancel.cancelled()=>return Err(ApiError::new(409,"Task cancelled")),r=receiver=>r.map_err(|_|ApiError::new(409,"Task cancelled"))?}
         }
-        // Repeated requests for the same full frame or crop are polling. Keep
-        // the first request immediate, and let semantic queries, explicit native
-        // waits and actual device actions reset this bounded observation delay.
-        let delay = observation_backoff.delay_for(&request);
-        timings["observationBackoffMs"] = json!(delay.as_millis() as u64);
-        wait_for_observation_backoff(delay, &cancel).await?;
         s.tasks
             .update(id, |t| {
                 t.snapshot["state"] = json!("executing");
@@ -556,7 +521,8 @@ async fn run(
         if failed {
             if recoverable {
                 recoveries += 1;
-                next_observation = Some(recover_observation(&s, id, recoveries, cancel.clone(), lease).await?);
+                next_observation =
+                    Some(recover_observation(&s, id, recoveries, cancel.clone(), lease, model.wants_elements()).await?);
                 if needs_confirmation || request["op"] == "type_text" {
                     return Err(ApiError::unavailable(
                         "设备已恢复，但上一步操作结果不确定。请先核对手机上的实际结果，再重新开始任务。",
@@ -659,64 +625,6 @@ mod tests {
             vec!["at", "elapsed_ms", "event", "observation_id", "phase", "session_id", "stage", "status", "task_id"]
         );
         stage.finish("error");
-    }
-
-    #[test]
-    fn repeated_screenshot_backoff_is_bounded_and_single_requests_stay_immediate() {
-        let mut backoff = ObservationBackoff::default();
-        let request = json!({"op":"screenshot","region":null});
-        let delays: Vec<_> = (0..8).map(|_| backoff.delay_for(&request).as_millis()).collect();
-        assert_eq!(delays, vec![0, 250, 500, 1000, 2000, 2000, 2000, 2000]);
-    }
-
-    #[test]
-    fn different_crops_and_semantic_queries_reset_screenshot_backoff() {
-        let mut backoff = ObservationBackoff::default();
-        let full = json!({"op":"screenshot","region":null});
-        let crop = json!({"op":"screenshot","region":[10,20,30,40]});
-        let another_crop = json!({"op":"screenshot","region":[50,20,30,40]});
-        assert_eq!(backoff.delay_for(&full), Duration::ZERO);
-        assert_eq!(backoff.delay_for(&full), Duration::from_millis(250));
-        for request in [&crop, &another_crop, &full] {
-            assert_eq!(backoff.delay_for(request), Duration::ZERO);
-        }
-        for operation in ["tap", "list_apps", "list_elements", "status", "wait_for"] {
-            assert_eq!(backoff.delay_for(&full), Duration::from_millis(250));
-            assert_eq!(backoff.delay_for(&json!({"op":operation})), Duration::ZERO);
-            assert_eq!(backoff.delay_for(&full), Duration::ZERO);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancelled_screenshot_backoff_never_dispatches_its_action() {
-        let cancel = CancellationToken::new();
-        let waiting_cancel = cancel.clone();
-        let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let waiting_dispatched = dispatched.clone();
-        let waiting = tokio::spawn(async move {
-            wait_for_observation_backoff(Duration::from_secs(2), &waiting_cancel).await?;
-            waiting_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok::<_, ApiError>(())
-        });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(100)).await;
-        cancel.cancel();
-        let result = waiting.await.unwrap();
-        assert_eq!(result.unwrap_err().message, "Task cancelled");
-        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn screenshot_backoff_waits_for_the_selected_delay() {
-        let cancel = CancellationToken::new();
-        let start = tokio::time::Instant::now();
-        wait_for_observation_backoff(Duration::from_millis(250), &cancel).await.unwrap();
-        assert_eq!(start.elapsed(), Duration::from_millis(250));
-        let start = tokio::time::Instant::now();
-        wait_for_observation_backoff(Duration::ZERO, &cancel).await.unwrap();
-        assert_eq!(start.elapsed(), Duration::ZERO);
-        cancel.cancel();
-        assert!(wait_for_observation_backoff(Duration::ZERO, &cancel).await.is_err());
     }
 
     #[test]

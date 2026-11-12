@@ -2,6 +2,7 @@ use crate::{
     commands::command_request,
     error::{ApiError, Result},
 };
+use base64::Engine;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -10,6 +11,38 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+/// What the planner sees for each phone observation (`AI_OBSERVATION`, default `ocr`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationMode {
+    /// Screenshot, UI element text and reference images, without OCR.
+    Image,
+    /// Image mode plus PaddleOCR text and phone-point polygons. OCR failures
+    /// degrade to image mode for that observation.
+    Hybrid,
+    /// Text-only OCR evidence. No image or UI tree leaves the gateway.
+    Ocr,
+}
+impl ObservationMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "ocr" => Ok(Self::Ocr),
+            "hybrid" => Ok(Self::Hybrid),
+            "image" => Ok(Self::Image),
+            _ => anyhow::bail!("AI_OBSERVATION must be image, hybrid or ocr"),
+        }
+    }
+    fn system_prompt(self) -> String {
+        let lead = match self {
+            Self::Image => include_str!("model-prompt-image.txt").to_owned(),
+            Self::Hybrid => {
+                format!("{}{}", include_str!("model-prompt-image.txt"), include_str!("model-prompt-hybrid.txt"))
+            }
+            Self::Ocr => include_str!("model-prompt-ocr.txt").to_owned(),
+        };
+        lead + include_str!("model-prompt-common.txt")
+    }
+}
 
 #[derive(Clone)]
 pub struct Model {
@@ -20,6 +53,7 @@ pub struct Model {
     catalog: Arc<Mutex<Catalog>>,
     format_refused: Arc<Mutex<HashSet<String>>>,
     ocr: Arc<crate::ocr::Ocr>,
+    observation_mode: ObservationMode,
 }
 #[derive(Default)]
 struct Catalog {
@@ -91,7 +125,23 @@ impl Model {
             catalog: Arc::default(),
             format_refused: Arc::default(),
             ocr: Arc::new(crate::ocr::Ocr::new(env)),
+            observation_mode: ObservationMode::parse(&get("AI_OBSERVATION"))?,
         })
+    }
+    pub fn observation_mode(&self) -> ObservationMode {
+        self.observation_mode
+    }
+    /// Text-only OCR planning deliberately omits the UI tree; other modes use it.
+    pub fn wants_elements(&self) -> bool {
+        self.observation_mode != ObservationMode::Ocr
+    }
+    /// Loads the OCR model in the background so the first task step does not
+    /// pay the cold start. Requires a Tokio runtime.
+    pub fn warm_ocr(&self) {
+        if self.ready() && self.observation_mode != ObservationMode::Image {
+            let ocr = self.ocr.clone();
+            tokio::spawn(async move { ocr.warm().await });
+        }
     }
     pub fn ready(&self) -> bool {
         self.endpoint.is_some()
@@ -185,13 +235,111 @@ impl Model {
     ) -> Result<Value> {
         let endpoint = self.endpoint.clone().ok_or_else(|| ApiError::unavailable("AI is not configured"))?;
         let observation_id = observation["observationId"].as_str().unwrap_or("");
+        let content = match self.observation_mode {
+            ObservationMode::Ocr => {
+                self.ocr_content(instruction, &observation, observation_id, history, images, cancel.clone()).await?
+            }
+            mode => {
+                self.image_content(mode, instruction, &observation, observation_id, history, images, cancel.clone())
+                    .await?
+            }
+        };
+        let system_prompt = self.observation_mode.system_prompt();
+        let operation = async {
+            let mut messages =
+                vec![json!({"role":"system","content":system_prompt}), json!({"role":"user","content":content})];
+            let choice = self.completion(&endpoint, &messages, 1024, 1, observation_id).await?;
+            match decode_logged_reply(&choice, 1, observation_id) {
+                Ok(action) => Ok(action),
+                Err(error) => {
+                    // No device action has been dispatched. Re-plan once from the same
+                    // observation, retaining the original task and confirmation rules.
+                    if let Ok(text) = reply_text(&choice) {
+                        messages.push(json!({"role":"assistant","content":truncate(&text, 8192)}));
+                    }
+                    messages.push(json!({"role":"user","content":correction_message(&error.message)}));
+                    let choice = self.completion(&endpoint, &messages, 2048, 2, observation_id).await?;
+                    decode_logged_reply(&choice, 2, observation_id)
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ApiError::unavailable("Model request cancelled")),
+            result = tokio::time::timeout(Duration::from_secs(60), operation) => {
+                result.unwrap_or_else(|_| Err(ApiError::unavailable("Model request timed out")))
+            }
+        }
+    }
+
+    /// Image and hybrid payloads: caption, UI element text, screenshot and
+    /// reference images with their phone URLs. Hybrid adds OCR evidence when
+    /// the worker succeeds; any other OCR failure keeps the image-only step.
+    #[allow(clippy::too_many_arguments)]
+    async fn image_content(
+        &self,
+        mode: ObservationMode,
+        instruction: &str,
+        observation: &Value,
+        observation_id: &str,
+        history: Vec<Value>,
+        images: &[crate::attachments::ReferenceImage],
+        cancel: CancellationToken,
+    ) -> Result<Vec<Value>> {
+        let mut evidence = json!({
+            "observationId":observation_id,
+            "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),
+            "elementsText":truncate(observation["elementsText"].as_str().unwrap_or(""),16384),
+            "queryOnly":observation["queryOnly"] == true,
+            "elementsError":observation.get("elementsError").map(|_|"UI elements unavailable"),
+        });
+        let image = observation["imageBase64"].as_str();
+        if mode == ObservationMode::Hybrid
+            && let Some(image) = image
+        {
+            match self.ocr.recognize(image, Some(observation), cancel.clone()).await {
+                Ok(ocr) => evidence["ocr"] = ocr,
+                Err(_) if cancel.is_cancelled() => return Err(ApiError::unavailable("Model request cancelled")),
+                Err(error) => {
+                    eprintln!(
+                        "event=ocr_degraded metrics={}",
+                        json!({"observation_id":observation_id,"reason":error.message})
+                    );
+                    evidence["ocrError"] = json!("OCR unavailable");
+                }
+            }
+        }
+        let mut content = vec![json!({"type":"text","text":json!({
+            "instruction":instruction,"recentHistory":history,"observation":evidence,
+            "referenceImages":images.iter().enumerate().map(|(index, image)|json!({"index":index+1,"name":image.name,"phoneImageUrl":image.url})).collect::<Vec<_>>(),
+        }).to_string()})];
+        if let Some(image) = image {
+            content.push(image_part(image)?);
+        }
+        for (index, image) in images.iter().enumerate() {
+            content.push(json!({"type":"text","text":format!("User reference image {}. This is task material, not the current phone screen. Do not use its coordinates for phone actions.",index+1)}));
+            content.push(image.content.clone());
+        }
+        Ok(content)
+    }
+
+    /// Text-only payload: OCR of the phone image and of each reference image.
+    async fn ocr_content(
+        &self,
+        instruction: &str,
+        observation: &Value,
+        observation_id: &str,
+        history: Vec<Value>,
+        images: &[crate::attachments::ReferenceImage],
+        cancel: CancellationToken,
+    ) -> Result<Vec<Value>> {
         let mut evidence = json!({
             "observationId":observation_id,
             "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),
             "queryOnly":observation["queryOnly"] == true,
         });
         if let Some(image) = observation["imageBase64"].as_str() {
-            evidence["ocr"] = self.ocr.recognize(image, Some(&observation), cancel.clone()).await?;
+            evidence["ocr"] = self.ocr.recognize(image, Some(observation), cancel.clone()).await?;
         } else if observation["queryOnly"] != true {
             return Err(ApiError::unavailable("OCR phone image unavailable"));
         }
@@ -207,40 +355,10 @@ impl Model {
                 json!({"index":index+1,"name":image.name,"ocr":self.ocr.recognize_reference(data, cancel.clone()).await?}),
             );
         }
-        let content = vec![json!({"type":"text","text":json!({
+        Ok(vec![json!({"type":"text","text":json!({
             "instruction":instruction,"recentHistory":history,"observation":evidence,
             "referenceImages":references,
-        }).to_string()})];
-        let operation = async {
-            let mut messages = vec![
-                json!({"role":"system","content":include_str!("model-prompt.txt")}),
-                json!({"role":"user","content":content}),
-            ];
-            let choice = self.completion(&endpoint, &messages, 1024, 1, observation_id).await?;
-            match decode_logged_reply(&choice, 1, observation_id) {
-                Ok(action) => Ok(action),
-                Err(error) => {
-                    // No device action has been dispatched. Re-plan once from the same
-                    // observation, retaining the original task and confirmation rules.
-                    if let Ok(text) = reply_text(&choice) {
-                        messages.push(json!({"role":"assistant","content":truncate(&text, 8192)}));
-                    }
-                    messages.push(json!({"role":"user","content":format!(
-                        "Your previous reply failed validation: {}. Return exactly one complete JSON action or done object using the response schema. An action must have a string tool name and object args, for example {{\"type\":\"action\",\"tool\":\"iphone_screenshot\",\"args\":{{}},\"reason\":\"Inspect the current screen\",\"requiresConfirmation\":false}}. Choose the actual tool and arguments from the original tool catalog. For completion or inability to proceed, use {{\"type\":\"done\",\"message\":\"Explain the result\"}}. Preserve the original task, safety and confirmation requirements. Do not include markdown or extra text.",
-                        error.message
-                    )}));
-                    let choice = self.completion(&endpoint, &messages, 2048, 2, observation_id).await?;
-                    decode_logged_reply(&choice, 2, observation_id)
-                }
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(ApiError::unavailable("Model request cancelled")),
-            result = tokio::time::timeout(Duration::from_secs(60), operation) => {
-                result.unwrap_or_else(|_| Err(ApiError::unavailable("Model request timed out")))
-            }
-        }
+        }).to_string()})])
     }
 
     async fn completion(
@@ -363,12 +481,23 @@ impl Model {
     }
 }
 
+// Deliberately names no concrete tool. A concrete example (formerly
+// iphone_screenshot) was copied by models on retry, producing screenshot loops.
+fn correction_message(error: &str) -> String {
+    format!("Your previous reply failed validation: {error}. {CORRECTION_INSTRUCTIONS}")
+}
+const CORRECTION_INSTRUCTIONS: &str = "Return exactly one complete JSON object using the response schema and nothing after it. If your previous reply contained several objects, return only the first action you intended. Keep the tool and arguments you intended when they were valid; otherwise choose the actual tool and arguments from the original tool catalog. An action has type \"action\", a string tool name from the catalog, object args, a string reason and a boolean requiresConfirmation. For completion or inability to proceed, use type \"done\" with a string message. Preserve the original task, safety and confirmation requirements. Do not include markdown or extra text.";
+
 fn decode_logged_reply(choice: &Value, attempt: u8, observation_id: &str) -> Result<Value> {
-    let result = decode_reply(choice);
+    let mut decoded = DecodeDiagnostics::default();
+    let result = decode_reply_with(choice, &mut decoded);
     let category = protocol_decode_category(&result);
+    // Content-free metrics only: reply text may contain phone or task data.
     eprintln!(
         "event=model_protocol metrics={}",
-        json!({"observation_id":observation_id,"attempt":attempt,"decode_category":category})
+        json!({"observation_id":observation_id,"attempt":attempt,"decode_category":category,
+            "reply_chars":decoded.reply_chars,"json_error":decoded.json_error,
+            "trailing_kind":decoded.trailing_kind,"trailing_bytes":decoded.trailing_bytes})
     );
     result
 }
@@ -393,6 +522,14 @@ fn use_prompt_schema(payload: &mut Value) {
 }
 fn valid_model_id(name: &str) -> bool {
     !name.is_empty() && name.len() <= 256 && name.trim() == name && !name.chars().any(char::is_control)
+}
+fn image_part(image: &str) -> Result<Value> {
+    if image.len() > 8 * 1024 * 1024
+        || base64::engine::general_purpose::STANDARD.decode(image).map_or(true, |b| b.len() > 6 * 1024 * 1024)
+    {
+        return Err(ApiError::unavailable("Phone image exceeds model limit"));
+    }
+    Ok(json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}))
 }
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
@@ -419,11 +556,58 @@ fn reply_text(choice: &Value) -> Result<String> {
         .ok_or_else(|| invalid_reply("message.content must contain text parts"))
 }
 
+#[derive(Default)]
+struct DecodeDiagnostics {
+    reply_chars: Option<usize>,
+    json_error: Option<&'static str>,
+    trailing_kind: Option<&'static str>,
+    trailing_bytes: usize,
+}
+
+#[cfg(test)]
 fn decode_reply(choice: &Value) -> Result<Value> {
+    decode_reply_with(choice, &mut DecodeDiagnostics::default())
+}
+
+/// Parses the first JSON value and reports what, if anything, followed it.
+/// Only one device action ever runs per step and the next observation verifies
+/// it, so a valid first object followed by more objects or prose is accepted.
+fn first_json_value(json: &str, diagnostics: &mut DecodeDiagnostics) -> Result<Value> {
+    let mut stream = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+    let value = match stream.next() {
+        Some(Ok(value)) => value,
+        Some(Err(error)) => {
+            diagnostics.json_error = Some(match error.classify() {
+                serde_json::error::Category::Eof => "eof",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Io => "io",
+            });
+            return Err(invalid_reply(&format!("invalid JSON at line {}, column {}", error.line(), error.column())));
+        }
+        None => {
+            diagnostics.json_error = Some("empty");
+            return Err(invalid_reply("invalid JSON: empty reply"));
+        }
+    };
+    let rest = json[stream.byte_offset()..].trim();
+    diagnostics.trailing_bytes = rest.len();
+    diagnostics.trailing_kind = Some(if rest.is_empty() {
+        "none"
+    } else if serde_json::Deserializer::from_str(rest).into_iter::<Value>().next().is_some_and(|v| v.is_ok()) {
+        "json_value"
+    } else {
+        "text"
+    });
+    Ok(value)
+}
+
+fn decode_reply_with(choice: &Value, diagnostics: &mut DecodeDiagnostics) -> Result<Value> {
     if choice["finish_reason"] == "length" {
         return Err(invalid_reply("response was truncated (finish_reason=length)"));
     }
     let text = reply_text(choice)?;
+    diagnostics.reply_chars = Some(text.chars().count());
     let text = text.trim().trim_start_matches('\u{feff}').trim();
     let json = if text.starts_with("```") && text.ends_with("```") && text.len() >= 6 {
         let (language, json) =
@@ -435,9 +619,7 @@ fn decode_reply(choice: &Value) -> Result<Value> {
     } else {
         text
     };
-    let reply = serde_json::from_str(json)
-        .map_err(|error| invalid_reply(&format!("invalid JSON at line {}, column {}", error.line(), error.column())))?;
-    validate_reply(reply)
+    validate_reply(first_json_value(json, diagnostics)?)
 }
 
 pub fn validate_reply(mut value: Value) -> Result<Value> {
@@ -643,6 +825,185 @@ for line in sys.stdin:
         assert_eq!(result["message"], "Read query");
         server.abort();
     }
+    async fn capture_server() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        async fn completion(State(requests): State<Arc<Mutex<Vec<Value>>>>, Json(payload): Json<Value>) -> Json<Value> {
+            requests.lock().await.push(payload);
+            Json(
+                json!({"choices":[{"message":{"content":r#"{"type":"done","message":"ok"}"#},"finish_reason":"stop"}]}),
+            )
+        }
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route("/chat/completions", post(completion)).with_state(requests.clone());
+        (endpoint, requests, tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }))
+    }
+    fn mode_model(endpoint: &str, mode: &str, worker: &std::path::Path) -> Model {
+        Model::new(&HashMap::from([
+            ("LLM_BASE_URL".into(), endpoint.to_owned()),
+            ("LLM_MODEL".into(), "fixture".into()),
+            ("LLM_API_KEY".into(), "secret".into()),
+            ("AI_OBSERVATION".into(), mode.into()),
+            ("OCR_WORKER".into(), worker.to_string_lossy().into_owned()),
+        ]))
+        .unwrap()
+    }
+    fn reference() -> crate::attachments::ReferenceImage {
+        crate::attachments::ReferenceImage {
+            name: "reference.png".into(),
+            url: "https://private.example/image-capability".into(),
+            content: json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}", png())}}),
+        }
+    }
+    const OK_WORKER: &str = r#"import sys,json
+for line in sys.stdin:
+    request=json.loads(line)
+    print(json.dumps({'id':request['id'],'width':20,'height':10,'lines':[{'text':'OCR line','confidence':0.9,'polygon':[[1,2],[10,2],[10,8],[1,8]]}],'truncated':False}),flush=True)
+"#;
+
+    #[test]
+    fn observation_mode_defaults_to_ocr_and_rejects_unknown_values() {
+        assert_eq!(ObservationMode::parse("").unwrap(), ObservationMode::Ocr);
+        assert_eq!(ObservationMode::parse(" Hybrid ").unwrap(), ObservationMode::Hybrid);
+        assert_eq!(ObservationMode::parse("image").unwrap(), ObservationMode::Image);
+        assert!(ObservationMode::parse("vision").is_err());
+        let ocr = ObservationMode::Ocr.system_prompt();
+        let image = ObservationMode::Image.system_prompt();
+        let hybrid = ObservationMode::Hybrid.system_prompt();
+        assert!(ocr.contains("You receive no visual image") && !ocr.contains("phoneImageUrl"));
+        assert!(image.contains("phoneImageUrl") && !image.contains("phonePolygon"));
+        assert!(hybrid.contains("phoneImageUrl") && hybrid.contains("phonePolygon"));
+        for prompt in [ocr, image, hybrid] {
+            assert!(
+                prompt.contains("Return only one JSON object")
+                    && prompt.contains("Tools (all unknown fields rejected)")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_sends_image_elements_reference_url_and_ocr() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("worker.py");
+        std::fs::write(&worker, OK_WORKER).unwrap();
+        let (endpoint, requests, server) = capture_server().await;
+        let model = mode_model(&endpoint, "hybrid", &worker);
+        assert!(model.wants_elements());
+        let observation = json!({"imageBase64":png(),"caption":"20x10 points","elementsText":"Button: Send"});
+        model.generate("Inspect", observation, vec![], &[reference()], CancellationToken::new()).await.unwrap();
+        let request = requests.lock().await[0].clone();
+        let parts = request["messages"][1]["content"].as_array().unwrap();
+        let context: Value = serde_json::from_str(parts[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(context["observation"]["elementsText"], "Button: Send");
+        assert_eq!(context["observation"]["ocr"]["lines"][0]["text"], "OCR line");
+        assert_eq!(context["referenceImages"][0]["phoneImageUrl"], "https://private.example/image-capability");
+        assert_eq!(parts.iter().filter(|part| part["type"] == "image_url").count(), 2, "phone and reference images");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hybrid_ocr_failure_degrades_to_the_image_step() {
+        let (endpoint, requests, server) = capture_server().await;
+        let model = mode_model(&endpoint, "hybrid", std::path::Path::new("/missing-ocr-worker.py"));
+        model
+            .generate("Inspect", json!({"imageBase64":png(),"caption":"20x10"}), vec![], &[], CancellationToken::new())
+            .await
+            .unwrap();
+        let request = requests.lock().await[0].clone();
+        let context: Value =
+            serde_json::from_str(request["messages"][1]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(context["observation"]["ocrError"], "OCR unavailable");
+        assert!(context["observation"].get("ocr").is_none());
+        assert_eq!(request["messages"][1]["content"][1]["type"], "image_url");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn image_mode_never_starts_the_ocr_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("worker.py");
+        std::fs::write(&worker, "open(__file__ + '.started', 'w').close()\n").unwrap();
+        let (endpoint, requests, server) = capture_server().await;
+        let model = mode_model(&endpoint, "image", &worker);
+        model.warm_ocr();
+        model
+            .generate("Inspect", json!({"imageBase64":png(),"caption":"20x10"}), vec![], &[], CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!dir.path().join("worker.py.started").exists());
+        let request = requests.lock().await[0].clone();
+        assert!(!request.to_string().contains("\"ocr\""));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ocr_mode_omits_elements_and_warmup_loads_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("worker.py");
+        std::fs::write(
+            &worker,
+            format!("import pathlib\npathlib.Path(__file__).with_suffix('.started').touch()\n{OK_WORKER}"),
+        )
+        .unwrap();
+        let (endpoint, _requests, server) = capture_server().await;
+        let model = mode_model(&endpoint, "ocr", &worker);
+        assert!(!model.wants_elements());
+        model.warm_ocr();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !worker.with_extension("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("warm-up starts the OCR worker");
+        server.abort();
+    }
+
+    fn reply(content: &str) -> Value {
+        json!({"message":{"content":content},"finish_reason":"stop"})
+    }
+
+    #[test]
+    fn concatenated_replies_run_only_the_first_valid_object() {
+        let first = r#"{"type":"action","tool":"iphone_tap","args":{"x":10,"y":20},"reason":"Open","requiresConfirmation":false}"#;
+        let second = r#"{"type":"action","tool":"iphone_type_text","args":{"text":"hi"},"reason":"Type","requiresConfirmation":false}"#;
+        for (content, kind) in [
+            (format!("{first}{second}"), "json_value"),
+            (format!("{first}\n{second}"), "json_value"),
+            (format!("{first}\nI will then type the text."), "text"),
+            (format!("{first}\n"), "none"),
+        ] {
+            let mut diagnostics = DecodeDiagnostics::default();
+            let action = decode_reply_with(&reply(&content), &mut diagnostics).unwrap();
+            assert_eq!(action["tool"], "iphone_tap", "{content}");
+            assert_eq!(diagnostics.trailing_kind, Some(kind), "{content}");
+            assert_eq!(diagnostics.trailing_bytes > 0, kind != "none");
+        }
+        // A valid trailing object never rescues an invalid first object.
+        let invalid_first = format!(
+            r#"{{"type":"action","tool":"unknown","args":{{}},"reason":"x","requiresConfirmation":false}}{second}"#
+        );
+        assert!(decode_reply(&reply(&invalid_first)).is_err());
+    }
+
+    #[test]
+    fn json_errors_are_classified_without_reply_content() {
+        for (content, category) in [("{\"type\":\"action\"", "eof"), ("{type:action}", "syntax"), ("   ", "empty")] {
+            let mut diagnostics = DecodeDiagnostics::default();
+            let error = decode_reply_with(&reply(content), &mut diagnostics).unwrap_err();
+            assert_eq!(diagnostics.json_error, Some(category), "{content}");
+            assert_eq!(protocol_decode_category(&Err(error)), "json_syntax");
+        }
+    }
+
+    #[test]
+    fn correction_message_names_no_concrete_tool() {
+        let message = correction_message("Invalid model reply: invalid JSON at line 1, column 9");
+        assert!(message.starts_with("Your previous reply failed validation: Invalid model reply: invalid JSON"));
+        assert!(!message.contains("iphone_"), "a concrete tool example is copied by models on retry");
+        assert!(message.contains("only the first action"));
+    }
+
     #[test]
     fn diagnostic_fields_have_explicit_timing_and_protocol_categories() {
         let diagnostics = RequestDiagnostics {

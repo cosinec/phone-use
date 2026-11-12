@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -26,7 +27,9 @@ const MAX_REFERENCE_CACHE_BYTES: usize = 512 * 1024;
 pub struct Ocr {
     python: String,
     worker: String,
-    process: Mutex<Option<Worker>>,
+    // Owned by a spawned exchange while a request is in flight, so a caller's
+    // cancellation never kills a worker that is mid-recognition.
+    process: Arc<Mutex<Option<Worker>>>,
     references: Mutex<ReferenceCache>,
     timeout: Duration,
 }
@@ -108,7 +111,7 @@ impl Ocr {
         Self {
             python: setting("OCR_PYTHON", "python3"),
             worker: setting("OCR_WORKER", default_worker(&std::env::current_dir().unwrap_or_default())),
-            process: Mutex::new(None),
+            process: Arc::new(Mutex::new(None)),
             references: Mutex::new(ReferenceCache::default()),
             // Includes queueing and cold model loading. Model HTTP retains its own deadline.
             timeout: Duration::from_secs(90),
@@ -136,11 +139,29 @@ impl Ocr {
             eprintln!("event=ocr_reference_cache status=miss entries={} bytes={}", cache.entries.len(), cache.bytes);
             Ok(evidence)
         };
+        // `recognize` bounds the worker exchange; the cache lock is only held by
+        // requests that are themselves bounded, so no second deadline is needed.
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ApiError::unavailable("OCR request cancelled")),
-            result = tokio::time::timeout(self.timeout, operation) => result.unwrap_or_else(|_| Err(ApiError::unavailable("OCR request timed out"))),
+            result = operation => result,
         }
+    }
+
+    /// Loads the OCR model before the first task step. Failures only log.
+    pub async fn warm(&self) {
+        let mut bytes = Cursor::new(Vec::new());
+        if image::RgbImage::new(32, 32).write_to(&mut bytes, image::ImageFormat::Png).is_err() {
+            return;
+        }
+        let image = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+        let started = Instant::now();
+        let result = self.recognize(&image, None, CancellationToken::new()).await;
+        eprintln!(
+            "event=ocr_warmup elapsed_ms={} status={}",
+            started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "error" }
+        );
     }
 
     pub async fn recognize(
@@ -151,36 +172,51 @@ impl Ocr {
     ) -> Result<Value> {
         let started = Instant::now();
         let dimensions = image_dimensions(image)?;
-        let operation = async {
-            let mut slot = self.process.lock().await;
-            // Keep the child in this future while IO is in flight. Dropping the future
-            // kills it, so no cancelled response can contaminate the next request.
-            let mut worker = match slot.take() {
-                Some(worker) => worker,
-                None => self.spawn()?,
-            };
-            let id = uuid::Uuid::new_v4().to_string();
-            let reply = worker.exchange(&id, image).await;
-            match reply {
-                Ok(reply) => {
-                    let parsed = parse_response(&reply, &id, dimensions);
-                    if parsed.is_ok() {
-                        *slot = Some(worker);
-                    } else {
-                        let _ = worker.child.kill().await;
+        if cancel.is_cancelled() {
+            return Err(ApiError::unavailable("OCR request cancelled"));
+        }
+        let (process, spawner, timeout) = (self.process.clone(), self.spawner(), self.timeout);
+        let (image, queued) = (image.to_owned(), cancel.clone());
+        // The exchange runs detached from the caller. A cancelled caller stops
+        // waiting immediately; the worker finishes its current reply, which is
+        // matched by id and discarded, and stays warm for the next request.
+        // Only a timeout or protocol failure drops (and so kills) the worker.
+        let exchange = tokio::spawn(async move {
+            let operation = async {
+                let mut slot = process.lock_owned().await;
+                if queued.is_cancelled() {
+                    return Err(ApiError::unavailable("OCR request cancelled"));
+                }
+                let mut worker = match slot.take() {
+                    Some(worker) => worker,
+                    None => spawner.spawn()?,
+                };
+                let id = uuid::Uuid::new_v4().to_string();
+                let reply = worker.exchange(&id, &image).await;
+                match reply {
+                    Ok(reply) => {
+                        let parsed = parse_response(&reply, &id, dimensions);
+                        if parsed.is_ok() {
+                            *slot = Some(worker);
+                        } else {
+                            let _ = worker.child.kill().await;
+                        }
+                        parsed
                     }
-                    parsed
+                    Err(error) => {
+                        let _ = worker.child.kill().await;
+                        Err(error)
+                    }
                 }
-                Err(error) => {
-                    let _ = worker.child.kill().await;
-                    Err(error)
-                }
-            }
-        };
+            };
+            tokio::time::timeout(timeout, operation)
+                .await
+                .unwrap_or_else(|_| Err(ApiError::unavailable("OCR request timed out")))
+        });
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ApiError::unavailable("OCR request cancelled")),
-            result = tokio::time::timeout(self.timeout, operation) => result.unwrap_or_else(|_| Err(ApiError::unavailable("OCR request timed out"))),
+            result = exchange => result.unwrap_or_else(|_| Err(ApiError::unavailable("OCR worker task failed"))),
         };
         eprintln!(
             "event=ocr_recognition elapsed_ms={} status={}",
@@ -190,6 +226,15 @@ impl Ocr {
         observation_text(result?, observation)
     }
 
+    fn spawner(&self) -> Spawner {
+        Spawner { python: self.python.clone(), worker: self.worker.clone() }
+    }
+}
+struct Spawner {
+    python: String,
+    worker: String,
+}
+impl Spawner {
     fn spawn(&self) -> Result<Worker> {
         let mut child = Command::new(&self.python)
             .arg(&self.worker)
@@ -478,7 +523,9 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn timeout_kills_worker_and_next_request_recovers() {
-        let (dir, ocr) = fixture(Duration::from_millis(300));
+        // Leave Python start-up well inside the deadline under parallel test load;
+        // the fixture's delayed reply (2 s) still exceeds it.
+        let (dir, ocr) = fixture(Duration::from_millis(1000));
         std::fs::write(dir.path().join("delay"), "").unwrap();
         assert_eq!(
             ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap_err().message,
@@ -491,7 +538,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn cancellation_kills_active_worker_and_recovers_without_stale_reply() {
+    async fn cancellation_keeps_the_active_worker_without_a_stale_reply() {
         let (dir, ocr) = fixture(Duration::from_secs(3));
         let ocr = std::sync::Arc::new(ocr);
         std::fs::write(dir.path().join("delay"), "").unwrap();
@@ -505,9 +552,12 @@ for line in sys.stdin:
         cancel.cancel();
         assert_eq!(request.await.unwrap().unwrap_err().message, "OCR request cancelled");
         std::fs::remove_file(dir.path().join("delay")).unwrap();
+        // The cancelled exchange completes in the background; its reply is
+        // consumed there, and the same warm worker serves the next request.
         ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap();
         let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
-        assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 2);
+        assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 1);
+        assert_eq!(events.lines().filter(|line| line.ends_with(" request")).count(), 2);
     }
 
     #[tokio::test]

@@ -504,17 +504,18 @@ impl Session {
         let entered = Instant::now();
         let deadline =
             ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
-        self.screen_admitted(cancel, None, entered, deadline).await
+        self.screen_admitted(cancel, None, entered, deadline, true).await
     }
     pub(crate) async fn task_screen(
         &self,
         cancel: CancellationToken,
         lease: &crate::control::TaskLease,
+        include_elements: bool,
     ) -> Result<Value> {
         let entered = Instant::now();
         let deadline =
             ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
-        self.screen_admitted(cancel, Some(lease), entered, deadline).await
+        self.screen_admitted(cancel, Some(lease), entered, deadline, include_elements).await
     }
     async fn screen_admitted(
         &self,
@@ -522,6 +523,7 @@ impl Session {
         task: Option<&crate::control::TaskLease>,
         queued_at: Instant,
         deadline: ictl_protocol::ActionDeadline,
+        include_elements: bool,
     ) -> Result<Value> {
         let admission = Some(match task {
             Some(task) => self.control.task_job(task)?,
@@ -530,7 +532,7 @@ impl Session {
         let (result, receiver) = watch::channel(None);
         self.jobs
             .try_send(Job {
-                request: JobRequest::Observe { include_elements: task.is_none() },
+                request: JobRequest::Observe { include_elements },
                 result,
                 cancel: cancel.clone(),
                 queued_at,
@@ -1186,7 +1188,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             let deadline = control_deadline
                 .expect("control route captured admission")
                 .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
-            Ok(reply(200, s.screen_admitted(s.cancel.clone(), None, entered, deadline).await?))
+            Ok(reply(200, s.screen_admitted(s.cancel.clone(), None, entered, deadline, true).await?))
         }
         (Method::GET, ["preview"]) => {
             let deadline = control_deadline
