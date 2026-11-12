@@ -115,3 +115,42 @@ New events contain fixed categories, IDs, counters, durations and sample ages. T
 Synthetic tests prove typed delivery, classifications, socket retirement, callback progress, cancellation, stale ages and first-reason preservation. They do not prove phone-specific support for another DVT socket or establish an actual historical phone crash. The final process sample may predate an XCTest disconnect; no final probe or teardown delay was added. Unsupported/failed monitoring remains unknown until a new runner. The guide records these limits and a real-device acceptance checklist.
 
 Independent spec/quality review is assigned to the parent after the scoped local commit. Task 1 diff package is `/tmp/wda-diagnostics-task-1.patch`, generated from the recorded feature baseline. Parent's later boundary design/plan documents remain untracked and excluded.
+
+## Task 1 review follow-up
+
+Both findings from `.superpowers/sdd/task1-review-report.md` are addressed in a scoped follow-up on top of `1fb9700`; that later-task design/plan commit is preserved. Only the runner event emitter/regression, this report, and the diagnostic guide change.
+
+P2: `xctest_exit_summary.requested_cleanup` is replaced by `local_cleanup_attribution`. A known explicit local stop reason emits `requested`; a missing reason or sticky Unattributed fallback emits `unknown`. There is no negative/unrequested category and no inference of spontaneous phone-process death. Gateway transport cancellation can precede native SIGTERM/daemon stop. The guide now documents gateway_close → transport_error → daemon_stop as a valid requested-cleanup sequence and requires correlation with the gateway's first known reason. No shutdown IPC, teardown delay, cancellation behavior or policy change was introduced.
+
+The existing production summary log was extracted into `emit_exit_summary` so the regression exercises the same emitter used by the runner. Before the fix, the test dropped the gateway side of a duplex transport and observed its read error while native stop delivery was deliberately delayed. Its tracing Layer captured the actual emitted `xctest_exit_summary` fields, including `requested_cleanup=false`; the assertion for `local_cleanup_attribution=unknown` failed. After GREEN, it verifies emitted unknown for missing/Unattributed reasons, absence of the old Boolean, requested for a later known local reason on the same runner, and that the earlier emitted event remains unknown.
+
+RED log: `/tmp/wda-diagnostics-review-red.log`.
+
+```text
+transport_closes_before_native_stop_emits_unknown_local_attribution ... FAILED
+emitted transport-before-stop evidence: {... "category": "socket_error", "event": "xctest_exit_summary", "requested_cleanup": "false", ...}
+left: None
+right: Some("unknown")
+test result: FAILED. 0 passed; 1 failed
+```
+
+P3: the guide's `wda_health_failed` field list no longer includes `elapsed_ms`; duration is explicitly documented on `wda_health_completed.duration_ms`.
+
+Focused RED and GREEN command:
+
+```bash
+cargo +1.90.0 --config 'source.crates-io.replace-with="rsproxy-sparse"' test --locked -p ictl-wda --lib transport_closes_before_native_stop --offline
+```
+
+GREEN: 1 passed, 0 failed. Log: `/tmp/wda-diagnostics-review-green.log`.
+
+Follow-up verification:
+
+```bash
+cargo +1.90.0 --config 'source.crates-io.replace-with="rsproxy-sparse"' test --locked -p ictl-wda --lib --offline
+cargo +1.90.0 --config 'source.crates-io.replace-with="rsproxy-sparse"' test --locked -p iphone-control --bin iphone-control phone_logs --offline
+cargo +1.90.0 fmt --package ictl-wda --package iphone-control --check
+git diff --check
+```
+
+Passed: WDA 89/89 (`/tmp/wda-diagnostics-review-wda.log`), app logging 1/1 (`/tmp/wda-diagnostics-review-app.log`), formatting and diff checks. The same Cargo duplicate-config warning and 10 existing apple-codesign dependency warnings remain; no new source warnings appeared. Vendor code and provenance did not change, and no broader JS or boundary work was run. Independent re-review remains the parent's final gate.

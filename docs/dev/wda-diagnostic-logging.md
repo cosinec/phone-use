@@ -145,7 +145,7 @@ Appium WDA v16.15.3 的 `FBScreenshot.takeWithScreenID` 最终将图片转换为
 - `/status` 探活使用独立连接池，不等待普通 HTTP 请求占用的连接锁。建连上限 10 秒，应答阶段预算 5 秒，请求总上限 15 秒（含连接池等待及重试）；取消或失败连接不放回池。普通控制请求的时限和“不重放已发动作”规则保持不变。
 - 连接、连接池等待或请求派发失败归类为 `transport_unavailable`，不累计为杀死存活 runner 的证据。至少 3 次连续应答失败、且首尾失败间隔达到 60 秒，才重启仍存活的 WDA；任一次探活成功或无法确认的传输故障清空该证据。真实 XCTest 退出继续立即进入原有恢复流程。这能减少短暂延迟触发的重启，不能证明 WDA 内部永不挂起；如果端口持续不可达而 XCTest 任务仍存活，本策略不会仅据此无限重启，需排查连接或重新连接设备。
 
-每次健康失败写入 `event=wda_health_failed`，包括 `category`（`transport_unavailable` / `response_timeout` / `response_interrupted` / `response_error` / `not_ready`）、`consecutive_failures`、`failure_window_ms`、`confirm_window_ms`、`elapsed_ms`、`runner_alive` 和 `restart`。HTTP `http_budget` 区分探活并记录总预算与应答预算；`http_complete` 继续记录具体等待阶段。结合 `wda_restart` 与手机生命周期回调，可区分服务端主动重启和 XCTest 自行退出。
+每次健康失败写入 `event=wda_health_failed`，包括 `category`（`transport_unavailable` / `response_timeout` / `response_interrupted` / `response_error` / `not_ready`）、`consecutive_failures`、`failure_window_ms`、`confirm_window_ms`、`runner_alive` 和 `restart`。完成探活的耗时记录在 `wda_health_completed.duration_ms`；`wda_health_failed` 不带 `elapsed_ms`。HTTP `http_budget` 区分探活并记录总预算与应答预算；`http_complete` 继续记录具体等待阶段。结合 `wda_restart` 与手机生命周期回调，可区分服务端主动重启和 XCTest 自行退出。
 
 验证需包含：空闲及就绪状态切换无媒体请求、手动截图与手势、旧会话延迟请求不阻塞新会话、慢建连后的响应预算、普通请求占用连接时探活仍可进行、真实无应答仍有界、持续失败与恢复清零、SDK 冷却隔离及控制通道保留。合成测试不能代替部署后的真机稳定性验证。
 
@@ -163,14 +163,14 @@ PID 监测使用单独的 DVT socket。iOS 17+ 通过当前 XCTest 已建立的 
 | `phone_process_launched` | native_pid、native_start_id、runner_id、phone_pid、event_seq；在启动返回 PID 后、授权之前记录 |
 | `phone_process_observed` | process_state、process_category、process_age_ms、probe_duration_ms、monitoring；state 只为 running/not_running/unknown |
 | `xctest_exited` | 固定 exit_category（test_plan_completed/runner_transport_disconnected/test_plan_timeout/socket_error/xctest_error）、stop_reason，以及最后 PID 样本的状态与年龄；不输出任意错误正文 |
-| `xctest_exit_summary` | 生命周期时长、phone log/debug 条数和回调累计计数；scope=xctest_session |
+| `xctest_exit_summary` | 生命周期时长、phone log/debug 条数和回调累计计数；scope=xctest_session；local_cleanup_attribution 为 requested 或 unknown，只反映已知的原生停止原因 |
 | `wda_health_completed` | scope=wda_status、runner 身份、phone_pid、sequence、duration_ms、category、consecutive_failures、last_success_age_ms；只在真正完成 `/status` 请求后记录 |
 | `wda_health_probe_skipped` | scope=supervisor_device_lock、runner 身份、operation_id、tool；只有操作名称和关联 ID，不含请求正文；没有可用操作身份时为 None |
 | `wda_health_recovered` | 某 runner 的失败探活恢复成功；Ready 状态即使没变化也记录 |
 | `xctest_stop_requested` | 首个 stop_reason 和 runner 身份，晚到的错误或 Drop 不覆盖它；停止时释放 monitor |
 | `session_close_requested` / `ws_closed` | session、namespace、首个已知 reason；取消不能覆盖 browser_close、heartbeat_pong_missing、send_timeout、socket_send_failed、api_deleted 或 server_shutdown |
 
-runner 的 stop_reason 取固定类别：startup_timeout、startup_cancellation、health_restart、device_offline、device_replacement、daemon_shutdown、usbmuxd_replacement、wda_reinstalled、unattributed。请求清理后出现 socket_error 时，仍保留最早的请求原因。unattributed 表示没有确定的归因，不能解释为手机崩溃。网关先记录停止原因，再取消会话和关闭 native；例如 browser_close → daemon_shutdown → socket_error 应解释为已请求清理后的传输退出。
+runner 的 stop_reason 取固定类别：startup_timeout、startup_cancellation、health_restart、device_offline、device_replacement、daemon_shutdown、usbmuxd_replacement、wda_reinstalled、unattributed。请求清理后出现 socket_error 时，仍保留最早的请求原因。unattributed 表示没有确定的归因，不能解释为手机崩溃。网关先记录停止原因，再取消共享传输，随后才关闭 native。`browser_close → socket_error → daemon_shutdown`（即 gateway_close → transport_error → daemon_stop）也是有效的请求清理顺序，传输错误可以早于原生停止信号。`local_cleanup_attribution=requested` 表示原生已记录明确的本地停止原因；没有停止原因或只有 unattributed 时记为 unknown。unknown 不表示无人请求清理，更不能解释为手机进程自行死亡。判断请求清理须按 session、namespace 和 native_start_id 对照网关的首因与原生事件；后续停止记录可以补充归因，但不会把此前的 unknown 事件改写成否定结论。
 
 原生 `daemon` 状态响应增加可选 `diagnostics` 字段。老快照缺少该字段时仍可反序列化；`state` 的含义保持不变。示意结构如下，时间、ID 和结果仅用于说明字段：
 
@@ -202,7 +202,7 @@ runner 的 stop_reason 取固定类别：startup_timeout、startup_cancellation�
 
 - 新建一个受控会话，核对 namespace 下 schema 3 的 native_start_id、runner_id 和 phone_pid；确认正常闲置时 running 样本更新，界面不被采图。
 - 执行一个占用设备锁的操作，确认 skip 携带 operation_id/tool，`last_probe` 时间不变、age 增长，操作后完成探活并继续更新。
-- 关闭浏览器，核对 browser_close 是网关首因，daemon_shutdown 是 runner 请求停止原因。后续 socket_error 不得覆盖前述原因，也不得被标成手机崩溃。
+- 关闭浏览器，核对 browser_close 是网关首因。若 socket_error 早于 daemon_shutdown，原生退出汇总应为 local_cleanup_attribution=unknown；已观察到明确本地停止原因时才为 requested。按 namespace 对照后续 daemon_shutdown，不能仅凭原生停止原因暂时缺失认定手机崩溃。
 - 用合成延迟或受控断链核对 unknown、monitoring=false 和 socket 释放；不要为验证 false 而杀掉正在使用的手机进程。
 - runner 再次建立后，确认健康记录和最后 PID 观测对应新的 runner_id；容器重建后确认 native_start_id 已改变。
 - 查询不被支持时，记录 setup/channel/request 固定分类并保留未知状态。合成测试通过只能证明分类、并发和取消行为；真机支持性、实际崩溃原因和长时间稳定性须单独验收。

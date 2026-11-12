@@ -90,6 +90,31 @@ struct Progress {
     plan_started: bool,
 }
 
+fn emit_exit_summary(p: &Progress, diagnostics: &RunnerDiagnostics, lifetime: Duration, category: &'static str) {
+    // The gateway can cancel transport before native observes shutdown intent.
+    // An absent local reason is unknown, never proof of an unrequested exit.
+    let local_cleanup_attribution = match diagnostics.snapshot().stop_reason {
+        Some(reason) if reason != StopReason::Unattributed => "requested",
+        _ => "unknown",
+    };
+    tracing::warn!(
+        event = "xctest_exit_summary",
+        runner_id = p.runner_id,
+        native_pid = std::process::id(),
+        native_start_id = native_start_id(),
+        lifetime_ms = lifetime.as_millis() as u64,
+        category,
+        scope = "xctest_session",
+        local_cleanup_attribution,
+        phone_log_messages = p.log_messages,
+        phone_debug_messages = p.debug_messages,
+        initialization_count = p.initialization_count,
+        authorization_wait_count = p.authorization_wait_count,
+        plan_start_count = p.plan_start_count,
+        callback_events = p.event_seq
+    );
+}
+
 struct ErrorListener(Arc<Mutex<Progress>>);
 
 impl ErrorListener {
@@ -283,26 +308,7 @@ impl WdaRunner {
                     Err(e) => e.to_string(),
                 };
                 progress.lock().unwrap().exit_reason = Some(reason.clone());
-                {
-                    let p = progress.lock().unwrap();
-                    tracing::warn!(
-                        event = "xctest_exit_summary",
-                        runner_id,
-                        native_pid = std::process::id(),
-                        native_start_id = native_start_id(),
-                        lifetime_ms = started.elapsed().as_millis() as u64,
-                        category,
-                        scope = "xctest_session",
-                        requested_cleanup =
-                            diagnostics.snapshot().stop_reason.is_some_and(|r| r != StopReason::Unattributed),
-                        phone_log_messages = p.log_messages,
-                        phone_debug_messages = p.debug_messages,
-                        initialization_count = p.initialization_count,
-                        authorization_wait_count = p.authorization_wait_count,
-                        plan_start_count = p.plan_start_count,
-                        callback_events = p.event_seq
-                    );
-                }
+                emit_exit_summary(&progress.lock().unwrap(), &diagnostics, started.elapsed(), category);
                 result
             };
             tokio::spawn(run.instrument(span))
@@ -415,6 +421,83 @@ impl Drop for WdaRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_closes_before_native_stop_emits_unknown_local_attribution() {
+        use std::collections::BTreeMap;
+        use tracing_subscriber::{Layer, layer::Context, prelude::*};
+        type Fields = BTreeMap<String, String>;
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<Fields>>>);
+        struct Visitor(Fields);
+        impl tracing::field::Visit for Visitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.0.insert(field.name().into(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut fields = Visitor(Fields::new());
+                event.record(&mut fields);
+                if fields.0.get("event").map(String::as_str) == Some("xctest_exit_summary") {
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+        for initial_reason in [None, Some(StopReason::Unattributed)] {
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let diagnostics = RunnerDiagnostics::new(7);
+            if let Some(reason) = initial_reason {
+                diagnostics.stop(reason);
+            }
+            let progress = Progress { runner_id: 7, ..Progress::default() };
+            tracing::subscriber::with_default(subscriber, || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    // Model gateway cancellation dropping an active native transport.
+                    // Native shutdown-intent delivery deliberately occurs only after
+                    // its transport error and exit summary have been observed.
+                    use tokio::io::AsyncReadExt;
+                    let (mut native_transport, gateway_transport) = tokio::io::duplex(16);
+                    let read = tokio::spawn(async move { native_transport.read_exact(&mut [0]).await });
+                    drop(gateway_transport);
+                    assert!(read.await.unwrap().is_err());
+                    diagnostics.exited("socket_error");
+                    emit_exit_summary(&progress, &diagnostics, Duration::from_millis(1), "socket_error");
+                });
+            });
+            let fields = capture.0.lock().unwrap();
+            assert_eq!(fields.len(), 1);
+            assert_eq!(
+                fields[0].get("local_cleanup_attribution").map(String::as_str),
+                Some("unknown"),
+                "emitted transport-before-stop evidence: {:?}",
+                fields[0]
+            );
+            assert!(!fields[0].contains_key("requested_cleanup"));
+            drop(fields);
+            // Only after the error event does the same runner receive native's
+            // explicit stop. The earlier emitted event remains unknown. A sticky
+            // unattributed fallback must also remain honest about its uncertainty.
+            diagnostics.stop(StopReason::DaemonShutdown);
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                emit_exit_summary(&progress, &diagnostics, Duration::from_millis(2), "socket_error")
+            });
+            let fields = capture.0.lock().unwrap();
+            assert_eq!(fields[0].get("local_cleanup_attribution").map(String::as_str), Some("unknown"));
+            assert_eq!(
+                fields[1].get("local_cleanup_attribution").map(String::as_str),
+                Some(if initial_reason.is_none() { "requested" } else { "unknown" })
+            );
+        }
+    }
 
     #[test]
     fn repeated_phone_callbacks_are_visible_at_production_info_level() {
