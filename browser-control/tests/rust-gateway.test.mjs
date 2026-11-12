@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { fixtureImageBase64 } from './fixtures/screen-image.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -29,7 +30,8 @@ async function harness(t, env = {}, fileEnv = {}) {
   await writeFile(native, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fileURLToPath(new URL('./fixtures/native-cli.mjs', import.meta.url)))} "$@"\n`, { mode: 0o700 });
   const child = spawn(binary, [], { cwd: dir, env: { ...process.env, HOST: '127.0.0.1', PORT: '0', CONTROL_ACCESS_TOKEN: token,
     ALLOWED_ORIGINS: origin, RUNTIME_DIR: path.join(dir, 'runtime'), ICTL_BIN: native,
-    WEB_DIST_DIR: fileURLToPath(new URL('../dist', import.meta.url)), LLM_BASE_URL: '', LLM_MODEL: '', LLM_API_KEY: '', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    WEB_DIST_DIR: fileURLToPath(new URL('../dist', import.meta.url)), LLM_BASE_URL: '', LLM_MODEL: '', LLM_API_KEY: '',
+    OCR_PYTHON: process.execPath, OCR_WORKER: fileURLToPath(new URL('./fixtures/ocr-worker.mjs', import.meta.url)), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '', errors = '', startupError;
   child.on('error', error => { startupError = error; });
   child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { errors += chunk; });
@@ -149,7 +151,7 @@ contract('WDA recovery waits for readiness and a fresh observation without repla
       const context = JSON.parse(fixture.requests[1].messages[1].content[0].text);
       assert.equal(context.recentHistory[0].state, 'uncertain');
       assert.equal(context.observation.caption, 'fixture fresh screen after action');
-      const counters = JSON.parse(context.observation.elementsText);
+      const counters = await nativeCounts(fixture);
       assert.equal(counters.taps, 1);
       assert.ok(counters.counts.screenshot >= 3);
     });
@@ -249,7 +251,7 @@ contract('WDA recovery retries an unavailable observation after a successful nav
   assert.equal(state.task.steps[0].state, 'succeeded');
   assert.equal(state.task.recovery.attempt, 1);
   const context = JSON.parse(fixture.requests[1].messages[1].content[0].text);
-  assert.equal(JSON.parse(context.observation.elementsText).taps, 1);
+  assert.equal((await nativeCounts(fixture)).taps, 1);
 });
 
 contract('WDA recovery requires checking uncertain text input before continuing', async t => {
@@ -515,7 +517,8 @@ contract('typing focus recovers only after a fresh observation and a focus tap',
       assert.deepEqual(state.task.steps.map(step => step.state), ['failed', 'succeeded', 'succeeded']);
       const input = JSON.parse(fixture.requests[1].messages[1].content[0].text);
       assert.equal(input.recentHistory[0].result.message, reason);
-      assert.ok(fixture.requests[1].messages[1].content.some(part => part.type === 'image_url'));
+      assert.ok(JSON.parse(fixture.requests[1].messages[1].content[0].text).observation.ocr.lines.length > 0);
+      assert.ok(fixture.requests[1].messages[1].content.every(part => part.type === 'text'));
       const counts = await nativeCounts(fixture);
       assert.equal(counts.typeRequests, 2);
       assert.equal(counts.taps, 1);
@@ -631,11 +634,11 @@ contract('preview avoids accessibility snapshots and observation bounds slow ele
   const route = `/api/sessions/${s.id}`;
   const preview = await app.api(route + '/preview', s.token);
   assert.equal(preview.status, 200);
-  const frame = await preview.json(); assert.equal(frame.imageBase64, 'aW1hZ2U=');
+  const frame = await preview.json(); assert.equal(frame.imageBase64, fixtureImageBase64);
   const stats = await (await app.api(route + '/command', s.token, { requestId: 'counts', deviceId: s.deviceId, tool: 'iphone_status' })).json();
   assert.deepEqual(JSON.parse(stats.text).counts, { screenshot: 1, list_elements: 0, launch_app: 0, terminate_app: 0, press_button: 0 });
   const observation = await (await app.api(route + '/screen', s.token)).json();
-  assert.equal(observation.imageBase64, 'aW1hZ2U='); assert.ok(observation.elementsError);
+  assert.equal(observation.imageBase64, fixtureImageBase64); assert.ok(observation.elementsError);
   assert.ok(observation.timings.elementsMs >= 1000 && observation.timings.elementsMs < 3000, JSON.stringify(observation.timings));
   t.diagnostic(`slow 4000 ms element fixture returned after ${observation.timings.elementsMs} ms; preview used zero element reads`);
 });
@@ -663,19 +666,22 @@ contract('AI previews reuse its observation and query text plus screenshot crops
   const count = async requestId => JSON.parse((await (await app.api(route + '/command', s.token, { requestId, deviceId: s.deviceId, tool: 'iphone_status' })).json()).text).counts;
   const before = await count('before-preview');
   const previews = await Promise.all(Array.from({ length: 12 }, () => app.api(route + '/preview', s.token).then(r => r.json())));
-  assert.ok(previews.every(p => p.imageBase64 === 'aW1hZ2U='));
+  assert.ok(previews.every(p => p.imageBase64 === fixtureImageBase64));
   assert.deepEqual(await count('after-preview'), before, 'active AI previews must not issue screenshot or element requests');
   release();
   let state;
   await until(async () => { state = await (await app.api(route, s.token)).json(); return ['completed', 'failed'].includes(state.task?.state); });
   assert.equal(state.task.state, 'completed', JSON.stringify(state.task)); assert.equal(calls, 3);
   const firstObservation = JSON.parse(bodies[0].messages[1].content[0].text).observation;
-  assert.equal(JSON.parse(firstObservation.elementsText).request.snapshot_timeout_ms, 1000);
+  assert.equal(firstObservation.ocr.coordinateSpace, 'phonePoints');
+  assert.equal(firstObservation.ocr.lines[0].text, 'Fixture screen');
+  assert.equal(firstObservation.elementsText, undefined);
   const second = JSON.parse(bodies[1].messages[1].content[0].text);
   assert.match(second.recentHistory[0].result.text, /com.example.fixture/);
   assert.equal(bodies[1].messages[1].content.filter(p => p.type === 'image_url').length, 0, 'read-only text lookup needs no new image');
-  assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length, 1, 'crop replaces redundant full-screen recapture');
-  assert.deepEqual(await count('final-counts'), { screenshot: 2, list_elements: 1, launch_app: 0, terminate_app: 0, press_button: 0 });
+  assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length, 0);
+  assert.equal(JSON.parse(bodies[2].messages[1].content[0].text).observation.ocr.lines[0].text, 'Fixture screen');
+  assert.deepEqual(await count('final-counts'), { screenshot: 2, list_elements: 0, launch_app: 0, terminate_app: 0, press_button: 0 });
   assert.ok(!JSON.stringify(state.task).includes('com.example.fixture'), 'tool contents stay out of polled UI snapshots');
   assert.ok(state.task.timings.modelMs >= 0);
   assert.ok(state.task.steps[0].timings.actionMs >= 0);
@@ -698,7 +704,7 @@ contract('exact home command skips initial model planning but still observes and
   const input = JSON.parse(bodies[0].messages[1].content[0].text);
   assert.equal(input.recentHistory[0].tool,'iphone_press_button'); assert.equal(input.recentHistory[0].args.button,'home');
   assert.equal(state.task.steps[0].timings.direct,true);
-  assert.equal(bodies[0].messages[1].content.filter(p => p.type === 'image_url').length,1);
+  assert.equal(bodies[0].messages[1].content.filter(p => p.type === 'image_url').length,0);
 });
 
 contract('query-only evidence cannot dispatch coordinate taps until a fresh image is obtained', async t => {
@@ -720,7 +726,7 @@ contract('query-only evidence cannot dispatch coordinate taps until a fresh imag
   let state; await until(async () => { state = await (await app.api(route,s.token)).json(); return ['completed','failed'].includes(state.task?.state); });
   assert.equal(state.task.state,'completed',JSON.stringify(state.task)); assert.equal(bodies.length,4);
   assert.equal(bodies[1].messages[1].content.filter(p => p.type === 'image_url').length,0);
-  assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length,1);
+  assert.equal(bodies[2].messages[1].content.filter(p => p.type === 'image_url').length,0);
   assert.deepEqual(state.task.steps.filter(p => p.tool === 'iphone_tap').map(p => p.args),[{x:5,y:7}]);
 });
 
@@ -742,7 +748,7 @@ contract('Rust entry point preserves auth, normalized identities, setup, screens
   assert.equal((await app.api(route + '/command', s.token, { ...command, args: { x: 6, y: 7 } })).status, 409);
   assert.equal((await app.api(route + '/command', s.token, { ...command, requestId: 'foreign', deviceId: 'a'.repeat(40) })).status, 409);
   assert.equal((await app.api(route + '/command', s.token, { ...command, requestId: 'invalid', args: { x: 1, y: 2, extra: true } })).status, 400);
-  const image = await (await app.api(route + '/screen', s.token)).json(); assert.equal(image.imageBase64, 'aW1hZ2U='); assert.equal(image.deviceId, device.serialNumber);
+  const image = await (await app.api(route + '/screen', s.token)).json(); assert.equal(image.imageBase64, fixtureImageBase64); assert.equal(image.deviceId, device.serialNumber);
   assert.equal((await app.api(route + '/setup', s.token, {})).status, 200);
   await until(async () => (await (await app.api(route, s.token)).json()).setup.transcript.includes('Apple account input'));
   assert.equal((await app.api(route + '/setup/input', s.token, { line: 'private-fixture-input' })).status, 200);
@@ -780,7 +786,7 @@ contract('Rust resumes signing namespace exclusively and disconnect revokes toke
   assert.notEqual(resumed.id, s.id);
 });
 
-contract('Rust task calls visual provider, confirms once, completes and cancels pending generation', async t => {
+contract('Rust task calls OCR text provider, confirms once, completes and cancels pending generation', async t => {
   let calls = 0, lastBody, hanging = false;
   const provider = http.createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk;
@@ -796,7 +802,8 @@ contract('Rust task calls visual provider, confirms once, completes and cancels 
   const s = await app.session(); await peer(t, s); await ready(app, s); const route = `/api/sessions/${s.id}`;
   const started = await app.api(route + '/tasks', s.token, { instruction: 'submit fixture' }); assert.equal(started.status, 201); const task = await started.json();
   let state; await until(async () => { state = await (await app.api(route, s.token)).json(); return state.task?.confirmation; });
-  assert.equal(lastBody.messages[1].content[1].type, 'image_url');
+  assert.ok(lastBody.messages[1].content.every(part => part.type === 'text'));
+  assert.equal(JSON.parse(lastBody.messages[1].content[0].text).observation.ocr.lines[0].text, 'Fixture screen');
   assert.equal((await app.api(`${route}/tasks/${task.id}/confirm`, s.token, { actionId: 'stale', approved: true })).status, 409);
   const decision = { actionId: state.task.confirmation.actionId, approved: true };
   assert.equal((await app.api(`${route}/tasks/${task.id}/confirm`, s.token, decision)).status, 200);
@@ -929,7 +936,7 @@ contract('Android AI tasks observe the Android device and require confirmation b
   const commands=new AndroidCommands({deviceId:s.deviceId,delay:async()=>{},
     controller:{setClipboard:async message=>typed.push(message.content)},
     shell:async command=>{if(command.startsWith('input keyevent')) keys.push(command);return '<hierarchy><node text="结果" bounds="[0,0][100,100]"/></hierarchy>';},
-    capture:async()=>{captures++;return {imageBase64:'anBlZw==',caption:'Android full screen 576x1280',view:{width:576,height:1280,nativeWidth:1080,nativeHeight:2400},sourceBytes:1000000,uploadedBytes:90000};},
+    capture:async()=>{captures++;return {imageBase64:fixtureImageBase64,caption:'Android full screen 576x1280',view:{width:576,height:1280,nativeWidth:1080,nativeHeight:2400},sourceBytes:1000000,uploadedBytes:90000};},
   });
   const ws=new WebSocket(s.relayUrl,{origin});
   const relay=new AndroidRelay(ws,s.deviceId,(request,signal)=>commands.execute(request,signal));
@@ -1019,8 +1026,13 @@ contract('task attachments validate image bytes, enforce ownership and reach mod
   await until(async () => (await fixture.snapshot()).task?.state === 'completed');
   const payload = fixture.requests.at(-1);
   const content = payload.messages[1].content;
-  assert.equal(content.filter(c => c.type === 'image_url').length, 2);
-  assert.ok(content.some(c => c.image_url?.url.startsWith('data:image/png;base64,')));
+  assert.equal(content.filter(c => c.type === 'image_url').length, 0);
+  const input = JSON.parse(content[0].text);
+  assert.equal(input.referenceImages[0].ocr.lines[0].text, 'Fixture screen');
+  assert.equal(input.referenceImages[0].ocr.coordinateSpace, 'referenceImagePixels');
+  assert.ok(!JSON.stringify(payload).includes(photo.dataBase64));
+  assert.ok(!JSON.stringify(payload).includes(fixtureImageBase64));
+  assert.ok(!JSON.stringify(payload).includes('phoneImageUrl'));
   assert.match(JSON.stringify(content), /posting.png/);
   const state = await fixture.snapshot();
   assert.ok(!JSON.stringify(state).includes(photo.dataBase64));
@@ -1209,4 +1221,31 @@ contract('control boundaries block websocket pairing setup while a task owns con
   assert.equal(fixture.usb.ws.readyState, WebSocket.OPEN);
   release();
   await until(async () => (await fixture.snapshot()).task?.state === 'completed');
+});
+
+contract('OCR-only planning skips automatic WDA elements and retains text geometry', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'done', message: 'OCR verified' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal((await nativeCounts(fixture)).counts.list_elements, 0);
+  const payload = fixture.requests[0];
+  const input = JSON.parse(payload.messages[1].content[0].text);
+  assert.equal(input.observation.ocr.width, 390);
+  assert.equal(input.observation.ocr.height, 844);
+  assert.deepEqual(input.observation.ocr.lines[0].phonePolygon, [[0, 0], [390, 0], [390, 844], [0, 844]]);
+  assert.equal(input.observation.elementsText, undefined);
+  assert.ok(!JSON.stringify(payload).includes(fixtureImageBase64));
+  assert.ok(!JSON.stringify(payload).includes('image_url'));
+});
+
+contract('OCR failure stops the task before the model receives any request', async t => {
+  const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify({ type: 'done', message: 'Unexpected' })), {
+    FIXTURE_OCR_ERROR: '1',
+  });
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'failed', JSON.stringify(state.task));
+  assert.match(state.task.error, /OCR/i);
+  assert.equal(fixture.requests.length, 0);
 });

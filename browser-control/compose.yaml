@@ -11,6 +11,8 @@ services:
       PORT: 8787
       RUNTIME_DIR: /app/.runtime
       ICTL_BIN: /usr/local/bin/iphone-control
+      OCR_PYTHON: /opt/ocr/bin/python3
+      OCR_WORKER: /app/ocr/worker.py
     ports:
       - "127.0.0.1:8787:8787"
     volumes:

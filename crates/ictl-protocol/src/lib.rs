@@ -148,10 +148,22 @@ pub enum Response {
     Image {
         jpeg_base64: String,
         caption: String,
+        #[serde(default, rename = "coordinateMapping", skip_serializing_if = "Option::is_none")]
+        coordinate_mapping: Option<CoordinateMapping>,
     },
     Error {
         message: String,
     },
+}
+
+/// Maps screenshot raster coordinates to device points on each axis.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinateMapping {
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
 }
 
 /// Facts about a [`Response::Text`] that clients act on (see [`tapped_nothing`], [`alert_reported`])
@@ -402,6 +414,19 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         let e: Response = serde_json::from_str(r#"{"kind":"error","message":"x"}"#).unwrap();
         assert_eq!(e, Response::error("x"));
+    }
+
+    #[test]
+    fn screenshot_mapping_round_trips_and_older_images_remain_readable() {
+        let wire = serde_json::json!({
+            "kind": "image", "jpeg_base64": "AAAA", "caption": "crop",
+            "coordinateMapping": {"offsetX": 1.0, "offsetY": 2.0, "scaleX": 0.25, "scaleY": 0.5}
+        });
+        let image: Response = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(image).unwrap(), wire);
+        let old = serde_json::json!({"kind":"image", "jpeg_base64":"AAAA", "caption":"full"});
+        let image: Response = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(image).unwrap(), old);
     }
 
     #[test]

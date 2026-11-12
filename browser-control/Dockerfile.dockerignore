@@ -23,3 +23,5 @@ browser-control/.env.*
 
 browser-control/pkg/
 browser-control/pkg-node/
+browser-control/.venv/
+browser-control/ocr/__pycache__/

@@ -36,6 +36,51 @@ test("Android observation sends compressed screenshot and scaled elements; unava
   const partial = JSON.parse((await fallback.execute({ op: "observe" }, signal())).text);
   assert.equal(partial.imageBase64, result.imageBase64); assert.match(partial.elementsError, /unavailable/);
 });
+test("Android screenshot metadata reaches observations while zero element limits skip hierarchy reads", async () => {
+  const coordinateMapping = {offsetX: 1.25, offsetY: 2.5, scaleX: 10.6 / 11, scaleY: 20.4 / 20};
+  const {adapter, calls} = fixture({capture: async () => ({
+    imageBase64: "anBlZw==", caption: "Android crop", coordinateMapping,
+    view: {width: 576, height: 1280, nativeWidth: 1080, nativeHeight: 2400, orientation: 0},
+  })});
+  const image = await adapter.execute({op: "screenshot"}, signal());
+  assert.deepEqual(image.coordinateMapping, coordinateMapping);
+  const observation = JSON.parse((await adapter.execute({op: "observe", limit: 0, snapshot_timeout_ms: 0}, signal())).text);
+  assert.deepEqual(observation.coordinateMapping, coordinateMapping);
+  assert.equal(observation.elementsText, "");
+  assert.equal(observation.timings.elementsMs, 0);
+  assert.equal(observation.elementsError, undefined);
+  assert.equal(calls.length, 0, "OCR-only observations must skip uiautomator");
+  const manual = JSON.parse((await adapter.execute({op: "observe", limit: 80}, signal())).text);
+  assert.notEqual(manual.elementsText, "");
+  assert.equal(calls.filter(call => call[1].startsWith("uiautomator dump")).length, 1);
+});
+
+test("Android capture returns exact crop mapping after independently rounding output dimensions", async (t) => {
+  const wasm = (await import('../web/wasm.mjs')).default;
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'OffscreenCanvas');
+  const draws = [];
+  Object.defineProperty(globalThis, 'OffscreenCanvas', {configurable: true, value: class {
+    getContext() { return {drawImage(...args) { draws.push(args); }}; }
+    async convertToBlob() { return {size: 3, arrayBuffer: async () => Uint8Array.of(1, 2, 3).buffer}; }
+  }});
+  t.after(() => {
+    if (previous) Object.defineProperty(globalThis, 'OffscreenCanvas', previous);
+    else delete globalThis.OffscreenCanvas;
+  });
+  let closed = 0;
+  const video = {snapshot: async () => ({
+    bitmap: {width: 1080, height: 2400, close() { closed++; }},
+    viewport: {width: 1080, height: 2400, orientation: 0}, sourceFormat: "video", sourceBytes: 999,
+  })};
+  const full = await wasm.captureAndroid({}, signal(), undefined, undefined, video);
+  assert.deepEqual(full.coordinateMapping, {offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1});
+  const crop = await wasm.captureAndroid({}, signal(), [1.25, 2.5, 10.6, 20.4], full.view, video);
+  assert.deepEqual(crop.coordinateMapping, {offsetX: 1.25, offsetY: 2.5, scaleX: 10.6 / 11, scaleY: 20.4 / 20});
+  assert.deepEqual(draws[1].slice(-4), [0, 0, 11, 20]);
+  assert.deepEqual(draws[1].slice(1, 5), [1.25 * 1080 / 576, 2.5 * 2400 / 1280, 10.6 * 1080 / 576, 20.4 * 2400 / 1280]);
+  assert.equal(closed, 2);
+});
+
 test("Android coordinate actions require a current screenshot and reject rotation before sending any input", async () => {
   const { adapter, calls } = fixture();
   await assert.rejects(adapter.execute({ op: "tap", x: 10, y: 10 }, signal()), /screenshot/);

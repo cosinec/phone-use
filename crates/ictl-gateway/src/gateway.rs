@@ -76,7 +76,7 @@ struct Job {
 }
 enum JobRequest {
     Command(Value),
-    Observe,
+    Observe { include_elements: bool },
     Preview,
 }
 struct CapturedScreen {
@@ -530,7 +530,7 @@ impl Session {
         let (result, receiver) = watch::channel(None);
         self.jobs
             .try_send(Job {
-                request: JobRequest::Observe,
+                request: JobRequest::Observe { include_elements: task.is_none() },
                 result,
                 cancel: cancel.clone(),
                 queued_at,
@@ -632,7 +632,8 @@ impl Session {
         entered: Instant,
     ) -> Result<Value> {
         self.check_deadline(deadline, entered, "gateway_queue")?;
-        let observe = matches!(request, JobRequest::Observe);
+        let observe = matches!(request, JobRequest::Observe { .. });
+        let include_elements = matches!(request, JobRequest::Observe { include_elements: true });
         if matches!(request, JobRequest::Preview) && self.control.task_owned() {
             return Ok(self.cached_preview().await);
         }
@@ -648,7 +649,7 @@ impl Session {
         }
         let capture = Instant::now();
         let mut result = if observe {
-            let response = native(json!({"op":"observe","limit":80,"snapshot_timeout_ms":1000}))
+            let response = native(json!({"op":"observe","limit":if include_elements { 80 } else { 0 },"snapshot_timeout_ms":if include_elements { 1000 } else { 0 }}))
                 .await
                 .map_err(|_| ApiError::unavailable("WDA observation unavailable"))?;
             if response["kind"] != "text" {
@@ -673,7 +674,7 @@ impl Session {
             if image["kind"] != "image" {
                 return Err(ApiError::unavailable("Screenshot unavailable"));
             }
-            json!({"imageBase64":image["jpeg_base64"],"caption":image["caption"],"elementsText":"","deviceId":self.device.serial_number,
+            json!({"imageBase64":image["jpeg_base64"],"caption":image["caption"],"coordinateMapping":image["coordinateMapping"],"elementsText":"","deviceId":self.device.serial_number,
                 "timings":{"screenshotMs":capture.elapsed().as_millis() as u64}})
         };
         result["capturedAt"] = json!(chrono::Utc::now().to_rfc3339());

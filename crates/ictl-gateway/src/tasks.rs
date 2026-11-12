@@ -16,7 +16,70 @@ const RECOVERY_WAIT: Duration = Duration::from_secs(120);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECOVERIES: u32 = 2;
 
+#[derive(Default)]
+struct ObservationBackoff {
+    previous_screenshot: Option<Value>,
+    delay: Duration,
+}
+impl ObservationBackoff {
+    fn delay_for(&mut self, request: &Value) -> Duration {
+        if request["op"] != "screenshot" {
+            *self = Self::default();
+            return Duration::ZERO;
+        }
+        if self.previous_screenshot.as_ref() == Some(request) {
+            self.delay = (self.delay * 2).max(Duration::from_millis(250)).min(Duration::from_secs(2));
+        } else {
+            self.previous_screenshot = Some(request.clone());
+            self.delay = Duration::ZERO;
+        }
+        self.delay
+    }
+}
+
+async fn wait_for_observation_backoff(delay: Duration, cancel: &CancellationToken) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ApiError::new(409, "Task cancelled")),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
+}
+
+struct TaskStage<'a> {
+    session_id: &'a str,
+    task_id: &'a str,
+    observation_id: &'a str,
+    stage: &'static str,
+    started: Instant,
+    outcome: &'static str,
+}
+impl<'a> TaskStage<'a> {
+    fn start(session_id: &'a str, task_id: &'a str, observation_id: &'a str, stage: &'static str) -> Self {
+        let stage =
+            Self { session_id, task_id, observation_id, stage, started: Instant::now(), outcome: "interrupted" };
+        eprintln!("{}", stage.event("start", "started"));
+        stage
+    }
+    fn event(&self, phase: &str, status: &str) -> Value {
+        json!({
+            "at":now(),"event":"task_stage","session_id":self.session_id,"task_id":self.task_id,
+            "observation_id":self.observation_id,"stage":self.stage,"phase":phase,"status":status,
+            "elapsed_ms":self.started.elapsed().as_millis() as u64
+        })
+    }
+    fn finish(mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+}
+impl Drop for TaskStage<'_> {
+    fn drop(&mut self) {
+        eprintln!("{}", self.event("end", self.outcome));
+    }
+}
+
 struct Task {
+    session_id: String,
+    started: Instant,
     snapshot: Value,
     cancel: CancellationToken,
     confirmation: Option<oneshot::Sender<()>>,
@@ -69,9 +132,11 @@ impl TaskManager {
         let snapshot = json!({
             "id": id, "instruction": instruction.trim(), "model": model.name, "state": "observing", "steps": [],
             "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
-            "attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100
+            "observationId":null,"attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100
         });
         *guard = Some(Task {
+            session_id: session.id.clone(),
+            started: Instant::now(),
             snapshot: snapshot.clone(),
             cancel: cancel.clone(),
             confirmation: None,
@@ -108,6 +173,14 @@ impl TaskManager {
                 step["finishedAt"] = json!(now());
             }
         }
+        eprintln!(
+            "{}",
+            json!({
+                "at":now(),"event":"task_stage","session_id":task.session_id,"task_id":id,
+                "observation_id":task.snapshot["observationId"],"stage":"finish","phase":"end","status":state,
+                "elapsed_ms":task.started.elapsed().as_millis() as u64
+            })
+        );
         task.snapshot["state"] = json!(state);
         task.snapshot["message"] = json!(message.or_else(|| {
             uncertain.then(|| "A device action may already have been sent and cannot be undone.".into())
@@ -276,32 +349,47 @@ async fn run(
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
+    let mut observation_backoff = ObservationBackoff::default();
     loop {
-        let snapshot = s.tasks.update(id, |t| t.snapshot["state"] = json!("observing")).await?;
+        let observation_id = uuid::Uuid::new_v4().to_string();
+        let snapshot = s
+            .tasks
+            .update(id, |task| {
+                task.snapshot["state"] = json!("observing");
+                task.snapshot["observationId"] = json!(observation_id);
+            })
+            .await?;
         let observing = Instant::now();
+        let observation_stage = TaskStage::start(&s.id, id, &observation_id, "observe");
         let direct =
             if images.is_empty() && history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
                 direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
             } else {
                 None
             };
-        let observation = if direct.is_some() {
-            json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"})
-        } else if let Some(observation) = next_observation.take() {
-            observation
-        } else {
-            match s.task_screen(cancel.clone(), lease).await {
-                Ok(observation) => observation,
-                Err(error)
-                    if s.device.platform == crate::identity::Platform::Ios
-                        && recoverable_observation_error(&error.message) =>
-                {
-                    recoveries += 1;
-                    recover_observation(&s, id, recoveries, cancel.clone(), lease).await?
+        let observation_result = async {
+            if direct.is_some() {
+                Ok(json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"}))
+            } else if let Some(observation) = next_observation.take() {
+                Ok(observation)
+            } else {
+                match s.task_screen(cancel.clone(), lease).await {
+                    Ok(observation) => Ok(observation),
+                    Err(error)
+                        if s.device.platform == crate::identity::Platform::Ios
+                            && recoverable_observation_error(&error.message) =>
+                    {
+                        recoveries += 1;
+                        recover_observation(&s, id, recoveries, cancel.clone(), lease).await
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => return Err(error),
             }
-        };
+        }
+        .await;
+        observation_stage.finish(if observation_result.is_ok() { "ok" } else { "error" });
+        let mut observation = observation_result?;
+        observation["observationId"] = json!(observation_id);
         let query_only = observation["queryOnly"] == true;
         if observation["deviceId"] != s.device.serial_number {
             return Err(ApiError::new(409, "Observation device identity mismatch"));
@@ -319,22 +407,24 @@ async fn run(
             history.remove(0);
         }
         let thinking = Instant::now();
-        let action = if let Some(direct) = direct {
+        let model_stage = TaskStage::start(&s.id, id, &observation_id, "model");
+        let action_result = if let Some(direct) = direct {
             timings["direct"] = json!(true);
-            direct
+            Ok(direct)
         } else {
-            validate_reply(
-                model
-                    .generate(
-                        snapshot["instruction"].as_str().unwrap(),
-                        observation,
-                        history.clone(),
-                        &images,
-                        cancel.clone(),
-                    )
-                    .await?,
-            )?
+            model
+                .generate(
+                    snapshot["instruction"].as_str().unwrap(),
+                    observation,
+                    history.clone(),
+                    &images,
+                    cancel.clone(),
+                )
+                .await
+                .and_then(validate_reply)
         };
+        model_stage.finish(if action_result.is_ok() { "ok" } else { "error" });
+        let action = action_result?;
         timings["modelMs"] = json!(thinking.elapsed().as_millis() as u64);
         s.tasks.update(id, |t| t.snapshot["timings"] = timings.clone()).await?;
         if cancel.is_cancelled() {
@@ -382,6 +472,12 @@ async fn run(
         if needs_confirmation {
             tokio::select! {biased;_=cancel.cancelled()=>return Err(ApiError::new(409,"Task cancelled")),r=receiver=>r.map_err(|_|ApiError::new(409,"Task cancelled"))?}
         }
+        // Repeated requests for the same full frame or crop are polling. Keep
+        // the first request immediate, and let semantic queries, explicit native
+        // waits and actual device actions reset this bounded observation delay.
+        let delay = observation_backoff.delay_for(&request);
+        timings["observationBackoffMs"] = json!(delay.as_millis() as u64);
+        wait_for_observation_backoff(delay, &cancel).await?;
         s.tasks
             .update(id, |t| {
                 t.snapshot["state"] = json!("executing");
@@ -393,7 +489,14 @@ async fn run(
             "tool": action["tool"], "args": action["args"]
         });
         let executing = Instant::now();
-        let result = match s.run_task_command(command, cancel.clone(), lease).await {
+        let action_stage = TaskStage::start(&s.id, id, &observation_id, "action");
+        let action_result = s.run_task_command(command, cancel.clone(), lease).await;
+        action_stage.finish(if action_result.as_ref().is_ok_and(|result| result["kind"] != "error") {
+            "ok"
+        } else {
+            "error"
+        });
+        let result = match action_result {
             Ok(result) => result,
             Err(error)
                 if s.device.platform == crate::identity::Platform::Ios && recoverable_wda_error(&error.message) =>
@@ -429,7 +532,7 @@ async fn run(
             // The just-captured full frame/crop IS the next observation; do not
             // fetch another full image and send two pictures for the same query.
             next_observation = Some(
-                json!({"deviceId":s.device.serial_number,"imageBase64":result["jpeg_base64"],"caption":result["caption"],"elementsText":""}),
+                json!({"deviceId":s.device.serial_number,"imageBase64":result["jpeg_base64"],"caption":result["caption"],"coordinateMapping":result["coordinateMapping"],"elementsText":""}),
             );
         } else if matches!(
             action["tool"].as_str(),
@@ -539,6 +642,83 @@ fn inference_result(result: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_stage_events_include_only_trace_and_timing_metadata() {
+        let stage = TaskStage::start("session-fixture", "task-fixture", "observation-fixture", "model");
+        let event = stage.event("end", "error");
+        assert_eq!(event["session_id"], "session-fixture");
+        assert_eq!(event["task_id"], "task-fixture");
+        assert_eq!(event["observation_id"], "observation-fixture");
+        assert_eq!(event["stage"], "model");
+        assert_eq!(event["phase"], "end");
+        assert_eq!(event["status"], "error");
+        let mut keys: Vec<_> = event.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["at", "elapsed_ms", "event", "observation_id", "phase", "session_id", "stage", "status", "task_id"]
+        );
+        stage.finish("error");
+    }
+
+    #[test]
+    fn repeated_screenshot_backoff_is_bounded_and_single_requests_stay_immediate() {
+        let mut backoff = ObservationBackoff::default();
+        let request = json!({"op":"screenshot","region":null});
+        let delays: Vec<_> = (0..8).map(|_| backoff.delay_for(&request).as_millis()).collect();
+        assert_eq!(delays, vec![0, 250, 500, 1000, 2000, 2000, 2000, 2000]);
+    }
+
+    #[test]
+    fn different_crops_and_semantic_queries_reset_screenshot_backoff() {
+        let mut backoff = ObservationBackoff::default();
+        let full = json!({"op":"screenshot","region":null});
+        let crop = json!({"op":"screenshot","region":[10,20,30,40]});
+        let another_crop = json!({"op":"screenshot","region":[50,20,30,40]});
+        assert_eq!(backoff.delay_for(&full), Duration::ZERO);
+        assert_eq!(backoff.delay_for(&full), Duration::from_millis(250));
+        for request in [&crop, &another_crop, &full] {
+            assert_eq!(backoff.delay_for(request), Duration::ZERO);
+        }
+        for operation in ["tap", "list_apps", "list_elements", "status", "wait_for"] {
+            assert_eq!(backoff.delay_for(&full), Duration::from_millis(250));
+            assert_eq!(backoff.delay_for(&json!({"op":operation})), Duration::ZERO);
+            assert_eq!(backoff.delay_for(&full), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_screenshot_backoff_never_dispatches_its_action() {
+        let cancel = CancellationToken::new();
+        let waiting_cancel = cancel.clone();
+        let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting_dispatched = dispatched.clone();
+        let waiting = tokio::spawn(async move {
+            wait_for_observation_backoff(Duration::from_secs(2), &waiting_cancel).await?;
+            waiting_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, ApiError>(())
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let result = waiting.await.unwrap();
+        assert_eq!(result.unwrap_err().message, "Task cancelled");
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screenshot_backoff_waits_for_the_selected_delay() {
+        let cancel = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        wait_for_observation_backoff(Duration::from_millis(250), &cancel).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::from_millis(250));
+        let start = tokio::time::Instant::now();
+        wait_for_observation_backoff(Duration::ZERO, &cancel).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        cancel.cancel();
+        assert!(wait_for_observation_backoff(Duration::ZERO, &cancel).await.is_err());
+    }
+
     #[test]
     fn direct_commands_are_exact_allowlisted_and_do_not_match_compound_or_negative_requests() {
         assert_eq!(direct_command(" 回到主屏幕。 ").unwrap()["args"]["button"], "home");

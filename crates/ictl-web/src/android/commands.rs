@@ -342,6 +342,7 @@ impl AndroidCommands {
                     ("kind", "image".into()),
                     ("jpeg_base64", get(&image, "imageBase64")),
                     ("caption", get(&image, "caption")),
+                    ("coordinateMapping", get(&image, "coordinateMapping")),
                 ]));
             }
             "observe" => {
@@ -349,17 +350,22 @@ impl AndroidCommands {
                 let this = self.clone();
                 let sig = signal.clone();
                 let budget = number(&request, "snapshot_timeout_ms");
-                let tree = future_to_promise(async move {
-                    let result = this.read_nodes(&sig, if budget > 0.0 { budget.min(1800.0) } else { 1000.0 }).await;
-                    let ms = (this.clock() - start).round();
-                    Ok(match result {
-                        Ok(nodes) => obj(&[("nodes", nodes), ("elementsMs", ms.into())]),
-                        Err(_) => obj(&[
-                            ("error", "UI hierarchy unavailable; use screenshot coordinates".into()),
-                            ("elementsMs", ms.into()),
-                        ]),
+                let tree = if get(&request, "limit").as_f64().unwrap_or(80.0) > 0.0 {
+                    future_to_promise(async move {
+                        let result =
+                            this.read_nodes(&sig, if budget > 0.0 { budget.min(1800.0) } else { 1000.0 }).await;
+                        let ms = (this.clock() - start).round();
+                        Ok(match result {
+                            Ok(nodes) => obj(&[("nodes", nodes), ("elementsMs", ms.into())]),
+                            Err(_) => obj(&[
+                                ("error", "UI hierarchy unavailable; use screenshot coordinates".into()),
+                                ("elementsMs", ms.into()),
+                            ]),
+                        })
                     })
-                });
+                } else {
+                    Promise::resolve(&obj(&[("elementsMs", 0.into())]))
+                };
                 let image = self.take_screenshot(signal, JsValue::UNDEFINED).await?;
                 let capture = (self.clock() - start).round();
                 let tree = resolved(tree.into()).await?;
@@ -368,6 +374,7 @@ impl AndroidCommands {
                     ("deviceId", get(&self.options, "deviceId")),
                     ("imageBase64", get(&image, "imageBase64")),
                     ("caption", get(&image, "caption")),
+                    ("coordinateMapping", get(&image, "coordinateMapping")),
                     (
                         "elementsText",
                         if truth(&nodes) {

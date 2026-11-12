@@ -2,7 +2,6 @@ use crate::{
     commands::command_request,
     error::{ApiError, Result},
 };
-use base64::Engine;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -20,6 +19,7 @@ pub struct Model {
     key: String,
     catalog: Arc<Mutex<Catalog>>,
     format_refused: Arc<Mutex<HashSet<String>>>,
+    ocr: Arc<crate::ocr::Ocr>,
 }
 #[derive(Default)]
 struct Catalog {
@@ -27,6 +27,34 @@ struct Catalog {
     names: Vec<String>,
     failed: bool,
 }
+struct RequestDiagnostics<'a> {
+    observation_id: &'a str,
+    attempt: u8,
+    provider_attempt: u8,
+    started: Instant,
+    request_bytes: usize,
+    response_bytes: usize,
+    response_headers_ms: Option<u128>,
+    first_body_chunk_ms: Option<u128>,
+    http_status: Option<u16>,
+    finish_reason: Option<&'static str>,
+    status: &'static str,
+}
+impl RequestDiagnostics<'_> {
+    fn snapshot(&self) -> Value {
+        json!({"observation_id":self.observation_id,"attempt":self.attempt,"provider_attempt":self.provider_attempt,
+            "request_bytes":self.request_bytes,"response_bytes":self.response_bytes,
+            "response_headers_ms":self.response_headers_ms,"first_body_chunk_ms":self.first_body_chunk_ms,
+            "total_ms":self.started.elapsed().as_millis(),"http_status":self.http_status,
+            "finish_reason":self.finish_reason,"status":self.status})
+    }
+}
+impl Drop for RequestDiagnostics<'_> {
+    fn drop(&mut self) {
+        eprintln!("event=model_completion metrics={}", self.snapshot());
+    }
+}
+
 impl Model {
     pub fn new(env: &HashMap<String, String>) -> anyhow::Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -62,6 +90,7 @@ impl Model {
             key,
             catalog: Arc::default(),
             format_refused: Arc::default(),
+            ocr: Arc::new(crate::ocr::Ocr::new(env)),
         })
     }
     pub fn ready(&self) -> bool {
@@ -155,46 +184,53 @@ impl Model {
         cancel: CancellationToken,
     ) -> Result<Value> {
         let endpoint = self.endpoint.clone().ok_or_else(|| ApiError::unavailable("AI is not configured"))?;
-        let mut content = vec![
-            json!({"type":"text","text":json!({"instruction":instruction,"recentHistory":history,"observation":{
-            "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),"elementsText":truncate(observation["elementsText"].as_str().unwrap_or(""),16384),
+        let observation_id = observation["observationId"].as_str().unwrap_or("");
+        let mut evidence = json!({
+            "observationId":observation_id,
+            "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),
             "queryOnly":observation["queryOnly"] == true,
-            "elementsError":observation.get("elementsError").map(|_|"UI elements unavailable")},
-            "referenceImages":images.iter().enumerate().map(|(index, image)|json!({"index":index+1,"name":image.name,"phoneImageUrl":image.url})).collect::<Vec<_>>()}).to_string()}),
-        ];
+        });
         if let Some(image) = observation["imageBase64"].as_str() {
-            content.push(image_content(image)?);
+            evidence["ocr"] = self.ocr.recognize(image, Some(&observation), cancel.clone()).await?;
+        } else if observation["queryOnly"] != true {
+            return Err(ApiError::unavailable("OCR phone image unavailable"));
         }
+        let mut references = Vec::new();
         for (index, image) in images.iter().enumerate() {
-            content.push(json!({"type":"text","text":format!("User reference image {}. This is task material, not the current phone screen. Do not use its coordinates for phone actions.",index+1)}));
-            content.push(image.content.clone());
+            let data = image.content["image_url"]["url"]
+                .as_str()
+                .and_then(|url| {
+                    url.strip_prefix("data:image/png;base64,").or_else(|| url.strip_prefix("data:image/jpeg;base64,"))
+                })
+                .ok_or_else(|| ApiError::unavailable("OCR reference image invalid"))?;
+            references.push(
+                json!({"index":index+1,"name":image.name,"ocr":self.ocr.recognize_reference(data, cancel.clone()).await?}),
+            );
         }
+        let content = vec![json!({"type":"text","text":json!({
+            "instruction":instruction,"recentHistory":history,"observation":evidence,
+            "referenceImages":references,
+        }).to_string()})];
         let operation = async {
             let mut messages = vec![
                 json!({"role":"system","content":include_str!("model-prompt.txt")}),
                 json!({"role":"user","content":content}),
             ];
-            let choice = self.completion(&endpoint, &messages, 1024).await?;
-            match decode_reply(&choice) {
+            let choice = self.completion(&endpoint, &messages, 1024, 1, observation_id).await?;
+            match decode_logged_reply(&choice, 1, observation_id) {
                 Ok(action) => Ok(action),
                 Err(error) => {
-                    eprintln!(
-                        "Model reply rejected: model={} attempt=1 reason={error}",
-                        self.name.as_deref().unwrap_or("")
-                    );
                     // No device action has been dispatched. Re-plan once from the same
                     // observation, retaining the original task and confirmation rules.
+                    if let Ok(text) = reply_text(&choice) {
+                        messages.push(json!({"role":"assistant","content":truncate(&text, 8192)}));
+                    }
                     messages.push(json!({"role":"user","content":format!(
                         "Your previous reply failed validation: {}. Return exactly one complete JSON action or done object using the response schema. An action must have a string tool name and object args, for example {{\"type\":\"action\",\"tool\":\"iphone_screenshot\",\"args\":{{}},\"reason\":\"Inspect the current screen\",\"requiresConfirmation\":false}}. Choose the actual tool and arguments from the original tool catalog. For completion or inability to proceed, use {{\"type\":\"done\",\"message\":\"Explain the result\"}}. Preserve the original task, safety and confirmation requirements. Do not include markdown or extra text.",
                         error.message
                     )}));
-                    let choice = self.completion(&endpoint, &messages, 2048).await?;
-                    decode_reply(&choice).inspect_err(|error| {
-                        eprintln!(
-                            "Model reply rejected: model={} attempt=2 reason={error}",
-                            self.name.as_deref().unwrap_or("")
-                        );
-                    })
+                    let choice = self.completion(&endpoint, &messages, 2048, 2, observation_id).await?;
+                    decode_logged_reply(&choice, 2, observation_id)
                 }
             }
         };
@@ -207,7 +243,14 @@ impl Model {
         }
     }
 
-    async fn completion(&self, endpoint: &reqwest::Url, messages: &[Value], max_tokens: u32) -> Result<Value> {
+    async fn completion(
+        &self,
+        endpoint: &reqwest::Url,
+        messages: &[Value],
+        max_tokens: u32,
+        attempt: u8,
+        observation_id: &str,
+    ) -> Result<Value> {
         // Request the reply shape upstream; command_request still validates every tool and argument locally.
         let schema: Value = serde_json::from_str(include_str!("model-reply.schema.json"))
             .map_err(|_| ApiError::unavailable("Invalid model reply schema"))?;
@@ -217,31 +260,62 @@ impl Model {
         if self.format_refused.lock().await.contains(name) {
             use_prompt_schema(&mut payload);
         }
+        let mut provider_attempt = 0;
         loop {
+            provider_attempt += 1;
+            let body = serde_json::to_vec(&payload)
+                .map_err(|_| ApiError::unavailable("Model request serialization failed"))?;
+            let mut diagnostics = RequestDiagnostics {
+                observation_id,
+                attempt,
+                provider_attempt,
+                started: Instant::now(),
+                request_bytes: body.len(),
+                response_bytes: 0,
+                response_headers_ms: None,
+                first_body_chunk_ms: None,
+                http_status: None,
+                finish_reason: None,
+                status: "interrupted",
+            };
             let mut response = self
                 .client
                 .post(endpoint.clone())
                 .bearer_auth(&self.key)
-                .json(&payload)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
                 .send()
                 .await
-                .map_err(|_| ApiError::unavailable("Model provider request failed"))?;
+                .map_err(|_| {
+                    diagnostics.status = "transport_error";
+                    ApiError::unavailable("Model provider request failed")
+                })?;
+            diagnostics.response_headers_ms = Some(diagnostics.started.elapsed().as_millis());
             let status = response.status();
+            diagnostics.http_status = Some(status.as_u16());
             let can_fallback = matches!(status.as_u16(), 400 | 422) && payload.get("response_format").is_some();
             if !status.is_success() && !can_fallback {
+                diagnostics.status = "http_error";
                 return Err(ApiError::unavailable(format!(
                     "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
                     status.as_u16()
                 )));
             }
             if response.content_length().is_some_and(|n| n > 65536) {
+                diagnostics.status = "response_too_large";
                 return Err(ApiError::unavailable("Model response too large"));
             }
             let mut bytes = Vec::new();
-            while let Some(chunk) =
-                response.chunk().await.map_err(|_| ApiError::unavailable("Model provider request failed"))?
-            {
-                if bytes.len() + chunk.len() > 65536 {
+            while let Some(chunk) = response.chunk().await.map_err(|_| {
+                diagnostics.status = "body_error";
+                ApiError::unavailable("Model provider request failed")
+            })? {
+                diagnostics.response_bytes += chunk.len();
+                if !chunk.is_empty() && diagnostics.first_body_chunk_ms.is_none() {
+                    diagnostics.first_body_chunk_ms = Some(diagnostics.started.elapsed().as_millis());
+                }
+                if diagnostics.response_bytes > 65536 {
+                    diagnostics.status = "response_too_large";
                     return Err(ApiError::unavailable("Model response too large"));
                 }
                 bytes.extend_from_slice(&chunk);
@@ -251,27 +325,61 @@ impl Model {
                 if body.contains("response_format") || body.contains("json_schema") {
                     self.format_refused.lock().await.insert(name.to_owned());
                     use_prompt_schema(&mut payload);
-                    eprintln!("Model structured output refused: model={name}; using schema instructions");
+                    diagnostics.status = "format_refused";
                     continue;
                 }
+                diagnostics.status = "http_error";
                 return Err(ApiError::unavailable(format!(
                     "模型服务返回 HTTP {}，请检查所选模型的权限、额度和可用性。",
                     status.as_u16()
                 )));
             }
-            let envelope: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| ApiError::unavailable("Model provider returned an invalid JSON envelope"))?;
-            let choice = envelope["choices"]
-                .as_array()
-                .and_then(|choices| choices.first())
-                .ok_or_else(|| ApiError::unavailable("Model provider response is missing choices[0]"))?;
+            let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                diagnostics.status = "envelope_error";
+                ApiError::unavailable("Model provider returned an invalid JSON envelope")
+            })?;
+            let choice = envelope["choices"].as_array().and_then(|choices| choices.first()).ok_or_else(|| {
+                diagnostics.status = "missing_choice";
+                ApiError::unavailable("Model provider response is missing choices[0]")
+            })?;
+            diagnostics.finish_reason = Some(match choice["finish_reason"].as_str() {
+                Some("stop") => "stop",
+                Some("length") => "length",
+                Some("content_filter") => "content_filter",
+                Some("tool_calls") => "tool_calls",
+                Some("function_call") => "function_call",
+                Some(_) => "unknown",
+                None => "missing",
+            });
             if choice["finish_reason"] == "content_filter"
                 || choice["message"]["refusal"].as_str().is_some_and(|s| !s.is_empty())
             {
+                diagnostics.status = "provider_refusal";
                 return Err(ApiError::unavailable("模型拒绝生成本次操作，请调整任务内容。"));
             }
+            diagnostics.status = "complete";
             return Ok(choice.clone());
         }
+    }
+}
+
+fn decode_logged_reply(choice: &Value, attempt: u8, observation_id: &str) -> Result<Value> {
+    let result = decode_reply(choice);
+    let category = protocol_decode_category(&result);
+    eprintln!(
+        "event=model_protocol metrics={}",
+        json!({"observation_id":observation_id,"attempt":attempt,"decode_category":category})
+    );
+    result
+}
+fn protocol_decode_category(result: &Result<Value>) -> &'static str {
+    match result {
+        Ok(action) if action["type"] == "done" => "done",
+        Ok(_) => "action",
+        Err(error) if error.message.contains("response was truncated") => "truncated",
+        Err(error) if error.message.contains("message.content") => "content_shape",
+        Err(error) if error.message.contains("invalid JSON") || error.message.contains("code fence") => "json_syntax",
+        Err(_) => "action_schema",
     }
 }
 
@@ -286,14 +394,6 @@ fn use_prompt_schema(payload: &mut Value) {
 fn valid_model_id(name: &str) -> bool {
     !name.is_empty() && name.len() <= 256 && name.trim() == name && !name.chars().any(char::is_control)
 }
-fn image_content(image: &str) -> Result<Value> {
-    if image.len() > 8 * 1024 * 1024
-        || base64::engine::general_purpose::STANDARD.decode(image).map_or(true, |b| b.len() > 6 * 1024 * 1024)
-    {
-        return Err(ApiError::unavailable("Phone image exceeds model limit"));
-    }
-    Ok(json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}))
-}
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
@@ -302,26 +402,28 @@ fn invalid_reply(detail: &str) -> ApiError {
     ApiError::unavailable(format!("Invalid model reply: {detail}"))
 }
 
+fn reply_text(choice: &Value) -> Result<String> {
+    let content = &choice["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_owned());
+    }
+    let parts = content.as_array().ok_or_else(|| invalid_reply("message.content must be text"))?;
+    parts
+        .iter()
+        .map(|part| match part["type"].as_str() {
+            Some("text" | "output_text") => part["text"].as_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join(""))
+        .ok_or_else(|| invalid_reply("message.content must contain text parts"))
+}
+
 fn decode_reply(choice: &Value) -> Result<Value> {
     if choice["finish_reason"] == "length" {
         return Err(invalid_reply("response was truncated (finish_reason=length)"));
     }
-    let content = &choice["message"]["content"];
-    let text = if let Some(text) = content.as_str() {
-        text.to_owned()
-    } else if let Some(parts) = content.as_array() {
-        parts
-            .iter()
-            .map(|part| match part["type"].as_str() {
-                Some("text" | "output_text") => part["text"].as_str(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| invalid_reply("message.content must contain text parts"))?
-            .join("")
-    } else {
-        return Err(invalid_reply("message.content must be text"));
-    };
+    let text = reply_text(choice)?;
     let text = text.trim().trim_start_matches('\u{feff}').trim();
     let json = if text.starts_with("```") && text.ends_with("```") && text.len() >= 6 {
         let (language, json) =
@@ -378,4 +480,207 @@ pub fn validate_reply(mut value: Value) -> Result<Value> {
 }
 fn valid_string(v: &Value, max: usize) -> bool {
     v.as_str().is_some_and(|s| !s.trim().is_empty() && s.chars().count() <= max)
+}
+
+#[cfg(test)]
+mod ocr_tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use base64::Engine;
+    use std::io::Cursor;
+
+    fn png() -> String {
+        let mut bytes = Cursor::new(Vec::new());
+        image::RgbImage::new(20, 10).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+    }
+
+    #[tokio::test]
+    async fn initial_and_correction_payloads_contain_only_ocr_for_phone_and_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join("worker.py");
+        std::fs::write(&worker, r#"import sys,json,pathlib
+for line in sys.stdin:
+    request=json.loads(line)
+    with open(pathlib.Path(__file__).with_suffix('.calls'),'a') as calls: calls.write('request\n')
+    print(json.dumps({'id':request['id'],'width':20,'height':10,'lines':[{'text':'OCR recognized only','confidence':0.95,'polygon':[[1,2],[10,2],[10,8],[1,8]]}],'truncated':False}),flush=True)
+"#).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        async fn completion(State(requests): State<Arc<Mutex<Vec<Value>>>>, Json(payload): Json<Value>) -> Json<Value> {
+            let mut requests = requests.lock().await;
+            requests.push(payload);
+            let content =
+                if requests.len() == 1 { "invalid reply" } else { r#"{"type":"done","message":"OCR inspected"}"# };
+            Json(json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let app = Router::new().route("/chat/completions", post(completion)).with_state(requests.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let model = Model::new(&HashMap::from([
+            ("LLM_BASE_URL".into(), format!("http://{endpoint}")),
+            ("LLM_MODEL".into(), "fixture".into()),
+            ("LLM_API_KEY".into(), "secret".into()),
+            ("OCR_WORKER".into(), worker.to_string_lossy().into_owned()),
+        ]))
+        .unwrap();
+        let image = png();
+        let reference = crate::attachments::ReferenceImage {
+            name: "reference.png".into(),
+            url: "https://private.example/image-capability".into(),
+            content: json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{image}")}}),
+        };
+        let result = model.generate("Inspect text", json!({"observationId":"fixture-observation","imageBase64":image,"caption":"20x10 points, image pixels are point coordinates","elementsText":"PRIVATE WDA TREE"}), vec![], &[reference], CancellationToken::new()).await.unwrap();
+        assert_eq!(result["message"], "OCR inspected");
+        let renamed_reference = crate::attachments::ReferenceImage {
+            name: "different-name.png".into(),
+            url: "https://private.example/another-image-capability".into(),
+            content: json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{image}")}}),
+        };
+        model
+            .clone()
+            .generate(
+                "Inspect text",
+                json!({"imageBase64":image,"caption":"20x10 points, image pixels are point coordinates"}),
+                vec![],
+                &[renamed_reference],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worker.with_extension("calls")).unwrap().lines().count(),
+            3,
+            "phone frames must be fresh, identical reference pixels must share OCR across Model clones"
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            let payload = request.to_string();
+            assert!(!payload.contains("image_url"), "image payload sent to model");
+            assert!(!payload.contains("base64"));
+            assert!(!payload.contains("image-capability"));
+            assert!(!payload.contains("PRIVATE WDA TREE"));
+            assert!(payload.contains("OCR recognized only"));
+            let context: Value =
+                serde_json::from_str(request["messages"][1]["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert!(context["observation"].get("observationId").is_some());
+            assert_eq!(context["referenceImages"][0]["ocr"]["coordinateSpace"], "referenceImagePixels");
+            assert!(context["referenceImages"][0]["ocr"]["lines"][0].get("phonePolygon").is_none());
+        }
+        assert!(
+            requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["role"] == "assistant" && message["content"] == "invalid reply")
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn ocr_failure_stops_before_model_http_without_image_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("worker.py");
+        std::fs::write(
+            &worker,
+            r#"import sys,json
+for line in sys.stdin:
+    request=json.loads(line)
+    print(json.dumps({'id':request['id'],'error':'PRIVATE WORKER DETAIL'}),flush=True)
+"#,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = Model::new(&HashMap::from([
+            ("LLM_BASE_URL".into(), format!("http://{}", listener.local_addr().unwrap())),
+            ("LLM_MODEL".into(), "fixture".into()),
+            ("LLM_API_KEY".into(), "secret".into()),
+            ("OCR_WORKER".into(), worker.to_string_lossy().into_owned()),
+        ]))
+        .unwrap();
+        let error = model
+            .generate("Inspect", json!({"imageBase64":png()}), vec![], &[], CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "OCR recognition failed");
+        assert!(tokio::time::timeout(Duration::from_millis(25), listener.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn query_only_tool_results_do_not_require_an_ocr_worker() {
+        async fn completion(Json(payload): Json<Value>) -> Json<Value> {
+            let context: Value =
+                serde_json::from_str(payload["messages"][1]["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(context["observation"]["queryOnly"], true);
+            assert!(context["observation"].get("ocr").is_none());
+            assert_eq!(context["recentHistory"][0]["result"]["text"], "Installed app result");
+            Json(
+                json!({"choices":[{"message":{"content":r#"{"type":"done","message":"Read query"}"#},"finish_reason":"stop"}]}),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/chat/completions", post(completion))).await.unwrap()
+        });
+        let model = Model::new(&HashMap::from([
+            ("LLM_BASE_URL".into(), format!("http://{endpoint}")),
+            ("LLM_MODEL".into(), "fixture".into()),
+            ("LLM_API_KEY".into(), "secret".into()),
+            ("OCR_PYTHON".into(), "/missing-ocr-interpreter".into()),
+        ]))
+        .unwrap();
+        let result = model
+            .generate(
+                "Read query",
+                json!({"queryOnly":true}),
+                vec![json!({"result":{"text":"Installed app result"}})],
+                &[],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["message"], "Read query");
+        server.abort();
+    }
+    #[test]
+    fn diagnostic_fields_have_explicit_timing_and_protocol_categories() {
+        let diagnostics = RequestDiagnostics {
+            observation_id: "fixture-observation",
+            attempt: 2,
+            provider_attempt: 1,
+            started: Instant::now(),
+            request_bytes: 123,
+            response_bytes: 45,
+            response_headers_ms: Some(10),
+            first_body_chunk_ms: Some(20),
+            http_status: Some(200),
+            finish_reason: Some("stop"),
+            status: "complete",
+        };
+        let metrics = diagnostics.snapshot();
+        assert_eq!(metrics["request_bytes"], 123);
+        assert_eq!(metrics["response_bytes"], 45);
+        assert_eq!(metrics["response_headers_ms"], 10);
+        assert_eq!(metrics["first_body_chunk_ms"], 20);
+        assert_eq!(metrics["observation_id"], "fixture-observation");
+        assert_eq!(protocol_decode_category(&decode_reply(&json!({"message":{"content":"invalid"}}))), "json_syntax");
+        assert_eq!(
+            protocol_decode_category(&decode_reply(&json!({"finish_reason":"length","message":{"content":"invalid"}}))),
+            "truncated"
+        );
+        assert_eq!(protocol_decode_category(&decode_reply(&json!({"message":{"content":null}}))), "content_shape");
+        assert_eq!(
+            protocol_decode_category(&decode_reply(
+                &json!({"message":{"content":r#"{"type":"action","tool":"unknown","reason":"inspect"}"#}})
+            )),
+            "action_schema"
+        );
+        assert_eq!(
+            protocol_decode_category(&decode_reply(
+                &json!({"message":{"content":r#"{"type":"done","message":"finished"}"#}})
+            )),
+            "done"
+        );
+    }
 }

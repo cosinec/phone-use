@@ -1,5 +1,6 @@
 // Transparent test substitute for iphone-control: same daemon/setup invocation and NDJSON socket.
 import net from 'node:net';
+import { fixtureImageBase64 } from './screen-image.mjs';
 import readline from 'node:readline';
 import { chmodSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -37,11 +38,11 @@ if (process.argv[2] === 'descendant') {
       if (!buffer.includes('\n')) return;
       const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
       if (request.op in counts) counts[request.op]++;
-      if (request.op === 'observe') { counts.screenshot++; counts.list_elements++; }
+      if (request.op === 'observe') { counts.screenshot++; if (request.limit > 0) counts.list_elements++; }
       if (request.op === 'tap') taps++;
       if (request.op === 'type_text') typeRequests++;
       if (request.op === 'tap' && request.x === 999) return;
-      const elementDelay = Number(process.env.FIXTURE_ELEMENTS_DELAY_MS || 0);
+      const elementDelay = request.op === 'observe' && request.limit === 0 ? 0 : Number(process.env.FIXTURE_ELEMENTS_DELAY_MS || 0);
       const budget = request.snapshot_timeout_ms ?? 1000;
       const typingError = process.env.FIXTURE_TYPE_TEXT_ERROR || (!taps && process.env.FIXTURE_TYPE_TEXT_NEEDS_FOCUS);
       const tapFailure = request.op === 'tap' && taps <= Number(process.env.FIXTURE_TAP_WDA_FAILURES || 0);
@@ -59,9 +60,9 @@ if (process.argv[2] === 'descendant') {
         : request.op === 'type_text' && typingError
         ? { kind: 'error', message: typingError }
         : request.op === 'observe'
-        ? { kind: 'text', text: JSON.stringify({ deviceId: taps && process.env.FIXTURE_RECOVERY_FOREIGN_OBSERVATION ? 'different-device' : process.env.IPHONE_UDID, imageBase64: 'aW1hZ2U=', caption: taps ? 'fixture fresh screen after action' : 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request, taps, counts }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
+        ? { kind: 'text', text: JSON.stringify({ deviceId: taps && process.env.FIXTURE_RECOVERY_FOREIGN_OBSERVATION ? 'different-device' : process.env.IPHONE_UDID, imageBase64: fixtureImageBase64, caption: taps ? 'fixture fresh screen after action' : 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request, taps, counts }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
         : request.op === 'screenshot'
-        ? { kind: 'image', jpeg_base64: 'aW1hZ2U=', caption: 'fixture points 390×844' }
+        ? { kind: 'image', jpeg_base64: fixtureImageBase64, caption: 'fixture points 390×844', coordinateMapping: { offsetX: request.region?.[0] ?? 0, offsetY: request.region?.[1] ?? 0, scaleX: request.region ? request.region[2] / 390 : 1, scaleY: request.region ? request.region[3] / 844 : 1 } }
         : request.op === 'list_apps' ? { kind: 'text', text: 'Fixture App: com.example.fixture' }
         : { kind: 'text', text: JSON.stringify({ request, taps, counts, typeRequests, env: {
           ICTL_CAPTURE_POLICY: process.env.ICTL_CAPTURE_POLICY, ICTL_LOW_LATENCY: process.env.ICTL_LOW_LATENCY,

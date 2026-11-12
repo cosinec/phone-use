@@ -649,7 +649,7 @@ pub fn wants_alert_check(req: &Request) -> bool {
 pub fn to_result(r: Response) -> CallToolResult {
     match r {
         Response::Text { text, .. } => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Response::Image { jpeg_base64, caption } => {
+        Response::Image { jpeg_base64, caption, .. } => {
             CallToolResult::success(vec![ContentBlock::image(jpeg_base64, "image/jpeg"), ContentBlock::text(caption)])
         }
         Response::Error { message } => CallToolResult::error(vec![ContentBlock::text(message)]),
@@ -778,7 +778,7 @@ impl McpServer {
                 done(vec![ContentBlock::text(text)])
             }
             Then::Screenshot(region) => match self.call(&Request::Screenshot { region }).await {
-                Response::Image { jpeg_base64, caption } => done(vec![
+                Response::Image { jpeg_base64, caption, .. } => done(vec![
                     ContentBlock::text(text),
                     ContentBlock::image(jpeg_base64, "image/jpeg"),
                     ContentBlock::text(caption),
@@ -1118,7 +1118,11 @@ mod tests {
         let r = to_result(Response::error("button 只能是 home / volume_up / volume_down / lock"));
         assert_eq!(r.is_error, Some(true));
         assert!(matches!(&r.content[0], ContentBlock::Text(t) if t.text.contains("button 只能是")));
-        let img = to_result(Response::Image { jpeg_base64: "AAAA".into(), caption: "430x932 点".into() });
+        let img = to_result(Response::Image {
+            jpeg_base64: "AAAA".into(),
+            caption: "430x932 点".into(),
+            coordinate_mapping: None,
+        });
         assert_eq!(img.content.len(), 2);
         assert!(to_request("iphone_nope", &Map::new()).is_err());
     }

@@ -301,12 +301,8 @@ impl Daemon {
             None => Err(wda_down(&g.state, g.info.as_ref())),
         };
         fetching.finish(wda_frame.is_ok());
-        // Keep recent orientation for local HID without masking the capture error.
-        if wda_frame.is_ok() {
-            let rotation = StepTimer::new("screenshot_rotation");
-            self.refresh_hid_rotation(g).await;
-            rotation.finish(true);
-        }
+        // HID touches refresh rotation immediately before validating a fresh frame.
+        // Keep that auxiliary query off the capture path.
         let (png, via) = capture_with_fallback(self.cfg.capture_policy, wda_frame, || async {
             if !hid_supported(g.info.as_ref()) {
                 return Err(wda_down(&g.state, g.info.as_ref()));
@@ -337,7 +333,7 @@ impl Daemon {
         let lang = ictl_l10n::lang();
         let processing = StepTimer::new("image_process_and_encode");
         let processing_span = tracing::Span::current();
-        let (jpeg, caption) = tokio::task::spawn_blocking(move || {
+        let (jpeg, caption, coordinate_mapping) = tokio::task::spawn_blocking(move || {
             let _span = processing_span.enter();
             let work = StepTimer::new("image_decode_resize_jpeg");
             let output = ictl_l10n::with_lang(lang, || match region {
@@ -360,17 +356,22 @@ impl Daemon {
             base64_bytes = jpeg_base64.len()
         );
         encoding.finish(true);
-        Ok(CapturedFrame { image: Response::Image { jpeg_base64, caption }, view, source_bytes, source_format })
+        Ok(CapturedFrame {
+            image: Response::Image { jpeg_base64, caption, coordinate_mapping: Some(coordinate_mapping) },
+            view,
+            source_bytes,
+            source_format,
+        })
     }
 
     pub(crate) async fn observe(&self, g: &mut Inner, limit: usize, budget: Duration) -> Result<Response, String> {
         let started = Instant::now();
         self.ensure_unlocked(g).await?;
         let CapturedFrame { image: frame, view, source_bytes, source_format } = self.capture_frame(g, None).await?;
-        let Response::Image { jpeg_base64, caption } = frame else { return Ok(frame) };
+        let Response::Image { jpeg_base64, caption, coordinate_mapping } = frame else { return Ok(frame) };
         let mut observation = serde_json::json!({
             "deviceId": g.device.as_ref().map(|d| d.udid.as_str()),
-            "imageBase64":jpeg_base64,"caption":caption,"elementsText":"",
+            "imageBase64":jpeg_base64,"caption":caption,"coordinateMapping":coordinate_mapping,"elementsText":"",
             "capturedAt":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
             "timings":{"screenshotMs":started.elapsed().as_millis() as u64,"sourceBytes":source_bytes,"sourceFormat":source_format}
         });

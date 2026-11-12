@@ -3,6 +3,7 @@
 use std::io::Cursor;
 
 use ictl_device::ScreenSize;
+use ictl_protocol::CoordinateMapping;
 use image::{DynamicImage, codecs::jpeg::JpegEncoder, imageops::FilterType};
 
 pub const ZOOM_MIN_LONG_SIDE: f64 = 600.0;
@@ -116,8 +117,8 @@ pub fn thumb_motion(a: &[u8], b: &[u8]) -> Motion {
     Motion { mean, max_tile }
 }
 
-/// 整屏缩放到点尺寸：图像像素即点坐标。返回 (jpeg, 说明文字)
-pub fn full_screen(png: &[u8], screen: ScreenSize, via: &str) -> Result<(Vec<u8>, String), String> {
+/// 整屏缩放到点尺寸，返回 JPEG、说明文字和像素到点的映射。
+pub fn full_screen(png: &[u8], screen: ScreenSize, via: &str) -> Result<(Vec<u8>, String, CoordinateMapping), String> {
     let img = decode(png)?;
     let (w, h) = oriented(img.width(), img.height(), screen);
     let out = jpeg(&img.resize_exact(w, h, filter_for((img.width(), img.height()), (w, h))), 80)?;
@@ -127,6 +128,7 @@ pub fn full_screen(png: &[u8], screen: ScreenSize, via: &str) -> Result<(Vec<u8>
             "{w}x{h} 点,图像像素即点坐标(经 {via})",
             "{w}x{h} points, image pixels are point coordinates (via {via})"
         ),
+        CoordinateMapping { offset_x: 0.0, offset_y: 0.0, scale_x: 1.0, scale_y: 1.0 },
     ))
 }
 
@@ -170,13 +172,13 @@ pub fn plan_zoom(
     Ok(ZoomPlan { crop: (cx1, cy1, cw, ch), out, zoom: out.0 as f64 / (x2 - x1), region: (x1, y1, x2 - x1, y2 - y1) })
 }
 
-/// 从原始高清截图裁出一块并放大。返回 (jpeg, 说明文字，含坐标换算式)
+/// 从原始高清截图裁出一块并放大，返回 JPEG、说明文字和像素到点的精确映射。
 pub fn region(
     png: &[u8],
     screen: ScreenSize,
     rect: (f64, f64, f64, f64),
     via: &str,
-) -> Result<(Vec<u8>, String), String> {
+) -> Result<(Vec<u8>, String, CoordinateMapping), String> {
     let img = decode(png)?;
     let p = plan_zoom(img.width(), img.height(), screen, rect.0, rect.1, rect.2, rect.3)?;
     let (cx, cy, cw, ch) = p.crop;
@@ -192,7 +194,16 @@ pub fn region(
         fmt_g(rw),
         fmt_g(rh)
     );
-    Ok((jpeg(&crop, 90)?, caption))
+    let (screen_w, screen_h) = oriented(img.width(), img.height(), screen);
+    let points_per_source_x = screen_w as f64 / img.width() as f64;
+    let points_per_source_y = screen_h as f64 / img.height() as f64;
+    let mapping = CoordinateMapping {
+        offset_x: cx as f64 * points_per_source_x,
+        offset_y: cy as f64 * points_per_source_y,
+        scale_x: cw as f64 * points_per_source_x / p.out.0 as f64,
+        scale_y: ch as f64 * points_per_source_y / p.out.1 as f64,
+    };
+    Ok((jpeg(&crop, 90)?, caption, mapping))
 }
 
 /// 读取 PNG 尺寸（只读文件头，不解码像素）
@@ -207,13 +218,43 @@ mod tests {
     fn source_jpeg_keeps_point_dimensions_and_region_coordinates() {
         let source = jpeg(&DynamicImage::new_rgb8(90, 180), 90).unwrap();
         let screen = ScreenSize { width: 30.0, height: 60.0 };
-        let (frame, _) = full_screen(&source, screen, "WDA").unwrap();
+        let (frame, _, _) = full_screen(&source, screen, "WDA").unwrap();
         let decoded = image::load_from_memory(&frame).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (30, 60));
-        let (crop, caption) = region(&source, screen, (5.0, 10.0, 10.0, 20.0), "WDA").unwrap();
+        let (crop, caption, _) = region(&source, screen, (5.0, 10.0, 10.0, 20.0), "WDA").unwrap();
         let decoded = image::load_from_memory(&crop).unwrap();
         assert_eq!(decoded.height(), 600);
         assert!(caption.contains('5') && caption.contains("10"), "{caption}");
+    }
+
+    #[test]
+    fn crop_mapping_tracks_integer_source_crop_and_each_output_axis() {
+        let screen = ScreenSize { width: 30.0, height: 60.0 };
+        let (jpeg, _, mapping) = region(&png(90, 180), screen, (1.1, 2.2, 10.2, 13.7), "WDA").unwrap();
+        let (width, height) = jpeg_size(&jpeg);
+        assert_eq!((width, height), (454, 600));
+        assert_eq!(mapping.offset_x, 1.0);
+        assert!((mapping.offset_y - 7.0 / 3.0).abs() < 1e-12);
+        assert!((mapping.scale_x - 31.0 / 3.0 / 454.0).abs() < 1e-12);
+        assert!((mapping.scale_y - 41.0 / 3.0 / 600.0).abs() < 1e-12);
+        assert_ne!(mapping.scale_x, mapping.scale_y);
+        assert!((mapping.offset_x + width as f64 * mapping.scale_x - 34.0 / 3.0).abs() < 1e-12);
+        assert!((mapping.offset_y + height as f64 * mapping.scale_y - 48.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mapping_matches_clipped_crop_and_landscape_full_frame() {
+        let screen = ScreenSize { width: 30.0, height: 60.0 };
+        let (jpeg, _, mapping) = region(&png(90, 180), screen, (-0.5, 50.3, 100.0, 20.2), "WDA").unwrap();
+        let (width, height) = jpeg_size(&jpeg);
+        assert_eq!(mapping.offset_x, 0.0);
+        assert!((mapping.offset_y - 151.0 / 3.0).abs() < 1e-12);
+        assert!((width as f64 * mapping.scale_x - 30.0).abs() < 1e-12);
+        assert!((mapping.offset_y + height as f64 * mapping.scale_y - 60.0).abs() < 1e-12);
+
+        let (jpeg, _, mapping) = full_screen(&png(180, 90), screen, "WDA").unwrap();
+        assert_eq!(jpeg_size(&jpeg), (60, 30));
+        assert_eq!(mapping, CoordinateMapping { offset_x: 0.0, offset_y: 0.0, scale_x: 1.0, scale_y: 1.0 });
     }
 
     const SCREEN: ScreenSize = ScreenSize { width: 430.0, height: 932.0 };
@@ -257,14 +298,14 @@ mod tests {
 
     #[test]
     fn full_screen_is_scaled_to_points() {
-        let (j, cap) = full_screen(&png(1290, 2796), SCREEN, "WDA").unwrap();
+        let (j, cap, _) = full_screen(&png(1290, 2796), SCREEN, "WDA").unwrap();
         assert_eq!(jpeg_size(&j), (430, 932));
         assert_eq!(cap, "430x932 点,图像像素即点坐标(经 WDA)");
     }
 
     #[test]
     fn landscape_screenshot_swaps_dimensions() {
-        let (j, _) = full_screen(&png(2796, 1290), SCREEN, "HID").unwrap();
+        let (j, _, _) = full_screen(&png(2796, 1290), SCREEN, "HID").unwrap();
         assert_eq!(jpeg_size(&j), (932, 430));
     }
 
@@ -272,10 +313,10 @@ mod tests {
     #[test]
     fn portrait_screenshot_with_landscape_size_is_not_squashed() {
         let land = ScreenSize { width: 1024.0, height: 768.0 };
-        let (j, cap) = full_screen(&png(1536, 2048), land, "WDA").unwrap();
+        let (j, cap, _) = full_screen(&png(1536, 2048), land, "WDA").unwrap();
         assert_eq!(jpeg_size(&j), (768, 1024));
         assert_eq!(cap, "768x1024 点,图像像素即点坐标(经 WDA)");
-        let (j, _) = full_screen(&png(2048, 1536), land, "WDA").unwrap();
+        let (j, _, _) = full_screen(&png(2048, 1536), land, "WDA").unwrap();
         assert_eq!(jpeg_size(&j), (1024, 768));
     }
 
@@ -310,7 +351,7 @@ mod tests {
     /// 回归用例 #16：倍数保留 3 位有效数字（2 位会让右边缘差约 1.4 点）
     #[test]
     fn zoom_caption_uses_three_significant_digits() {
-        let (j, cap) = region(&png(1290, 2796), SCREEN, (0.0, 55.0, 430.0, 40.0), "WDA").unwrap();
+        let (j, cap, _) = region(&png(1290, 2796), SCREEN, (0.0, 55.0, 430.0, 40.0), "WDA").unwrap();
         assert_eq!(jpeg_size(&j).0, 1200);
         assert_eq!(
             cap,

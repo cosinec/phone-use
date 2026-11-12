@@ -8,7 +8,8 @@ flowchart LR
   B <-->|HTTPS / WSS| G[服务器\nRust 网关与网页]
   G <--> M[每会话独立虚拟 usbmuxd]
   M <--> N[iphone-control\n配对、签名、WDA]
-  G <--> A[可选视觉模型\nAPI key 仅在服务器]
+  G <--> O[同容器常驻 PaddleOCR]
+  G -->|OCR 文字、置信度、坐标| A[可选文字模型\nAPI key 仅在服务器]
 ```
 
 网页必须保持打开。所选 iPhone 拔出 USB 时，页面会立即显示断开并关闭对应 WebSocket 与会话；其他设备的拔出事件不会影响当前会话。部署后的用户 Mac 无需额外安装原生 helper；服务器必须安装原生引擎。仅部署静态网页不能提供手机控制。把服务器在本机启动，是开发时模拟云端角色，不能据此称为已部署云服务。
@@ -21,7 +22,7 @@ flowchart LR
 
 手动与 AI 操作共用同一会话队列：截图、点按、长按、滑动、中文输入、主屏幕/返回/锁屏/音量、列出/启动/结束应用、打开 URL、查询和等待界面元素。兼容 API 仍使用 `iphone_*` 工具名；Android 应用参数必须是 `list_apps` 返回的 Android package ID。时钟等厂商可变包名不走 iOS 快捷指令。旋转或显示尺寸无法核实时，坐标动作会报错，要求刷新截图。多显示器暂不支持。受保护的画面可能无法截图。
 
-`/device/ws` 沿用现有 origin 校验、短期会话令牌、1 MiB 帧上限与单连接所有权。Android 设备 ID 使用区分大小写的 `android:` 命名空间，同一设备不能被多个服务端会话同时占用。动作不自动重试，取消会丢弃尚未派发的动作。支持 WebCodecs 时优先由设备编码 H.264（最长边 1280 像素、上限 10 fps / 2 Mbps），浏览器解码后取新画面转为 JPEG 上传；通道不可用时退回系统 PNG 截图并在浏览器缩放。连续视频只在设备和浏览器之间传输。采图核对原生显示方向，方向或尺寸变化后等待新的编码配置和画面；坐标与元素边框统一换算。识别阶段并行采图和限时查询元素树，界面树不可用时保留截图。截图与元素查询耗时分别记录；模型上下文省略空布局节点，保留无标签但可聚焦的输入控件。
+`/device/ws` 沿用现有 origin 校验、短期会话令牌、1 MiB 帧上限与单连接所有权。Android 设备 ID 使用区分大小写的 `android:` 命名空间，同一设备不能被多个服务端会话同时占用。动作不自动重试，取消会丢弃尚未派发的动作。支持 WebCodecs 时优先由设备编码 H.264（最长边 1280 像素、上限 10 fps / 2 Mbps），浏览器解码后取新画面转为 JPEG 上传；通道不可用时退回系统 PNG 截图并在浏览器缩放。连续视频只在设备和浏览器之间传输。采图核对原生显示方向，方向或尺寸变化后等待新的编码配置和画面；坐标与元素边框统一换算。手动界面观察并行采图和限时查询元素树，AI 任务观察跳过元素树查询。截图与元素查询耗时分别记录；手动界面查询保留可聚焦输入控件，AI 规划使用截图的 OCR 结果。
 
 适配器、取消/去重和真实 Rust 网关 WebSocket 集成测试使用明确标注的 ADB/截图 fixture；它们与下述 Xiaomi 平板实测分开记录，不代表所有机型的 USB 兼容性或任务成功率。Windows、多显示器和其他 Android 版本仍待验证。
 
@@ -35,7 +36,7 @@ Chrome Network 中 5 次空闲设置页面 `/preview` 请求为 494、501、470�
 
 ## Rust/WASM 浏览器客户端
 
-任务最多执行 100 步，总时限为 30 分钟。任务输入框支持选择、粘贴和拖入 JPEG/PNG 图片，可预览和移除。每个会话最多 6 张，单张 5 MiB，总计 20 MiB。模型能查看参考图片，并获得用于手机 Safari 打开的短期链接。发帖配图需要先通过手机系统界面保存到照片，再从目标 App 选图，导入结果以真机界面为准。
+任务最多执行 100 步，总时限为 30 分钟。任务输入框支持选择、粘贴和拖入 JPEG/PNG 图片，可预览和移除。每个会话最多 6 张，单张 5 MiB，总计 20 MiB。参考图片经过 PaddleOCR 后，以文字、置信度和参考图像素坐标提供给模型。图片内容和图片链接由服务器及页面管理，模型输入仅包含识别结果。发帖配图需要先通过手机系统界面保存到照片，再从目标 App 选图，导入结果以真机界面为准。
 
 iPhone 预览优先使用 WDA 的独立 MJPEG 通道，在 AI 思考和操作期间持续更新。连接不可用时使用截图后备，过旧的流画面会暂停手动点击。预览链接只能读取对应会话的画面，会话结束后失效。
 
@@ -63,6 +64,19 @@ cp .env.example .env
 npm run build
 GATEWAY_BIN="$(cd ../target/release && pwd)/iphone-control-gateway" npm start
 ```
+
+AI 识别需要 Python 3.11 和 PaddleOCR CPU 依赖。在 `browser-control` 目录执行下列命令，并将 `.env` 的 `OCR_PYTHON` 设为虚拟环境解释器的绝对路径。`.env.example` 中提供了此启动目录使用的 `OCR_WORKER=ocr/worker.py` 示例。
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python3 -m pip install -r ocr/requirements.txt
+.venv/bin/python3 ocr/worker.py --prepare
+.venv/bin/python3 -m unittest discover -s ocr -p 'test_*.py'
+```
+
+`--prepare` 预先下载 `PP-OCRv5_mobile_det` 和 `PP-OCRv5_mobile_rec`。模型支持中英文，缓存默认位于运行用户的 `~/.paddlex`，可用 `PADDLE_PDX_CACHE_HOME` 指定目录。网关按需启动同一容器内的常驻 Python 子进程，初始化一次并逐张识别。文档方向分类、文档矫正和文本行方向分类均关闭，文字坐标对应输入图片像素。工作进程的标准输出仅传输 JSONL，依赖库的原生输出被抑制，失败返回固定错误信息。
+
+固定依赖为 PaddlePaddle 3.3.1、PaddleOCR 3.7.0 和 PaddleX 3.7.2。CPU 容器使用 Linux amd64，Mac arm64 可用于本地开发。镜像构建时安装 Python 依赖并预下载模型，`OCR_PYTHON=/opt/ocr/bin/python3`、`OCR_WORKER=/app/ocr/worker.py` 已写入镜像。模型缓存保留在容器内运行用户目录。版本与参数依据 [官方安装说明](https://www.paddleocr.ai/main/en/quick_start.html)、[官方 OCR 参数](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/OCR.en.md)、[PaddlePaddle PyPI](https://pypi.org/project/paddlepaddle/3.3.1/) 和 [PaddleOCR PyPI](https://pypi.org/project/paddleocr/3.7.0/)。
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，在页面粘贴服务器访问令牌并点击「连接 iPhone」。令牌仅在本页内存中使用。首次连接需要解锁手机、信任电脑，并根据原生向导完成开发者模式、Apple 账号与 WDA 签名。
 
@@ -94,13 +108,13 @@ AI 任务执行期间暂停手动操作。确认框显示具体操作、参数�
 
 网页通过 `/api/sessions/:id/preview` 获取纯图片，预览不会读取元素树。AI 运行期间该接口直接返回任务最近采集的真实画面；首张观察尚未完成时返回 `null`，页面保留现有画面。任务状态每秒独立刷新，不再等待截图完成。设备空闲时短时间内的并发预览合并，设备命令执行后会使预览缓存失效。
 
-AI 的 `/screen` 通过一个原生 `observe` 请求在同一设备锁内取得截图和元素树。只检查一次解锁状态，图片方向供元素树解析复用。原生引擎将只读元素快照限制为 1 秒，超时后模型按截图继续判断；已有 MCP 客户端默认保持原来的快照超时。升级必须同时构建网关和原生引擎，旧引擎不支持 `observe`。
+AI 任务通过原生 `observe` 请求采图，跳过自动元素树查询。PaddleOCR 在服务器常驻子进程中识别屏幕文字，将文字、置信度和手机点坐标传给模型。整屏和裁剪图使用原生引擎提供的精确坐标映射。手动 `/screen` 仍提供截图与限时 1 秒的元素树查询，MCP 快照超时沿用原配置。升级需要同时构建网关和原生引擎。
 
 浏览器会话默认启用 `ICTL_LOW_LATENCY=1`：创建 WDA 会话时请求源端高质量 JPEG，并复用低延迟等待设置。设置未被 WDA 明确确认时恢复普通手势路径。确认成功的会话中，点击保留 200 毫秒绘制窗口，滑动仍保留原有稳定检测。图片点尺寸、横竖屏及区域坐标换算保持一致；`ICTL_LOW_LATENCY=0` 可关闭设备端 JPEG/等待配置，重新连接后生效。
 
 WDA HTTP 连接按完整响应边界复用。超时、取消、不完整响应会丢弃连接；空闲连接失效时仅 GET 最多重连一次，发出的 POST/动作不重放。`Connection: close` 或无明确消息边界的响应不入连接池。
 
-查询工具的有界文字结果直接作为下一轮只读证据，区域截图本身作为下一轮图像，避免重新采集整屏。没有当前图像的查询结果不能直接触发坐标动作，模型必须重新观察并规划。完全匹配“回到主屏幕 / go home”、“打开设置 / open settings”、“打开时钟 / open clock”的单步请求省略首次模型规划，动作后仍观察并调用模型验证；复合或否定指令走普通流程。查询内容不写入轮询的任务快照。
+查询工具的有界文字结果直接作为下一轮只读证据，区域截图复用到下一轮 OCR，避免重新采集整屏。缺少当前屏幕 OCR 的查询结果需要重新观察后再规划坐标动作。完全匹配“回到主屏幕 / go home”、“打开设置 / open settings”、“打开时钟 / open clock”的单步请求省略首次模型规划，动作后仍观察并调用模型验证；复合或否定指令走普通流程。查询内容不写入轮询的任务快照。
 
 任务面板显示最近一轮的观察、模型和操作耗时；API 的 `timings.capture` 进一步区分队列、截图和元素耗时，并提供 `sourceFormat` 和 `sourceBytes`（源图像二进制大小，不含 base64/HTTP 开销）。自动化覆盖模拟 WDA/USB/模型，实际公网耗时、手机文字清晰度及任务成功率仍需真机测量。
 
@@ -121,13 +135,13 @@ WDA HTTP 连接按完整响应边界复用。超时、取消、不完整响应�
 | `LLM_MODEL` | 默认模型名称，页面可从服务商模型列表中另选 |
 | `LLM_API_KEY` | 可选模型 key，仅配置于服务器环境 |
 
-模型三个变量缺一即为未配置。当前客户端向 `/chat/completions` 发送视觉 Chat Completions 请求，使用 `temperature: 0`、`max_tokens: 1024`，要求模型返回校验后的纯 JSON 操作或完成消息。它不使用 function tools。服务商必须兼容图片输入、这些请求参数与响应格式；已配置只表示配置完整，不能证明服务商健康。o-series 等需要不同 token/temperature 参数的模型仍需后续适配，当前没有宣称通用模型兼容性或真实模型评测。
+模型三个变量缺一即为未配置。当前客户端向 `/chat/completions` 发送包含 OCR 文字与坐标的 Chat Completions 请求，使用 `temperature: 0`、`max_tokens: 1024`，要求模型返回校验后的纯 JSON 操作或完成消息。它不使用 function tools。服务商需要兼容这些请求参数与响应格式；已配置只表示配置完整，不能证明服务商健康。o-series 等需要不同 token/temperature 参数的模型仍需后续适配，当前没有宣称通用模型兼容性或真实模型评测。
 
-任务模型下拉框来自同一 `LLM_BASE_URL` 的 `/models`，API key 仅由服务器发送。列表成功缓存 60 秒，失败缓存 15 秒，失败时提示并保留默认模型或上次列表。可点「刷新列表」重新读取服务器当前列表。所有返回的合法模型 ID 均可选择，是否支持图片、账号是否有权限及模型是否可用取决于服务商。任务创建可携带 `model`，服务器校验它属于模型列表或默认模型；省略则使用 `LLM_MODEL`。每个任务固定自己的模型，运行期间下拉框禁用，执行记录展示本次模型。切换不会修改其他设备或任务的默认模型。
+任务模型下拉框来自同一 `LLM_BASE_URL` 的 `/models`，API key 仅由服务器发送。列表成功缓存 60 秒，失败缓存 15 秒，失败时提示并保留默认模型或上次列表。可点「刷新列表」重新读取服务器当前列表。所有返回的合法模型 ID 均可选择，账号权限、结构化输出支持和模型可用性取决于服务商。任务创建可携带 `model`，服务器校验它属于模型列表或默认模型；省略则使用 `LLM_MODEL`。每个任务固定自己的模型，运行期间下拉框禁用，执行记录展示本次模型。切换不会修改其他设备或任务的默认模型。
 
 ## Linux 部署
 
-Dockerfile 从当前源码构建 Rust 网关和原生引擎，包含本地已验证的原生修复，复用 `ghcr.io/derrors/iphone-control:0.1.4` 的 Appium 未签名 WDA、资源和许可证，并为网关新增依赖生成许可证清单。Rust/WASM 阶段编译 Leptos 页面与浏览器控制逻辑，Node 阶段打包 SDK、WASM、CSS 和静态资源。运行阶段为 Debian 与两个 Rust 可执行文件。服务端没有 USB 设备挂载，也不需要 privileged 或系统 usbmuxd；USB 在用户 Mac 浏览器中，通过 WSS 转发到各会话的虚拟 mux。服务器需要能访问 Apple、签名相关服务、设备支持资源以及模型服务商。
+Dockerfile 从当前源码构建 Rust 网关和原生引擎，包含本地已验证的原生修复，复用 `ghcr.io/derrors/iphone-control:0.1.4` 的 Appium 未签名 WDA、资源和许可证，并为网关新增依赖生成许可证清单。Rust/WASM 阶段编译 Leptos 页面与浏览器控制逻辑，Node 阶段打包 SDK、WASM、CSS 和静态资源。运行阶段包含 Python CPU OCR 依赖、已下载的 OCR 模型和两个 Rust 可执行文件。服务端没有 USB 设备挂载，也不需要 privileged 或系统 usbmuxd；USB 在用户 Mac 浏览器中，通过 WSS 转发到各会话的虚拟 mux。服务器需要能访问 Apple、签名相关服务、设备支持资源以及模型服务商。
 
 在 `browser-control/.env` 中填写部署值，例如网站 origin `https://phone.example.com`；将 `ALLOWED_ORIGINS` 与 `PUBLIC_BASE_URL` 都设置成这个 origin。不要把真实凭证写入 Dockerfile 或镜像。然后：
 
@@ -163,5 +177,6 @@ Dockerfile 默认使用一个 Cargo 构建任务，适配小内存 VPS，可通�
 - [ ] 在真实手机完成 Trust、开发者模式、Apple 签名与 WDA 启动；页面明确显示 WDA 就绪。
 - [ ] 截图对应真实手机，竖屏/横屏的点按、滑动、长按位置正确；Home、Lock、音量和文字输入结果可见。
 - [ ] 刷新和重连能恢复 IndexedDB 配对记录与服务器签名状态，跨设备和并发会话保持隔离。
-- [ ] 配置真实视觉模型后任务观察、操作和完成正确；敏感操作确认、拒绝和停止都经过真机验收。
-- [x] Linux 容器构建运行、HTTPS 静态资源、外部 REST/WebSocket 鉴权与代理日志配置已核验。跨公网真机操作仍需独立验收。
+- [ ] 配置真实文字模型后任务观察、操作和完成正确；敏感操作确认、拒绝和停止都经过真机验收。
+- [x] 既有 Rust 镜像的 Linux 构建运行、HTTPS、REST/WebSocket 鉴权与代理日志配置已核验。
+- [ ] 新增 PaddleOCR 运行时后的 Linux 镜像构建与跨公网真机性能验收。

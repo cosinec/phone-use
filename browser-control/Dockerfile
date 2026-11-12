@@ -54,11 +54,15 @@ COPY browser-control/ ./
 COPY --from=wasm-build /src/browser-control/pkg/ ./pkg/
 RUN npm run build:assets -- --base="${WEB_BASE}"
 
-FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 libstdc++6 libssl3t64 zlib1g \
+FROM python:3.11-slim-trixie
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 libstdc++6 libssl3t64 zlib1g libgomp1 libgl1 libglib2.0-0t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 control
 WORKDIR /app
+COPY browser-control/ocr/requirements.txt /app/ocr/requirements.txt
+RUN python3 -m venv /opt/ocr \
+    && /opt/ocr/bin/python3 -m pip install --no-cache-dir -r /app/ocr/requirements.txt
+COPY browser-control/ocr/worker.py /app/ocr/worker.py
 COPY --from=rust-build /usr/local/bin/iphone-control /usr/local/bin/iphone-control-gateway /usr/local/bin/
 COPY --from=assets /usr/share/iphone-control/ /usr/share/iphone-control/
 COPY --from=assets /usr/share/licenses/ /usr/share/licenses/
@@ -70,6 +74,11 @@ COPY LICENSE ./LICENSE
 COPY browser-control/THIRD_PARTY.md ./THIRD_PARTY.md
 RUN mkdir -p /app/.runtime && chown -R control:control /app
 USER control
+# Download the two mobile CPU models into a cache carried in this image.
+# Runtime requests reuse this cache and the gateway's persistent Python child.
+ENV PADDLE_PDX_CACHE_HOME=/home/control/.paddlex PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+RUN /opt/ocr/bin/python3 /app/ocr/worker.py --prepare
+ENV OCR_PYTHON=/opt/ocr/bin/python3 OCR_WORKER=/app/ocr/worker.py
 ENV HOST=0.0.0.0 PORT=8787 RUNTIME_DIR=/app/.runtime WEB_DIST_DIR=/app/dist ICTL_BIN=/usr/local/bin/iphone-control MALLOC_ARENA_MAX=2
 EXPOSE 8787
 CMD ["iphone-control-gateway"]

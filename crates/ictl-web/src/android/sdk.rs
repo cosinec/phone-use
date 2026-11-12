@@ -184,6 +184,8 @@ async fn capture_inner(
         let mut source = [0.0, 0.0, native_width, native_height];
         let mut out_width = width;
         let mut out_height = height;
+        let mut coordinate_mapping =
+            json(serde_json::json!({"offsetX":0.0,"offsetY":0.0,"scaleX":1.0,"scaleY":1.0}));
         let mut caption = format!(
             "Android full screen {width}x{height}. Coordinates use these screenshot pixels (native {}x{}).",
             number(&view, "nativeWidth"),
@@ -223,6 +225,9 @@ async fn capture_inner(
             if out_width == 0.0 || out_height == 0.0 {
                 return Err(error("Screenshot region too small"));
             }
+            coordinate_mapping = json(serde_json::json!({
+                "offsetX":x,"offsetY":y,"scaleX":w/out_width,"scaleY":h/out_height
+            }));
             caption = format!(
                 "Android crop at x={x}, y={y}, width={w}, height={h} in full screenshot {}x{}. Add this origin to crop pixel coordinates.",
                 number(&previous, "width"),
@@ -258,6 +263,7 @@ async fn capture_inner(
         Ok(obj(&[
             ("imageBase64", encoded),
             ("caption", caption.into()),
+            ("coordinateMapping", coordinate_mapping),
             ("view", view),
             ("sourceBytes", source_bytes),
             ("sourceFormat", source_format.into()),

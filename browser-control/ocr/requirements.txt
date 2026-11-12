@@ -1,0 +1,7 @@
+# CPU wheels, verified against the official PyPI packages and PaddleOCR 3.x API.
+# Linux runtime targets amd64. macOS arm64 is supported for local development.
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+paddlex==3.7.2
+numpy==2.2.6
+Pillow==13.0.0

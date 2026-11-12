@@ -10,6 +10,7 @@ pub mod mjpeg;
 pub mod model;
 pub mod mux;
 pub mod native;
+mod ocr;
 pub mod relay;
 pub mod server;
 pub mod static_files;

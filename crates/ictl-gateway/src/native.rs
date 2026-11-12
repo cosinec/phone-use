@@ -731,13 +731,18 @@ mod tests {
     async fn cleanup_escalates_to_kill_an_uncooperative_process_group() {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "trap '' TERM; sleep 30 & wait"])
+            .args(["-c", "trap '' TERM; printf ready; while :; do sleep 30; done"])
             .process_group(0)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = command.spawn().unwrap();
         let group = Group { pid: child.id().unwrap() as i32, cleanup: Mutex::new(()), cleaned: AtomicBool::new(false) };
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut ready = [0; 5];
+        tokio::time::timeout(Duration::from_secs(2), child.stdout.as_mut().unwrap().read_exact(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ready, b"ready");
         tokio::time::timeout(Duration::from_secs(3), stop_group(&group)).await.unwrap().unwrap();
         let status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await.unwrap().unwrap();
         assert!(!status.success());
