@@ -15,7 +15,11 @@
 
 ## Tasks
 
-- [ ] Add `deploy/deploy-vps.py` and behavioral tests under `deploy/tests/`. Validate inputs before side effects, replace exactly one image reference, back up, deploy, health check, roll back, record revision and digest. Run `python3 -m unittest discover -s deploy/tests -v`.
-- [ ] Change `.github/workflows/ci.yml` to release-only pushes and serialize runs. Reuse `.github/workflows/browser.yml` through `workflow_call`. Replace upstream tag release workflow with a reusable `.github/workflows/release.yml` that builds/smokes/pushes the web image and deploys its digest. Run actionlint and `git diff --check`.
-- [ ] Install the root-owned deploy entry point and a dedicated forced-command SSH key without restarting the service. Set repository Secrets via stdin, validate key restrictions and reject invalid deploy requests, and verify the active container is unchanged.
-- [ ] Document setup, release commands, rollback and verification limits in `deploy/README.md`. Commit and push only this change and open a reviewable PR. Run live packaging/deployment only after the first release source is selected.
+- [x] Add `deploy/deploy-vps.py` and behavioral tests under `deploy/tests/`. Validate inputs before side effects, replace exactly one image reference, back up, deploy, health check, roll back, record revision and digest. Run `python3 -m unittest discover -s deploy/tests -v`.
+- [x] Change `.github/workflows/ci.yml` to release-only pushes and serialize runs. Reuse `.github/workflows/browser.yml` through `workflow_call`. Replace upstream tag release workflow with a reusable `.github/workflows/release.yml` that builds/smokes/pushes the web image and deploys its digest. Run actionlint and `git diff --check`.
+- [x] Install the root-owned deploy entry point and a dedicated forced-command SSH key without restarting the service. Set repository Secrets via stdin, validate key restrictions and reject invalid deploy requests, and verify the active container is unchanged.
+- [x] Document setup, release commands, rollback and verification limits in `deploy/README.md`. Commit and push only this change and open a reviewable PR. Run live packaging/deployment only after the first release source is selected.
+
+## Verification record
+
+Actionlint 1.7.12, eight deployment behavior tests, shell syntax and diff whitespace checks passed. Independent review found no actionable issues. The server entry point and five Secrets were provisioned; forced-command integration rejected main and blocked an arbitrary SSH command. Existing local/public health checks passed, and the container ID, image, Compose checksum and deployment-record checksum remained unchanged. No release branch, production image build or application deployment was performed, as requested.

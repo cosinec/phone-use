@@ -1,9 +1,7 @@
 name: Browser Rust WASM
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_call:
 
 permissions:
   contents: read

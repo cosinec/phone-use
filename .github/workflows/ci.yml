@@ -2,39 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: ["release-*"]
 
 permissions:
   contents: read
 
-# 同一个 PR 推了新提交，就取消旧提交还没跑完的那次：macOS runner 少，旧运行会占着队列，
-# 后面的排到超时被取消。main 上的每次推送都跑完
+# Only release branches publish. Serialize the entire run so an older build
+# cannot deploy after a newer release; let an active deployment finish.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-vps-production
+  cancel-in-progress: false
 
 jobs:
-  # PR 只改了文档（Markdown、docs/、website/）时不跑 macOS 编译
-  changes:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    outputs:
-      code: ${{ steps.filter.outputs.code }}
-    steps:
-      - uses: dorny/paths-filter@v4
-        id: filter
-        with:
-          predicate-quantifier: every
-          filters: |
-            code:
-              - '**'
-              - '!**/*.md'
-              - '!docs/**'
-              - '!website/**'
-
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -53,9 +32,6 @@ jobs:
 
   # macOS（Apple Silicon）上能编译、测试通过；格式和平台无关，上面已经查过
   macos:
-    needs: [changes]
-    # changes 在 main 的推送上会跳过，这时照样跑
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -89,17 +65,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  image:
+  browser:
+    uses: ./.github/workflows/browser.yml
+
+  deployment-tests:
     runs-on: ubuntu-latest
-    needs: [rust]
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      # 只验证镜像能构建，不推送
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/Dockerfile
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - run: python3 -m unittest discover -s deploy/tests -v
+
+  release:
+    needs: [rust, macos, msrv, secrets, browser, deployment-tests]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
