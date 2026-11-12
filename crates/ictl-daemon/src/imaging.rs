@@ -207,6 +207,11 @@ pub fn region(
 }
 
 /// 读取 PNG 尺寸（只读文件头，不解码像素）
+/// 截图（PNG 或 JPEG）的像素尺寸，只读文件头
+pub fn frame_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()
+}
+
 pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::with_format(Cursor::new(png), image::ImageFormat::Png).into_dimensions().ok()
 }
@@ -214,6 +219,14 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_size_reads_png_and_jpeg_headers() {
+        assert_eq!(frame_size(&png(390, 844)), Some((390, 844)));
+        let jpeg = jpeg(&DynamicImage::new_rgb8(844, 390), 80).unwrap();
+        assert_eq!(frame_size(&jpeg), Some((844, 390)));
+        assert_eq!(frame_size(b"not an image"), None);
+    }
+
     #[test]
     fn source_jpeg_keeps_point_dimensions_and_region_coordinates() {
         let source = jpeg(&DynamicImage::new_rgb8(90, 180), 90).unwrap();

@@ -225,6 +225,9 @@ pub(crate) struct Inner {
     pub offline_since: Option<Instant>,
     /// 最近一次经本进程锁屏的时间（自动解锁要等锁屏过渡走完，见 [`crate::tools::LOCK_SETTLE`]）
     pub last_lock: Option<Instant>,
+    /// 最近一次确认手机没锁屏的时间。[`crate::tools::UNLOCK_REUSE`] 内的下一个操作不再问 `/wda/locked`
+    /// （每次是一个经浏览器转发的往返）；锁屏、换设备、检查出错都会清掉
+    pub unlocked_at: Option<Instant>,
     /// HID 会话最近一次使用的时间；空闲超过 [`crate::supervise::HID_IDLE`] 就关掉（它持有屏幕媒体流）
     pub hid_used: Option<Instant>,
     /// 最近一次读到的元素树。只在调用方允许（max_age_ms）时复用；改变界面的操作做完就清掉
@@ -332,6 +335,7 @@ impl Daemon {
             list_errors: 0,
             offline_since: Some(now),
             last_lock: None,
+            unlocked_at: None,
             hid_used: None,
             elements_cache: None,
             dedup: Dedup::default(),

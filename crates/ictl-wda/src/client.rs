@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 同一操作内（滑动后轮询元素树、输入后核对等）复用刚问到的方向
+const ORIENTATION_REUSE: Duration = Duration::from_millis(1500);
+/// 截图横竖和缓存一致时，方向最多复用这么久（任务里一步约 6–9 秒，相邻两步可复用）
+const FRAME_ORIENTATION_REUSE: Duration = Duration::from_secs(15);
 /// 普通点击按下的时长（毫秒）。太短可能不被识别成点击；解锁按键另有自己的时长
 const TAP_PRESS_MS: u64 = 50;
 
@@ -114,6 +118,9 @@ pub struct WdaClient<T> {
     screen: Option<ScreenSize>,
     /// 本客户端（对应一次 WDA 启动）是否确认过一次「确实没锁屏」，确认后 `/wda/locked` 就可信了
     lock_state_trusted: bool,
+    /// 最近一次问到的方向和时间。每次 `/orientation` 是一个经浏览器转发的往返（约 0.2–1.5 秒，
+    /// 动作刚做完时 WDA 要等界面静止才回答），同一操作内的重复查询和横竖没变的截图都复用它
+    orientation_cache: Option<(elements::Orientation, tokio::time::Instant)>,
     /// 点击前后要恢复的等待设置（第一次点击时读一次）
     idle_baseline: Option<IdleSettings>,
     idle_current: Option<IdleSettings>,
@@ -129,6 +136,7 @@ impl<T: Transport> WdaClient<T> {
             session: None,
             screen: None,
             lock_state_trusted: false,
+            orientation_cache: None,
             idle_baseline: None,
             idle_current: None,
             low_latency: false,
@@ -272,6 +280,25 @@ impl<T: Transport> WdaClient<T> {
     /// 尺寸缓存的是问的那一刻的方向，转屏后不换算的话截图会被压扁、屏幕下半截的元素被当成屏幕外。
     /// 问不到方向（旧版 WDA 等）就按缓存的尺寸、方向未知（不换算元素坐标）
     pub async fn view(&mut self) -> Result<elements::View> {
+        self.view_reusing(|_| true, ORIENTATION_REUSE).await
+    }
+
+    /// 截图用的视图：截图本身的横竖和缓存的方向一致、且不太旧时不再问 `/orientation`。
+    /// 横竖一变（转屏、进出横屏 App）就重新问；同为横屏的左右翻转靠 `max_age` 兜底
+    pub async fn view_for_frame(&mut self, landscape_frame: bool) -> Result<elements::View> {
+        self.view_reusing(move |o| o.is_landscape() == landscape_frame, FRAME_ORIENTATION_REUSE).await
+    }
+
+    /// 下一次取视图时一定重新问方向（转屏、按键等可能改变方向的操作之后调用）
+    pub fn forget_orientation(&mut self) {
+        self.orientation_cache = None;
+    }
+
+    async fn view_reusing(
+        &mut self,
+        reusable: impl Fn(elements::Orientation) -> bool,
+        max_age: Duration,
+    ) -> Result<elements::View> {
         let base = match self.screen {
             Some(s) => s,
             None => {
@@ -289,9 +316,19 @@ impl<T: Transport> WdaClient<T> {
                 size
             }
         };
+        if let Some((o, at)) = self.orientation_cache
+            && at.elapsed() < max_age
+            && reusable(o)
+        {
+            return Ok(elements::View { screen: o.orient(base), orientation: Some(o) });
+        }
         Ok(match self.orientation().await {
-            Ok(o) => elements::View { screen: o.orient(base), orientation: Some(o) },
+            Ok(o) => {
+                self.orientation_cache = Some((o, tokio::time::Instant::now()));
+                elements::View { screen: o.orient(base), orientation: Some(o) }
+            }
             Err(e) => {
+                self.orientation_cache = None;
                 tracing::debug!("读屏幕方向失败，按缓存的屏幕尺寸算：{e}");
                 elements::View { screen: base, orientation: None }
             }
@@ -1067,8 +1104,45 @@ mod tests {
             (v.screen, v.orientation),
             (ScreenSize { width: 1024.0, height: 768.0 }, Some(elements::Orientation::LandscapeLeft))
         );
+        // 同一操作内复用；过了复用时间再问就跟上了转屏
+        assert_eq!(c.screen_size().await.unwrap(), ScreenSize { width: 1024.0, height: 768.0 });
+        assert_eq!(m.seen.lock().unwrap().len(), 3);
+        tokio::time::pause();
+        tokio::time::advance(ORIENTATION_REUSE).await;
         assert_eq!(c.screen_size().await.unwrap(), ScreenSize { width: 768.0, height: 1024.0 });
-        assert_eq!(m.seen.lock().unwrap()[2].1, "/session/S/orientation");
+        assert_eq!(m.seen.lock().unwrap()[3].1, "/session/S/orientation");
+    }
+
+    /// 截图横竖没变就复用方向；横竖一变、超时或被要求忘掉时重新问
+    #[tokio::test(start_paused = true)]
+    async fn frame_view_reuses_orientation_until_the_frame_shape_changes_or_it_expires() {
+        let m = Mock::with(&[
+            (200, r#"{"value":{"screenSize":{"width":390,"height":844},"scale":3}}"#),
+            (200, r#"{"sessionId":"S"}"#),
+            (200, r#"{"value":"PORTRAIT"}"#),
+            (200, r#"{"value":"LANDSCAPE"}"#),
+            (200, r#"{"value":"LANDSCAPE"}"#),
+            (200, r#"{"value":"PORTRAIT"}"#),
+        ]);
+        let mut c = WdaClient::new(&m);
+        let orientation_calls =
+            |m: &Mock| m.seen.lock().unwrap().iter().filter(|r| r.1.ends_with("/orientation")).count();
+        assert_eq!(c.view_for_frame(false).await.unwrap().orientation, Some(elements::Orientation::Portrait));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        // 相邻一步、截图仍是竖的：不问
+        assert_eq!(c.view_for_frame(false).await.unwrap().screen, ScreenSize { width: 390.0, height: 844.0 });
+        assert_eq!(orientation_calls(&m), 1);
+        // 截图变成横的：马上重新问
+        assert_eq!(c.view_for_frame(true).await.unwrap().orientation, Some(elements::Orientation::LandscapeLeft));
+        assert_eq!(orientation_calls(&m), 2);
+        // 横屏但缓存过期：重新问
+        tokio::time::advance(FRAME_ORIENTATION_REUSE).await;
+        c.view_for_frame(true).await.unwrap();
+        assert_eq!(orientation_calls(&m), 3);
+        // 被要求忘掉：重新问
+        c.forget_orientation();
+        assert_eq!(c.view_for_frame(false).await.unwrap().orientation, Some(elements::Orientation::Portrait));
+        assert_eq!(orientation_calls(&m), 4);
     }
 
     /// 从主屏打开网址：等 Safari 到前台、元素树稳定才返回，不是发完请求就走；一闪而过的系统服务不算

@@ -38,6 +38,9 @@ where
 
 /// 锁屏后至少等这么久再自动解锁：锁屏过渡没走完就唤醒，WDA 第一下上滑卡约 16 秒后报 `point.x != INFINITY`
 pub(crate) const LOCK_SETTLE: Duration = Duration::from_secs(3);
+/// 确认没锁屏之后这么久内不再检查。自动锁屏至少要空闲 30 秒，任务里每一步都有点击、滑动；
+/// 经本进程锁屏会立刻清掉。一步里「观察」和「动作」之间通常只隔一次模型调用，第二次检查可省掉
+pub(crate) const UNLOCK_REUSE: Duration = Duration::from_secs(5);
 /// 元素少于这么多个就按画面判断是否稳定（游戏只有几个状态栏元素；普通 App 页面通常几十个）
 const VISUAL_SETTLE_BELOW: usize = 12;
 /// 两帧缩略图平均逐像素差低于这个值算静止（0～255）。游戏背景的轻微摆动约 1～2，消除动画几十
@@ -69,6 +72,11 @@ impl Daemon {
     /// 配置了密码就在锁屏时自动解锁；没配置而手机锁着则报错（与 toolkit 一致）
     pub(crate) async fn ensure_unlocked(&self, g: &mut Inner) -> Result<(), String> {
         let checking = StepTimer::new("unlock_check");
+        if g.unlocked_at.is_some_and(|t| t.elapsed() < UNLOCK_REUSE) {
+            tracing::debug!(event = "unlock_check_reused");
+            checking.finish(true);
+            return Ok(());
+        }
         let cfg = self.unlock_cfg(g.device.as_ref().map(|d| d.udid.as_str()));
         if let Some(left) = g.last_lock.and_then(|t| LOCK_SETTLE.checked_sub(t.elapsed())) {
             tokio::time::sleep(left).await;
@@ -76,6 +84,7 @@ impl Daemon {
         let Some(wda) = self.wda(g) else { return Ok(()) };
         let outcome = ictl_unlock::ensure_unlocked(wda, &cfg).await;
         checking.finish(outcome.is_ok());
+        g.unlocked_at = outcome.is_ok().then(Instant::now);
         match outcome {
             Ok(_) => Ok(()),
             Err(e @ (UnlockError::WrongPasscode | UnlockError::Uncertain(_))) => {
@@ -311,8 +320,13 @@ impl Daemon {
         })
         .await?;
         let measuring = StepTimer::new("screenshot_view");
+        // 截图横竖和最近问到的方向一致就不再问 `/orientation`（动作刚做完时这一问要等界面静止，0.3–1.5 秒）
+        let frame = imaging::frame_size(&png);
         let view = match self.wda(g) {
-            Some(w) => w.view().await.ok(),
+            Some(w) => match frame {
+                Some((width, height)) => w.view_for_frame(width > height).await.ok(),
+                None => w.view().await.ok(),
+            },
             None => None,
         };
         let screen = match view {
@@ -823,11 +837,13 @@ impl Daemon {
             };
             if locked {
                 g.last_lock = Some(Instant::now());
+                g.unlocked_at = None;
                 return Ok(ictl_l10n::tr!("已锁屏", "Locked").into());
             }
         }
         self.hid_do(g, |h| Box::pin(h.press(Button::Lock))).await?;
         g.last_lock = Some(Instant::now());
+        g.unlocked_at = None;
         Ok(ictl_l10n::tr!("已锁屏", "Locked").into())
     }
 

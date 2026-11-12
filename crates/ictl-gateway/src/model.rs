@@ -12,7 +12,8 @@ use std::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// What the planner sees for each phone observation (`AI_OBSERVATION`, default `ocr`).
+/// What the planner sees for each phone observation (`AI_OBSERVATION`, default `image`).
+/// Measured on the 2-core VPS, image steps were faster than OCR steps (8.8 s vs 10.4 s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationMode {
     /// Screenshot, UI element text and reference images, without OCR.
@@ -26,9 +27,9 @@ pub enum ObservationMode {
 impl ObservationMode {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "ocr" => Ok(Self::Ocr),
+            "" | "image" => Ok(Self::Image),
             "hybrid" => Ok(Self::Hybrid),
-            "image" => Ok(Self::Image),
+            "ocr" => Ok(Self::Ocr),
             _ => anyhow::bail!("AI_OBSERVATION must be image, hybrid or ocr"),
         }
     }
@@ -704,6 +705,7 @@ for line in sys.stdin:
             ("LLM_MODEL".into(), "fixture".into()),
             ("LLM_API_KEY".into(), "secret".into()),
             ("OCR_WORKER".into(), worker.to_string_lossy().into_owned()),
+            ("AI_OBSERVATION".into(), "ocr".into()),
         ]))
         .unwrap();
         let image = png();
@@ -778,6 +780,7 @@ for line in sys.stdin:
             ("LLM_MODEL".into(), "fixture".into()),
             ("LLM_API_KEY".into(), "secret".into()),
             ("OCR_WORKER".into(), worker.to_string_lossy().into_owned()),
+            ("AI_OBSERVATION".into(), "ocr".into()),
         ]))
         .unwrap();
         let error = model
@@ -862,8 +865,9 @@ for line in sys.stdin:
 "#;
 
     #[test]
-    fn observation_mode_defaults_to_ocr_and_rejects_unknown_values() {
-        assert_eq!(ObservationMode::parse("").unwrap(), ObservationMode::Ocr);
+    fn observation_mode_defaults_to_image_and_rejects_unknown_values() {
+        assert_eq!(ObservationMode::parse("").unwrap(), ObservationMode::Image);
+        assert_eq!(ObservationMode::parse("ocr").unwrap(), ObservationMode::Ocr);
         assert_eq!(ObservationMode::parse(" Hybrid ").unwrap(), ObservationMode::Hybrid);
         assert_eq!(ObservationMode::parse("image").unwrap(), ObservationMode::Image);
         assert!(ObservationMode::parse("vision").is_err());

@@ -19,6 +19,10 @@ const MAX_RECOVERIES: u32 = 2;
 /// element tap (nothing was tapped, no side effect) is reported back to the
 /// model instead of halting, at most this many times per task.
 const MAX_OCR_ELEMENT_MISSES: u32 = 2;
+/// Actions the gateway rejects before dispatch (unknown tool, invalid
+/// arguments, Back on iOS) never reach the device. Report them to the model
+/// and re-plan, at most this many times per task.
+const MAX_REJECTED_ACTIONS: u32 = 2;
 
 struct TaskStage<'a> {
     session_id: &'a str,
@@ -323,6 +327,7 @@ async fn run(
     let mut next_observation: Option<Value> = None;
     let mut focus_recoveries = 0;
     let mut element_misses = 0;
+    let mut rejected_actions = 0;
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
@@ -420,7 +425,15 @@ async fn run(
         if query_only && matches!(action["tool"].as_str(), Some("iphone_tap" | "iphone_swipe" | "iphone_long_press")) {
             continue;
         }
-        let request = command_request(action["tool"].as_str().unwrap(), &action["args"])?;
+        let request = match command_request(action["tool"].as_str().unwrap(), &action["args"]) {
+            Ok(request) => request,
+            Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
+                rejected_actions += 1;
+                history.push(rejected_history(&action, &error));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if typing_blocked && request["op"] == "type_text" {
             return Err(ApiError::unavailable("Focus an editable field before typing again; task halted"));
         }
@@ -466,8 +479,14 @@ async fn run(
         } else {
             "error"
         });
+        let mut rejected = false;
         let result = match action_result {
             Ok(result) => result,
+            Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
+                rejected_actions += 1;
+                rejected = true;
+                json!({"kind":"error","message":rejected_message(&error)})
+            }
             Err(error)
                 if s.device.platform == crate::identity::Platform::Ios && recoverable_wda_error(&error.message) =>
             {
@@ -490,6 +509,8 @@ async fn run(
         let missed = action["tool"] == "iphone_tap_element" && missed;
         let state = if recoverable {
             "uncertain"
+        } else if rejected {
+            "rejected"
         } else if failed {
             "failed"
         } else if missed {
@@ -523,6 +544,10 @@ async fn run(
                 step["state"] = json!(state);
             })
             .await?;
+        if rejected {
+            // Nothing reached the device; observe again and let the model re-plan.
+            continue;
+        }
         if failed {
             if recoverable {
                 recoveries += 1;
@@ -600,6 +625,14 @@ fn direct_command(instruction: &str) -> Option<Value> {
         json!({"type":"action","tool":tool,"args":args,"reason":"执行用户明确指定的单步操作，随后观察并验证结果","requiresConfirmation":false}),
     )
 }
+fn rejected_message(error: &ApiError) -> String {
+    format!("Rejected by the gateway before reaching the device, nothing was done: {}", error.message)
+}
+fn rejected_history(action: &Value, error: &ApiError) -> Value {
+    json!({"tool":action["tool"],"args":action["args"],"reason":action["reason"],"state":"rejected",
+        "result":{"kind":"error","message":rejected_message(error)}})
+}
+
 fn continue_after_element_miss(mode: crate::model::ObservationMode, misses: u32) -> bool {
     mode == crate::model::ObservationMode::Ocr && misses <= MAX_OCR_ELEMENT_MISSES
 }
@@ -638,6 +671,19 @@ mod tests {
             vec!["at", "elapsed_ms", "event", "observation_id", "phase", "session_id", "stage", "status", "task_id"]
         );
         stage.finish("error");
+    }
+
+    #[test]
+    fn rejected_actions_are_reported_as_not_dispatched() {
+        let action = json!({"tool":"iphone_press_button","args":{"button":"back"},"reason":"Go back"});
+        let entry = rejected_history(&action, &ApiError::new(400, "Back is supported on Android only"));
+        assert_eq!(entry["state"], "rejected");
+        assert_eq!(entry["tool"], "iphone_press_button");
+        let message = entry["result"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("before reaching the device") && message.ends_with("Back is supported on Android only")
+        );
+        assert!(command_request("iphone_unknown", &json!({})).unwrap_err().status == 400);
     }
 
     #[test]
