@@ -766,7 +766,8 @@ impl Session {
             self.socket_dir.join("ctl.sock"),
             address,
             self.cancel.clone(),
-        );
+        )
+        .with_signing_runtime(gateway.config.runtime.clone());
         self.controller
             .set(Controller::Ios(controller.clone()))
             .map_err(|_| anyhow::anyhow!("Native already started"))?;

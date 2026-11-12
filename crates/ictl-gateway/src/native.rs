@@ -97,6 +97,7 @@ struct Inner {
     command: PathBuf,
     device: Device,
     data_dir: PathBuf,
+    signing_runtime: Option<PathBuf>,
     socket_path: PathBuf,
     mux_address: String,
     cancel: CancellationToken,
@@ -123,6 +124,7 @@ impl NativeController {
             command,
             device,
             data_dir,
+            signing_runtime: None,
             socket_path,
             mux_address,
             cancel,
@@ -138,6 +140,12 @@ impl NativeController {
             start_lock: Mutex::new(()),
             setup_lock: Mutex::new(()),
         }))
+    }
+
+    /// Gateway-controlled scope; never derive a shared root from HOME or a device ID.
+    pub fn with_signing_runtime(mut self, runtime: PathBuf) -> Self {
+        Arc::get_mut(&mut self.0).expect("new controller is exclusively owned").signing_runtime = Some(runtime);
+        self
     }
 
     async fn spawn(&self, mode: &str) -> Result<(Child, Arc<Group>)> {
@@ -158,6 +166,11 @@ impl NativeController {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(runtime) = &self.0.signing_runtime {
+            command
+                .env("ICTL_SIGNING_ROOT", runtime.join("signing"))
+                .env("ICTL_SIGNING_LEGACY_DATA_ROOT", runtime.join("data"));
+        }
         command.process_group(0);
         // Registration and shutdown share this lock, so close cannot miss a newly spawned child.
         let mut groups = self.0.groups.lock().await;

@@ -92,9 +92,12 @@ pub struct Cert {
     pub name: String,
     pub certificate_id: String,
     pub serial_number: String,
+    #[serde(default)]
     pub status: String,
-    status_code: Integer,
-    pub expiration_date: Date,
+    #[serde(default)]
+    status_code: Option<Integer>,
+    #[serde(default)]
+    pub expiration_date: Option<Date>,
     certificate_platform: Option<String>,
     pub cert_type: Option<CertType>,
     pub cert_content: Option<Data>,

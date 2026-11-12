@@ -18,6 +18,10 @@ tracing.workspace = true
 plist.workspace = true
 uuid.workspace = true
 zip.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

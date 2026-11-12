@@ -10,6 +10,7 @@
 pub mod bundle;
 pub mod ipa;
 pub mod profile;
+mod signing_cache;
 
 use std::path::{Path, PathBuf};
 
@@ -114,7 +115,7 @@ impl AccountDir {
             .map_err(|e| SignError::SessionInvalid(e.to_string()))?;
         let teams = inner.qh_list_teams().await.map_err(|e| SignError::SessionInvalid(e.to_string()))?.teams;
         let team_id = teams.first().map(|t| t.team_id.clone()).ok_or(SignError::NoTeam)?;
-        Ok(Session { inner, team_id, dir: self.clone() })
+        Ok(Session { inner, team_id, dir: self.clone(), account_id: acct.adsid().clone() })
     }
 }
 
@@ -123,6 +124,7 @@ pub struct Session {
     inner: DeveloperSession,
     pub team_id: String,
     dir: AccountDir,
+    account_id: String,
 }
 
 /// 一次签名的结果
@@ -164,10 +166,18 @@ impl Session {
         let team = &self.team_id;
         let new_id = if orig.ends_with(&format!(".{team}")) { orig.clone() } else { format!("{orig}.{team}") };
 
-        // 证书必须在申请描述文件之前定下来：本地没有私钥时这里会吊销旧证书、新建一张，
-        // 而描述文件只包含生成那一刻团队里有效的证书，先拿描述文件会装不上（0xe8008015）
-        let cert =
-            CertificateIdentity::new_with_session(&self.inner, self.dir.dir.clone(), None, team, false, None).await?;
+        // Resolve the shared identity before provisioning profiles are requested.
+        let cache = signing_cache::Cache::from_env(&self.dir.dir, &self.account_id, team)?;
+        let cert = CertificateIdentity::new_with_session_candidates(
+            &self.inner,
+            cache.root,
+            None,
+            team,
+            false,
+            None,
+            &cache.candidates,
+        )
+        .await?;
 
         // 只有带 entitlements 的 bundle（App/扩展）需要换 ID 并申请描述文件；WDA 里只有主程序一个
         let mut profiles = Vec::new();
