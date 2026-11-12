@@ -106,6 +106,7 @@ pub struct Session {
     preview_ticket: String,
     attachments: crate::attachments::Attachments,
     close_lock: Mutex<bool>,
+    close_reason: crate::heartbeat::CloseReason,
     pub tasks: TaskManager,
 }
 
@@ -262,6 +263,7 @@ impl Gateway {
             mjpeg: crate::mjpeg::Preview::default(),
             preview_ticket: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
             close_lock: Mutex::new(false),
+            close_reason: crate::heartbeat::CloseReason::default(),
             tasks: TaskManager::new(),
         });
         registry.owners.insert(namespace, sid.clone());
@@ -270,23 +272,38 @@ impl Gateway {
         let waiting = session.clone();
         tokio::spawn(async move {
             tokio::select! {_=waiting.cancel.cancelled()=>{},_=waiting.hello.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(300))=>{}}
-            waiting.close().await;
+            let reason = if waiting.cancel.is_cancelled() { "cancel" } else { "hello_timeout" };
+            waiting.close_with_reason(reason).await;
         });
         Ok(session)
     }
     pub async fn close(&self) {
-        self.cancel.cancel();
         let sessions: Vec<_> = self.registry.lock().await.sessions.values().cloned().collect();
-        futures_util::future::join_all(sessions.iter().map(|s| s.close())).await;
+        for session in &sessions {
+            session.close_reason.record("server_shutdown");
+        }
+        self.cancel.cancel();
+        futures_util::future::join_all(sessions.iter().map(|s| s.close_with_reason("server_shutdown"))).await;
     }
 }
 impl Session {
     pub async fn close(&self) {
+        self.close_with_reason("unattributed").await;
+    }
+    pub async fn close_with_reason(&self, reason: &'static str) {
+        self.close_reason.record(reason);
         self.cancel.cancel();
         let mut done = self.close_lock.lock().await;
         if *done {
             return;
         }
+        eprintln!(
+            "{} event=session_close_requested session={} namespace={} reason={}",
+            chrono::Utc::now().to_rfc3339(),
+            self.id,
+            self.namespace,
+            self.close_reason.get()
+        );
         *self.state.lock().await = "closed".into();
         self.tasks.disconnect().await;
         if let Some(relay) = self.relay.get() {
@@ -613,7 +630,7 @@ impl Session {
                         chrono::Utc::now().to_rfc3339(),
                         session.id
                     );
-                    session.close().await;
+                    session.close_with_reason("native_start_failed").await;
                 }
             }
         });
@@ -633,7 +650,7 @@ impl Session {
                         chrono::Utc::now().to_rfc3339(),
                         session.id
                     );
-                    session.close().await;
+                    session.close_with_reason("pair_mapping_save_failed").await;
                     break;
                 }
                 *session.pair.lock().await = Some(record.clone());
@@ -650,7 +667,14 @@ impl Session {
         let alive = Arc::new(AtomicBool::new(true));
         let writer_alive = alive.clone();
         let cancel = self.cancel.clone();
-        let writer = tokio::spawn(crate::heartbeat::write_frames(sink, frames, writer_alive, cancel, self.id.clone()));
+        let writer = tokio::spawn(crate::heartbeat::write_frames(
+            sink,
+            frames,
+            writer_alive,
+            cancel,
+            self.id.clone(),
+            self.close_reason.clone(),
+        ));
         let deadline = tokio::time::sleep(Duration::from_secs(10));
         tokio::pin!(deadline);
         let mut hello = false;
@@ -751,6 +775,8 @@ impl Session {
                 break "protocol_error";
             }
         };
+        self.close_reason.record(reason);
+        let reason = self.close_reason.get();
         eprintln!(
             "{} event=ws_closed session={} namespace={} reason={reason} duration_ms={} frames_received={frames_received} bytes_received={bytes_received}",
             chrono::Utc::now().to_rfc3339(),
@@ -758,7 +784,7 @@ impl Session {
             self.namespace,
             started.elapsed().as_millis()
         );
-        self.close().await;
+        self.close_with_reason(reason).await;
         let _ = writer.await;
     }
 }
@@ -967,7 +993,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
                 chrono::Utc::now().to_rfc3339(),
                 s.id
             );
-            s.close().await;
+            s.close_with_reason("api_deleted").await;
             Ok(reply(200, json!({"state":"closed"})))
         }
         (Method::POST, ["command"]) => Ok(reply(200, s.run_command(body(request).await?, s.cancel.clone()).await?)),

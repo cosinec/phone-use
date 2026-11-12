@@ -5,6 +5,7 @@
 //! - 元素树：[`elements`]，纯函数，可见性按坐标判断
 
 pub mod client;
+pub mod diagnostics;
 pub mod elements;
 pub mod http;
 mod mjpeg;

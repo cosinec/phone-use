@@ -12,12 +12,27 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Default)]
+pub(crate) struct CloseReason(Arc<std::sync::Mutex<Option<&'static str>>>);
+impl CloseReason {
+    pub fn record(&self, reason: &'static str) {
+        let mut first = self.0.lock().unwrap();
+        if first.is_none() || matches!(*first, Some("cancel" | "unattributed")) {
+            *first = Some(reason);
+        }
+    }
+    pub fn get(&self) -> &'static str {
+        self.0.lock().unwrap().unwrap_or("unattributed")
+    }
+}
+
 pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
     mut sink: S,
     mut frames: mpsc::Receiver<Frame>,
     writer_alive: Arc<AtomicBool>,
     cancel: CancellationToken,
     session_id: String,
+    close_reason: CloseReason,
 ) {
     // Schedule from actual send completion, never from an interval's old ticks.
     // The timer precedes queued data so continuous traffic cannot starve Ping.
@@ -29,6 +44,7 @@ pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
             _ = tokio::time::sleep_until(next_ping) => {
                 if !writer_alive.swap(false, Ordering::SeqCst) {
                     eprintln!("{} event=ws_writer_closed session={session_id} reason=heartbeat_pong_missing", chrono::Utc::now().to_rfc3339());
+                    close_reason.record("heartbeat_pong_missing");
                     cancel.cancel();
                     break;
                 }
@@ -36,7 +52,7 @@ pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
             },
             frame = frames.recv() => match frame {
                 Some(frame) => Message::Binary(frame.encode().into()),
-                None => break,
+                None => { close_reason.record("writer_channel_closed"); break; },
             },
         };
         let is_ping = matches!(message, Message::Ping(_));
@@ -45,7 +61,8 @@ pub(crate) async fn write_frames<S: Sink<Message> + Unpin>(
             result = tokio::time::timeout(Duration::from_secs(20), sink.send(message)) => result,
         };
         if !matches!(sent, Ok(Ok(()))) {
-            let cause = if sent.is_err() { "send timeout" } else { "socket send failed" };
+            let cause = if sent.is_err() { "send_timeout" } else { "socket_send_failed" };
+            close_reason.record(cause);
             eprintln!(
                 "{} event=ws_writer_closed session={session_id} reason={cause:?}",
                 chrono::Utc::now().to_rfc3339()
@@ -68,6 +85,15 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::time::{Instant, Sleep};
+
+    #[test]
+    fn first_known_close_reason_survives_later_cancellation() {
+        let reason = CloseReason::default();
+        reason.record("browser_close");
+        reason.record("cancel");
+        reason.record("socket_send_failed");
+        assert_eq!(reason.get(), "browser_close");
+    }
 
     struct Peer {
         messages: mpsc::UnboundedSender<Message>,
@@ -112,6 +138,7 @@ mod tests {
             alive.clone(),
             cancel.clone(),
             "fixture".into(),
+            CloseReason::default(),
         ));
         (frames, peer, alive, cancel, task)
     }

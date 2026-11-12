@@ -1,86 +1,24 @@
-//! Retain the device PID from the pinned idevice launcher without dumping its
-//! debug messages, launch environment, XCTest activities or phone log payloads.
-use std::fmt::{self, Write};
-use tracing::{
-    Event, Subscriber,
-    field::{Field, Visit},
-};
+//! Keep typed runner diagnostics while suppressing arbitrary device messages.
+use std::fmt;
+use tracing::{Event, Subscriber};
 use tracing_subscriber::{
-    EnvFilter,
     fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
     registry::LookupSpan,
 };
-
 const PHONE_TARGET: &str = "idevice::services::dvt::xctest";
-
-pub(crate) fn with_phone_launch(filter: EnvFilter) -> EnvFilter {
-    filter.add_directive(format!("{PHONE_TARGET}=debug").parse().expect("fixed phone log directive"))
-}
-
-#[derive(Default)]
-struct Message {
-    value: String,
-    truncated: bool,
-}
-impl fmt::Write for Message {
-    fn write_str(&mut self, value: &str) -> fmt::Result {
-        if self.value.len() + value.len() > 512 {
-            self.truncated = true;
-            return Err(fmt::Error);
-        }
-        self.value.push_str(value);
-        Ok(())
-    }
-}
-impl Visit for Message {
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if field.name() == "message" {
-            let _ = write!(self, "{value:?}");
-        }
-    }
-}
-
-fn launched_pid(message: &Message) -> Option<u32> {
-    if message.truncated {
-        return None;
-    }
-    message.value.strip_prefix("Launched test runner pid=")?.parse().ok().filter(|pid| *pid > 0)
-}
-
 pub(crate) struct PhoneEvents;
 impl<S, N> FormatEvent<S, N> for PhoneEvents
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
     N: for<'a> FormatFields<'a> + 'static,
 {
-    fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> fmt::Result {
+    fn format_event(&self, ctx: &FmtContext<'_, S, N>, writer: Writer<'_>, event: &Event<'_>) -> fmt::Result {
         let level = *event.metadata().level();
         if event.metadata().target().starts_with(PHONE_TARGET)
             && level != tracing::Level::WARN
             && level != tracing::Level::ERROR
         {
-            let mut message = Message::default();
-            event.record(&mut message);
-            let Some(phone_pid) = launched_pid(&message) else {
-                return Ok(());
-            };
-            use tracing_subscriber::fmt::time::FormatTime;
-            tracing_subscriber::fmt::time::SystemTime.format_time(&mut writer)?;
-            write!(
-                writer,
-                " INFO phone_lifecycle: event=phone_process_launched native_pid={} phone_pid={phone_pid}",
-                std::process::id()
-            )?;
-            if let Some(scope) = ctx.event_scope() {
-                for span in scope.from_root() {
-                    if span.metadata().name() == "xctest_runner"
-                        && let Some(fields) = span.extensions().get::<tracing_subscriber::fmt::FormattedFields<N>>()
-                    {
-                        write!(writer, " {fields}")?;
-                    }
-                }
-            }
-            return writeln!(writer);
+            return Ok(());
         }
         tracing_subscriber::fmt::format().format_event(ctx, writer, event)
     }
@@ -90,6 +28,7 @@ where
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use tracing_subscriber::EnvFilter;
 
     #[derive(Clone, Default)]
     struct Output(Arc<Mutex<Vec<u8>>>);
@@ -116,11 +55,12 @@ mod tests {
             .with_ansi(false)
             .with_writer(output.clone())
             .event_format(PhoneEvents)
-            .with_env_filter(with_phone_launch(EnvFilter::new("info,ictl_wda::runner=info,idevice=warn")))
+            .with_env_filter(EnvFilter::new("info,ictl_wda::runner=info,idevice=warn"))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("xctest_runner", runner_id = 42);
             let _entered = span.enter();
+            tracing::info!(target: "ictl_wda::diagnostics", event="phone_process_launched",phone_pid=1234u64,runner_id=42u64,native_start_id="fixture-generation");
             tracing::debug!(target: "idevice::services::dvt::xctest", "Launched test runner pid={}", 1234);
             tracing::debug!(target: "idevice::services::dvt::xctest", "PRIVATE_LAUNCH_ENV_AND_TYPED_PASSWORD");
             tracing::debug!(target: "idevice::services::dvt::xctest", "Launched test runner pid=1234 PRIVATE_TRAILING_DATA");
@@ -131,8 +71,11 @@ mod tests {
             tracing::info!(event = "ordinary_server_event");
         });
         let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("event=phone_process_launched"), "{text}");
-        assert!(text.contains("phone_pid=1234") && text.contains("runner_id=42"), "{text}");
+        assert!(text.contains("phone_process_launched"), "{text}");
+        assert!(
+            text.contains("phone_pid=1234") && text.contains("runner_id=42") && text.contains("fixture-generation"),
+            "{text}"
+        );
         assert!(text.contains("ordinary_server_event"));
         assert!(text.contains("existing_device_warning"));
         assert!(!text.contains("PRIVATE") && !text.contains("XXXXX"), "{text}");

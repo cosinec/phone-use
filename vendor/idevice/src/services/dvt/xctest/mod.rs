@@ -21,6 +21,7 @@
 //! # }
 //! ```
 
+pub mod diagnostics;
 pub mod dtx_services;
 pub mod listener;
 pub mod types;
@@ -432,6 +433,7 @@ pub(super) struct TestManagerConnections {
     /// Keeps the software tunnel/adapter handles alive for the duration of the session.
     #[allow(dead_code)]
     rsd_handles: Vec<crate::tcp::handle::AdapterHandle>,
+    diagnostic_rsd: Option<(crate::tcp::handle::AdapterHandle, RsdHandshake)>,
 }
 
 /// Connects to a lockdown-based DTX service, trying each name in order.
@@ -618,6 +620,7 @@ async fn connect_rsd_stack_once(
         ctrl,
         main,
         dvt,
+        diagnostic_rsd: Some((handle.clone(), handshake)),
         rsd_handles: vec![handle],
     })
 }
@@ -691,6 +694,7 @@ pub(super) async fn connect_testmanagerd(
         main,
         dvt,
         rsd_handles: Vec::new(),
+        diagnostic_rsd: None,
     })
 }
 
@@ -972,14 +976,16 @@ async fn wait_for_xctest_service_channel(
         .await
     {
         Ok(code) => code,
-        Err(IdeviceError::XcTestTimeout(_)) => match main_client
-            .wait_for_service_channel_code(plain_identifiers, Some(true), timeout)
-            .await
-        {
-            Ok(code) => code,
-            Err(IdeviceError::XcTestTimeout(_)) => return Err(IdeviceError::TestRunnerTimeout),
-            Err(error) => return Err(error),
-        },
+        Err(IdeviceError::XcTestTimeout(_)) => {
+            match main_client
+                .wait_for_service_channel_code(plain_identifiers, Some(true), timeout)
+                .await
+            {
+                Ok(code) => code,
+                Err(IdeviceError::XcTestTimeout(_)) => return Err(IdeviceError::TestRunnerTimeout),
+                Err(error) => return Err(error),
+            }
+        }
         Err(error) => return Err(error),
     };
 
@@ -1034,10 +1040,9 @@ async fn initialize_testmanager_daemon_sessions(
     Ok(())
 }
 
-async fn launch_and_authorize_test_runner(
-    ctrl_proxy: &mut TestManagerProxy<Box<dyn ReadWrite>>,
+async fn launch_test_runner(
     process_control: &mut XCTestProcessControlChannel<'_, Box<dyn ReadWrite>>,
-    ios_major_version: u8,
+    observer: Option<&Arc<dyn diagnostics::ProcessObserver>>,
     runner_bundle_id: &str,
     launch_args: Vec<String>,
     launch_env: Dictionary,
@@ -1046,13 +1051,7 @@ async fn launch_and_authorize_test_runner(
     let pid = process_control
         .launch_suspended_process(runner_bundle_id, launch_args, launch_env, launch_options)
         .await?;
-    debug!("Launched test runner pid={}", pid);
-
-    if ios_major_version < 17 {
-        crate::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-
-    ctrl_proxy.authorize_test(ios_major_version, pid).await?;
+    diagnostics::launched(observer, pid);
     Ok(pid)
 }
 
@@ -1825,6 +1824,7 @@ async fn run_dispatch_loop_until_done_or_disconnect<L: XCUITestListener>(
 /// ```
 pub struct XCUITestService {
     provider: Arc<dyn IdeviceProvider>,
+    process_observer: Option<Arc<dyn diagnostics::ProcessObserver>>,
 }
 
 #[cfg(feature = "wda")]
@@ -1965,7 +1965,19 @@ impl std::fmt::Debug for XCUITestService {
 impl XCUITestService {
     /// Creates a new `XCUITestService` backed by the given provider.
     pub fn new(provider: Arc<dyn IdeviceProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            process_observer: None,
+        }
+    }
+
+    /// Enables bounded synchronous process evidence on an independent DVT socket.
+    pub fn with_process_observer(
+        mut self,
+        observer: Arc<dyn diagnostics::ProcessObserver>,
+    ) -> Self {
+        self.process_observer = Some(observer);
+        self
     }
 
     /// Runs the XCTest bundle described by `cfg` to completion.
@@ -2041,10 +2053,9 @@ impl XCUITestService {
             cfg.runner_args.as_deref(),
         );
 
-        let _pid = launch_and_authorize_test_runner(
-            &mut ctrl_proxy,
+        let pid = launch_test_runner(
             &mut process_control,
-            ios_major_version,
+            self.process_observer.as_ref(),
             &cfg.runner_bundle_id,
             launch_args,
             launch_env,
@@ -2052,20 +2063,50 @@ impl XCUITestService {
         )
         .await?;
 
-        // 6-7. Wait for driver channel and start the test plan.
-        let driver_channel = start_test_plan_session(&mut conns.main, &mut main_proxy).await?;
-
-        // 8. Dispatch loop, raced against the runner connection dropping.
-        run_dispatch_loop_until_done_or_disconnect(
-            &mut conns.main,
-            driver_channel,
-            &xctest_config,
-            listener,
-            timeout,
-        )
-        .await?;
-
-        Ok(())
+        drop(process_control);
+        let lifecycle = async {
+            if ios_major_version < 17 {
+                crate::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            ctrl_proxy.authorize_test(ios_major_version, pid).await?;
+            let driver_channel = start_test_plan_session(&mut conns.main, &mut main_proxy).await?;
+            run_dispatch_loop_until_done_or_disconnect(
+                &mut conns.main,
+                driver_channel,
+                &xctest_config,
+                listener,
+                timeout,
+            )
+            .await
+        };
+        if let Some(observer) = &self.process_observer {
+            let connection = async {
+                match conns.diagnostic_rsd.as_mut() {
+                    Some((handle, handshake)) => {
+                        rsd_connect(
+                            handle,
+                            handshake,
+                            "com.apple.instruments.dtservicehub",
+                            "dtservicehub-diagnostics",
+                            false,
+                        )
+                        .await
+                    }
+                    None => {
+                        connect_dtx_service(
+                            &*self.provider,
+                            &[DVT_SERVICE, DVT_LEGACY_SERVICE],
+                            false,
+                        )
+                        .await
+                    }
+                }
+            };
+            diagnostics::with_monitor(lifecycle, diagnostics::monitor(connection, pid, observer))
+                .await
+        } else {
+            lifecycle.await
+        }
     }
 
     /// Starts an XCTest runner intended to host WebDriverAgent and waits

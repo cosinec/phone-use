@@ -118,7 +118,7 @@ impl<'a, R: ReadWrite> DeviceInfoClient<'a, R> {
             )
             .await?;
         let data = self.read_reply().await?;
-        Ok(data.as_boolean().unwrap_or(false))
+        parse_running_reply(&data)
     }
 
     /// Returns hardware information about the device
@@ -228,5 +228,25 @@ impl<'a, R: ReadWrite> DeviceInfoClient<'a, R> {
             .await?;
         let data = self.read_reply().await?;
         Ok(data.into_string().unwrap_or_default())
+    }
+}
+
+fn parse_running_reply(data: &Value) -> Result<bool, IdeviceError> {
+    data.as_boolean().ok_or_else(|| {
+        IdeviceError::UnexpectedResponse("expected boolean process observation".into())
+    })
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    #[test]
+    fn strict_pid_boolean_reply() {
+        assert_eq!(parse_running_reply(&Value::Boolean(true)).unwrap(), true);
+        assert_eq!(parse_running_reply(&Value::Boolean(false)).unwrap(), false);
+        assert!(
+            parse_running_reply(&Value::String("false".into())).is_err(),
+            "malformed replies are unknown, never process exit"
+        );
     }
 }

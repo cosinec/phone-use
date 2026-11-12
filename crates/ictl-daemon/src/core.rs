@@ -25,11 +25,13 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::diagnostics::{Diagnostics, HealthDiagnostics};
 use crate::eventlog::EventLog;
 use crate::machine::{Backoff, DeviceState, Misses, MuxWatch};
 use crate::notify::{self, Dedup, Event};
 use crate::protocol::{Request, Response};
 use crate::supervise::StartOutcome;
+use ictl_wda::diagnostics::StopReason;
 
 pub const TICK: Duration = Duration::from_secs(10);
 /// 改变手机状态的请求排队超过这么久就放弃
@@ -161,6 +163,8 @@ pub struct Snapshot {
     pub unlock_disabled: bool,
     pub notify_configured: bool,
     pub log_tail: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<HealthDiagnostics>,
 }
 
 pub(crate) struct Inner {
@@ -213,6 +217,7 @@ pub struct Daemon {
     pub log: EventLog,
     pub(crate) inner: Mutex<Inner>,
     snap: watch::Sender<Snapshot>,
+    pub(crate) diagnostics: Arc<std::sync::Mutex<Diagnostics>>,
 }
 
 /// 停掉 HID 会话（屏幕媒体流），隧道保留。媒体流不停的话手机一直以为「配对的电脑」在看屏幕：
@@ -324,9 +329,16 @@ impl Daemon {
             unlock_disabled: cfg.unlock_disabled_flag().exists(),
             notify_configured: cfg.notify.any(),
             log_tail: Vec::new(),
+            diagnostics: None,
         };
         let (snap, _) = watch::channel(first);
-        Arc::new(Self { cfg, log, inner: Mutex::new(inner), snap })
+        Arc::new(Self {
+            cfg,
+            log,
+            inner: Mutex::new(inner),
+            snap,
+            diagnostics: Arc::new(std::sync::Mutex::new(Diagnostics::default())),
+        })
     }
 
     /// 自动解锁配置：用设备 `udid` 自己的密码。没接设备时密码文件不存在（自动解锁不可用）
@@ -419,12 +431,13 @@ impl Daemon {
     }
 
     /// 丢掉整个会话：runner、WDA 客户端、正在后台启动的任务、隧道（先停 HID 媒体流）
-    pub(crate) async fn drop_session(&self, g: &mut Inner) {
+    pub(crate) async fn drop_session(&self, g: &mut Inner, reason: StopReason) {
+        self.diagnostics.lock().unwrap().stop(reason);
         if let Some(h) = g.starting.take() {
             h.abort();
         }
         if let Some(r) = g.runner.take() {
-            r.stop();
+            r.stop_with_reason(reason);
         }
         g.wda = None;
         g.elements_cache = None;
@@ -473,6 +486,7 @@ impl Daemon {
             unlock_disabled: unlock.disabled_by_failure(),
             notify_configured: self.cfg.notify.any(),
             log_tail: Vec::new(),
+            diagnostics: None,
         });
     }
 
@@ -485,17 +499,19 @@ impl Daemon {
             .ok()
             .and_then(|value| value["op"].as_str().map(str::to_owned))
             .unwrap_or_default();
+        let operation_id = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
         let span = tracing::info_span!(
             "device_request",
-            operation_id = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed),
+            operation_id,
             native_pid = std::process::id(),
+            native_start_id = ictl_wda::diagnostics::native_start_id(),
             operation,
             diagnostic_id = ?ctx.diagnostic_id
         );
         async {
             let timer = StepTimer::new("device_request");
             tracing::info!(event = "device_request_received", queued_ms = queued_at.elapsed().as_millis() as u64);
-            let response = self.handle_request(req, queued_at, ctx).await;
+            let response = self.handle_request(req, queued_at, ctx, operation_id, operation).await;
             timer.finish(!matches!(response, Response::Error { .. }));
             response
         }
@@ -503,7 +519,14 @@ impl Daemon {
         .await
     }
 
-    async fn handle_request(self: &Arc<Self>, req: Request, queued_at: Instant, ctx: CallCtx) -> Response {
+    async fn handle_request(
+        self: &Arc<Self>,
+        req: Request,
+        queued_at: Instant,
+        ctx: CallCtx,
+        operation_id: u64,
+        operation: String,
+    ) -> Response {
         // 不需要设备锁的请求
         match req {
             Request::Daemon => {
@@ -512,6 +535,7 @@ impl Daemon {
                 s.unlock_disabled = unlock.disabled_by_failure();
                 s.auto_unlock = unlock.enabled();
                 s.log_tail = self.log.tail(15);
+                s.diagnostics = Some(self.diagnostics.lock().unwrap().snapshot());
                 return Response::text(serde_json::to_string_pretty(&s).unwrap_or_default());
             }
             // 重签自己分段持锁：签名、安装要几十秒，期间不挡住别的请求
@@ -533,6 +557,7 @@ impl Daemon {
             },
             None => self.inner.lock().await,
         };
+        let _active = Diagnostics::active(&self.diagnostics, operation_id, operation);
         waiting.finish(true);
         let g = &mut *g;
         if let Some(want) = &ctx.expect_udid {
@@ -633,7 +658,7 @@ impl Daemon {
         let mut g = self.inner.lock().await;
         self.log.log("收到停止信号,退出");
         // 先停 HID 媒体流、runner（经 usbmuxd），再停 usbmuxd
-        self.drop_session(&mut g).await;
+        self.drop_session(&mut g, StopReason::DaemonShutdown).await;
         if let Some(mut c) = g.usbmuxd.take() {
             let _ = c.kill().await;
         }
@@ -685,6 +710,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ictl-core-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         (Daemon::new(Config::from_env(&dir)), dir)
+    }
+
+    #[tokio::test]
+    async fn status_diagnostics_and_busy_tick_do_not_wait_for_device_lock() {
+        let (d, dir) = test_daemon("diagnostics-busy");
+        let runner = ictl_wda::diagnostics::RunnerDiagnostics::new(7);
+        d.diagnostics.lock().unwrap().set_runner(runner);
+        d.diagnostics.lock().unwrap().complete(7, Duration::from_millis(12), "ready");
+        let busy = d.inner.lock().await;
+        let _active = Diagnostics::active(&d.diagnostics, 99, "tap".into());
+        tokio::time::timeout(Duration::from_millis(50), d.clone().tick()).await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(50),
+            d.handle(Request::Daemon, Instant::now(), CallCtx::default()),
+        )
+        .await
+        .unwrap();
+        let Response::Text { text, .. } = response else {
+            panic!("expected status text");
+        };
+        let status: Snapshot = serde_json::from_str(&text).unwrap();
+        let evidence = status.diagnostics.unwrap();
+        assert_eq!(evidence.last_probe.unwrap().sequence, 1);
+        assert_eq!(evidence.last_skip.unwrap().active_operation.unwrap().operation_id, 99);
+        assert_eq!(evidence.runner.unwrap().identity.runner_id, 7);
+        drop(busy);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 调用方已经断开：还在排队等设备锁的请求不执行

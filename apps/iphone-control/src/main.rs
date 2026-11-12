@@ -122,11 +122,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .event_format(phone_logs::PhoneEvents)
-        .with_env_filter(phone_logs::with_phone_launch(filter))
+        .with_env_filter(filter)
         .init();
     tracing::info!(
         event = "phone_diagnostics_enabled",
-        schema = 2,
+        schema = 3,
+        native_start_id = ictl_daemon::native_start_id(),
+        phone_process_observation = true,
         native_pid = std::process::id(),
         callback_events = true,
         phone_process_launch = true,

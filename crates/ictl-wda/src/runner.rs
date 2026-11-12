@@ -17,6 +17,7 @@ use idevice::{
 };
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::{RunnerDiagnostics, StopReason, native_start_id};
 use crate::http::DeviceTransport;
 use crate::{Result, WdaClient, WdaError, is_automation_pin_error};
 
@@ -75,6 +76,7 @@ fn launch_hint(msg: String) -> String {
 #[derive(Default)]
 struct Progress {
     runner_id: u64,
+    diagnostics: Option<RunnerDiagnostics>,
     event_seq: u64,
     initialization_count: u64,
     authorization_wait_count: u64,
@@ -98,6 +100,8 @@ impl ErrorListener {
     fn event(&self, event: &'static str) {
         let mut p = self.0.lock().unwrap();
         p.event_seq += 1;
+        let sequence = p.diagnostics.as_ref().map_or(p.event_seq, RunnerDiagnostics::next_sequence);
+        let phone_pid = p.diagnostics.as_ref().and_then(|d| d.snapshot().phone_pid);
         match event {
             "xctest_ui_initializing" => p.initialization_count += 1,
             "xctest_authorization_wait" => p.authorization_wait_count += 1,
@@ -110,7 +114,9 @@ impl ErrorListener {
             event,
             runner_id = p.runner_id,
             native_pid = std::process::id(),
-            event_seq = p.event_seq,
+            native_start_id = native_start_id(),
+            event_seq = sequence,
+            phone_pid = ?phone_pid,
             initialization_count = p.initialization_count,
             authorization_wait_count = p.authorization_wait_count,
             plan_start_count = p.plan_start_count
@@ -209,6 +215,8 @@ pub struct WdaRunner {
     task: JoinHandle<std::result::Result<(), IdeviceError>>,
     progress: Arc<Mutex<Progress>>,
     started: std::time::Instant,
+    diagnostics: RunnerDiagnostics,
+    ready: bool,
 }
 
 impl WdaRunner {
@@ -218,8 +226,21 @@ impl WdaRunner {
         bundle_id: &str,
         timeout: Duration,
     ) -> Result<(Self, WdaClient<DeviceTransport>)> {
-        let runner_id = NEXT_RUNNER.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(event = "xctest_start_requested", runner_id, native_pid = std::process::id());
+        Self::start_with_diagnostics(provider, bundle_id, timeout, Self::diagnostic_session()).await
+    }
+
+    pub fn diagnostic_session() -> RunnerDiagnostics {
+        RunnerDiagnostics::new(NEXT_RUNNER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub async fn start_with_diagnostics(
+        provider: Arc<dyn IdeviceProvider>,
+        bundle_id: &str,
+        timeout: Duration,
+        diagnostics: RunnerDiagnostics,
+    ) -> Result<(Self, WdaClient<DeviceTransport>)> {
+        let runner_id = diagnostics.snapshot().identity.runner_id;
+        diagnostics.event("xctest_start_requested");
         let lookup = async {
             let mut ip =
                 InstallationProxyClient::connect(&*provider).await.map_err(|e| WdaError::Unavailable(e.to_string()))?;
@@ -236,14 +257,27 @@ impl WdaRunner {
             ))
         })??;
 
-        let progress = Arc::new(Mutex::new(Progress { runner_id, ..Progress::default() }));
+        let progress =
+            Arc::new(Mutex::new(Progress { runner_id, diagnostics: Some(diagnostics.clone()), ..Progress::default() }));
         let task = {
-            let (provider, progress) = (provider.clone(), progress.clone());
-            let span = tracing::info_span!("xctest_runner", runner_id);
+            let (provider, progress, diagnostics) = (provider.clone(), progress.clone(), diagnostics.clone());
+            let span = tracing::info_span!("xctest_runner", runner_id, native_start_id = native_start_id());
             let run = async move {
                 let started = std::time::Instant::now();
-                tracing::info!(event = "xctest_started", runner_id, native_pid = std::process::id());
-                let result = XCUITestService::new(provider).run(cfg, &mut ErrorListener(progress.clone()), None).await;
+                diagnostics.event("xctest_started");
+                let result = XCUITestService::new(provider)
+                    .with_process_observer(Arc::new(diagnostics.clone()))
+                    .run(cfg, &mut ErrorListener(progress.clone()), None)
+                    .await;
+                let category = match &result {
+                    Ok(()) => "test_plan_completed",
+                    Err(IdeviceError::TestRunnerDisconnected) => "runner_transport_disconnected",
+                    Err(IdeviceError::XcTestTimeout(_)) => "test_plan_timeout",
+                    Err(IdeviceError::Socket(_)) => "socket_error",
+                    Err(_) => "xctest_error",
+                };
+                diagnostics.exited(category);
+                diagnostics.event("xctest_exited");
                 let reason = match &result {
                     Ok(()) => "test plan completed".to_owned(),
                     Err(e) => e.to_string(),
@@ -252,19 +286,29 @@ impl WdaRunner {
                 {
                     let p = progress.lock().unwrap();
                     tracing::warn!(
-                        event = "xctest_exited", runner_id,
-                        lifetime_ms = started.elapsed().as_millis() as u64, reason = %reason,
-                        phone_log_messages = p.log_messages, phone_debug_messages = p.debug_messages,
+                        event = "xctest_exit_summary",
+                        runner_id,
+                        native_pid = std::process::id(),
+                        native_start_id = native_start_id(),
+                        lifetime_ms = started.elapsed().as_millis() as u64,
+                        category,
+                        scope = "xctest_session",
+                        requested_cleanup =
+                            diagnostics.snapshot().stop_reason.is_some_and(|r| r != StopReason::Unattributed),
+                        phone_log_messages = p.log_messages,
+                        phone_debug_messages = p.debug_messages,
                         initialization_count = p.initialization_count,
                         authorization_wait_count = p.authorization_wait_count,
-                        plan_start_count = p.plan_start_count, callback_events = p.event_seq
+                        plan_start_count = p.plan_start_count,
+                        callback_events = p.event_seq
                     );
                 }
                 result
             };
             tokio::spawn(run.instrument(span))
         };
-        let mut runner = Self { task, progress: progress.clone(), started: std::time::Instant::now() };
+        let mut runner =
+            Self { task, progress: progress.clone(), started: std::time::Instant::now(), diagnostics, ready: false };
         let client = WdaClient::new(DeviceTransport::new(provider, WDA_PORT));
 
         let failure = |extra: Option<String>| {
@@ -312,9 +356,11 @@ impl WdaRunner {
             }
             if (plan_started || fallback_logged) && client.ready().await.unwrap_or(false) {
                 tracing::info!(event = "xctest_http_ready", runner_id, elapsed_ms = t0.elapsed().as_millis() as u64);
+                runner.ready = true;
                 return Ok((runner, client));
             }
             if tokio::time::Instant::now() >= deadline {
+                runner.diagnostics.stop(StopReason::StartupTimeout);
                 runner.task.abort();
                 return Err(failure(Some(
                     ictl_l10n::tr!("WDA 在限定时间内没有就绪", "WDA didn't become ready in time").to_owned(),
@@ -334,15 +380,29 @@ impl WdaRunner {
     }
 
     /// 停掉 runner（即丢掉它，见 Drop）
-    pub fn stop(self) {}
+    pub fn diagnostics(&self) -> RunnerDiagnostics {
+        self.diagnostics.clone()
+    }
+    pub fn stop(self) {
+        self.stop_with_reason(StopReason::Unattributed);
+    }
+    pub fn stop_with_reason(self, reason: StopReason) {
+        self.diagnostics.stop(reason);
+    }
 }
 
 /// 丢掉就停：守护进程的后台启动任务可能在 start() 中途被取消，不能留下一个没人管的 XCTest 会话
 impl Drop for WdaRunner {
     fn drop(&mut self) {
+        self.diagnostics.stop(if self.ready || self.task.is_finished() {
+            StopReason::Unattributed
+        } else {
+            StopReason::StartupCancellation
+        });
+        self.diagnostics.event("xctest_stop_requested");
         let runner_id = self.progress.lock().map(|p| p.runner_id).unwrap_or(0);
         tracing::info!(
-            event = "xctest_stop_requested",
+            event = "xctest_stop_summary",
             runner_id,
             native_pid = std::process::id(),
             lifetime_ms = self.started.elapsed().as_millis() as u64,

@@ -6,8 +6,12 @@
   "changes": [
     "Retain launch NSError domain/code and selected description/failure-reason/underlying-error fields from the raw NSKeyedArchive response, with bounded reference traversal.",
     "Log a fixed phone_process_launch_failed event and avoid dumping arbitrary response dictionaries.",
-    "No launch retry, signing, transport or XCTest behavior changes.",
-    "Use a typed DVT launch failure so Display preserves the bounded error chain instead of the previous InternalError display losing its message."
+    "No launch retry, signing, XCTest dispatch, readiness or restart policy changes.",
+    "Use a typed DVT launch failure so Display preserves the bounded error chain instead of the previous InternalError display losing its message.",
+    "Deliver launch PID through an optional synchronous ProcessObserver before test authorization; default observer-disabled behavior for unrelated clients.",
+    "Observe PID liveness on a dedicated DVT socket over the existing RSD tunnel (or an independent lockdown connection), with a shared 5-second setup bound, 5-second request bound and 10-second delayed cadence.",
+    "Retire the complete diagnostic socket on setup/request failure or timeout; own the monitor future within the XCTest lifecycle so cancellation drops its connection and no polling task survives.",
+    "Parse isRunningPid replies strictly as Boolean; unsupported, malformed, failed, or timed-out observations remain unknown instead of false."
   ],
   "upstreamFiles": {
     "Cargo.toml": "a0ab1e19648854f4cfffc19264b215aca6459c1454222f02eab96a96a9327f65",
@@ -146,5 +150,12 @@
     "src/remote_pairing/errors.rs": "906cdf6b2eaf7608347d87e1d9a7b395e5d1fd761bf21abd8bec2a26263c6861",
     "src/remote_pairing/socket.rs": "85d0b72c62481527e4efc741ca087511aee879cae5571e17be3a6e705b7c0125",
     "src/remote_pairing/tlv.rs": "2beb60fa71fcd03edc01bec9adaa8809fb2871ad4453829f5829912098f4df4d"
+  },
+  "modifiedFiles": {
+    "src/services/dvt/process_control.rs": "a32c6497f74e18b30a822bee3cceaf87f2a5dc6addc01bab2ca997eb0894f587",
+    "src/services/dvt/device_info.rs": "44b685501ba3fb5d56365e9a9b2ebdd56aa418e2c9667a16fbef07ed9eaa5aad",
+    "src/services/dvt/errors.rs": "e89469fd3722b35e7957f7f6d817af22d3fc245ff3adaf2171ad07aa14b44197",
+    "src/services/dvt/xctest/mod.rs": "dd5de536f15c888ce05d5b33e3998ee6d4d0ad17ea827537718a7bd396441577",
+    "src/services/dvt/xctest/diagnostics.rs": "465a74b80a5567634b8a27ff7d5e64f089c472f3f4f656f2fed80f818bd23317"
   }
 }

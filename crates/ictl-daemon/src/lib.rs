@@ -28,6 +28,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 pub use config::Config;
 pub use core::{Daemon, Snapshot};
+pub use ictl_wda::diagnostics::native_start_id;
 
 /// 一行请求的长度上限（正常不到 1KB；输入的文字也远小于这个）
 const MAX_REQUEST_LINE: u64 = 1024 * 1024;
@@ -209,3 +210,5 @@ mod tests {
         assert!(parse_request(b"{").is_err());
     }
 }
+
+pub mod diagnostics;

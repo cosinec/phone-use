@@ -46,6 +46,7 @@ idevice = { version = "=0.1.68", default-features = false, features = [
     "installation_proxy",
     "misagent",
     "xctest",
+    "device_info",
 ] }
 rmcp = { version = "=3.9.0", features = ["server", "transport-io"] }
 tokio = { version = "=1.54.1", features = ["full"] }

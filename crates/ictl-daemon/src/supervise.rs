@@ -10,6 +10,7 @@ use ictl_wda::{WdaClient, WdaError, WdaRunner, http::DeviceTransport};
 use crate::core::{Daemon, DeviceProfile, Inner, close_hid};
 use crate::machine::DeviceState;
 use crate::notify::Event;
+use ictl_wda::diagnostics::StopReason;
 
 /// 正常 2～10 秒就绪。手机重启后未授权 automation 时，testmanagerd 握手每次卡 30 秒、要重试一两次，
 /// 60 秒常常等不到 runner 启动，也就认不出「需要输入密码」
@@ -82,7 +83,7 @@ impl Daemon {
             }
         }
         // 经旧 usbmuxd 建立的连接（隧道、runner、WDA）都要失效：先停 HID 媒体流（还要经它），再停它
-        self.drop_session(g).await;
+        self.drop_session(g, StopReason::UsbmuxdReplacement).await;
         if let Some(mut c) = g.usbmuxd.take() {
             let _ = c.kill().await;
         }
@@ -112,7 +113,10 @@ impl Daemon {
 
     /// 每 10 秒一次。有请求在用设备就跳过这一轮（巡检不排队，下一轮再来）
     pub async fn tick(self: Arc<Self>) {
-        let Ok(mut g) = self.inner.try_lock() else { return };
+        let Ok(mut g) = self.inner.try_lock() else {
+            self.diagnostics.lock().unwrap().skip();
+            return;
+        };
         let g = &mut *g;
         self.ensure_usbmuxd(g, false).await;
 
@@ -187,7 +191,7 @@ impl Daemon {
             self.log.log("手机离线");
             // 名字、型号、iOS 版本是这台的：留着的话状态、提示文字会把它当成还在控制的设备
             g.info = None;
-            self.drop_session(g).await;
+            self.drop_session(g, StopReason::DeviceOffline).await;
             g.offline_since = Some(now);
             g.apps.clear();
         }
@@ -212,7 +216,7 @@ impl Daemon {
                 Some(old) => self.log.log(&format!("改为控制 {}（原来是 {}）", seen.udid, old.udid)),
                 None => {}
             }
-            self.drop_session(g).await;
+            self.drop_session(g, StopReason::DeviceReplacement).await;
             g.device_profile = DeviceProfile::NotChecked;
             // App 列表是上一台的（同一台重新接入也重读，便宜）
             g.apps.clear();
@@ -261,6 +265,20 @@ impl Daemon {
             (Some(w), true) => w.ready().await,
             _ => Ok(false),
         };
+        if let (Some(runner), Some(_)) = (&g.runner, &g.wda)
+            && runner_alive
+        {
+            let evidence = runner.diagnostics();
+            let identity = evidence.snapshot().identity;
+            let category = health_failure(&health).0;
+            let mut d = self.diagnostics.lock().unwrap();
+            let recovered = d.complete(identity.runner_id, health_started.elapsed(), category);
+            let snapshot = d.snapshot();
+            tracing::info!(event="wda_health_completed", scope="wda_status", native_pid=identity.native_pid, native_start_id=%identity.native_start_id, runner_id=identity.runner_id, phone_pid=?evidence.snapshot().phone_pid, sequence=snapshot.last_probe.as_ref().map(|p|p.sequence), duration_ms=health_started.elapsed().as_millis() as u64, category, consecutive_failures=snapshot.consecutive_failures, last_success_age_ms=?snapshot.last_success.as_ref().map(|p|p.age_ms));
+            if recovered {
+                evidence.event("wda_health_recovered");
+            }
+        }
         if matches!(health, Ok(true)) {
             g.wda_misses.reset();
             self.refresh_hid_rotation(g).await;
@@ -291,13 +309,18 @@ impl Daemon {
                 g.wda_misses.reset();
                 false
             };
-            let reason =
-                health.as_ref().err().map(ToString::to_string).unwrap_or_else(|| "/status returned ready=false".into());
-            self.log.log(&format!(
-                "event=wda_health_failed elapsed_ms={} category={category} consecutive_failures={} failure_window_ms={} confirm_window_ms={} restart={restart} runner_alive=true reason={reason}",
-                health_started.elapsed().as_millis(), g.wda_misses.count(), g.wda_misses.elapsed(now).as_millis(),
-                crate::machine::Misses::CONFIRM_WINDOW.as_millis()
-            ));
+            tracing::info!(
+                event = "wda_health_failed",
+                scope = "wda_status",
+                native_pid = std::process::id(),
+                native_start_id = ictl_wda::diagnostics::native_start_id(),
+                category,
+                consecutive_failures = g.wda_misses.count(),
+                failure_window_ms = g.wda_misses.elapsed(now).as_millis() as u64,
+                confirm_window_ms = crate::machine::Misses::CONFIRM_WINDOW.as_millis() as u64,
+                restart,
+                runner_alive = true
+            );
             if !restart {
                 return;
             }
@@ -314,7 +337,7 @@ impl Daemon {
             self.log.log(&format!("WDA 不可用 event=wda_restart runner_alive={runner_alive} reason={reason}"));
             // 隧道和 HID 也一起丢：WDA 掉线常常是底层连接断了（例如 usbmuxd 重启），
             // 留着旧隧道，下次查镜像就报 socket io failed 并白白退避 60 秒
-            self.drop_session(g).await;
+            self.drop_session(g, if runner_alive { StopReason::HealthRestart } else { StopReason::Unattributed }).await;
         }
         g.wda_misses.reset();
         if g.starting.is_some() || !g.backoff.ready(Instant::now()) {
@@ -332,6 +355,8 @@ impl Daemon {
         }
         self.log.log("启动 WDA");
         let (cache, url, user_dir) = (self.cfg.ddi_cache(), self.cfg.ddi_url.clone(), self.cfg.ddi_dir.clone());
+        let diagnostics = WdaRunner::diagnostic_session();
+        self.diagnostics.lock().unwrap().set_runner(diagnostics.clone());
         g.starting = Some(tokio::task::spawn_local(async move {
             // 手机重启后开发者镜像可能掉了；已挂载时只是一次查询。错误带上「是不是挂载这一步」
             let ddi: Result<Option<String>, (DeviceError, bool)> = async {
@@ -357,7 +382,7 @@ impl Daemon {
                 Err((DeviceError::PasswordProtected, _)) => return StartOutcome::NeedsUnlock,
                 Err((e, mount_failed)) => return StartOutcome::Ddi { error: e.to_string(), mount_failed },
             };
-            match WdaRunner::start(device.provider(), &bundle, WDA_START_TIMEOUT).await {
+            match WdaRunner::start_with_diagnostics(device.provider(), &bundle, WDA_START_TIMEOUT, diagnostics).await {
                 Ok((runner, client)) => StartOutcome::Ready { runner, client, mounted },
                 Err(e) => StartOutcome::Wda(e),
             }
@@ -527,7 +552,7 @@ impl Daemon {
                 g.persisted.save(&self.cfg.state_file());
                 // 新包装上后旧的 runner 会失效，下一轮巡检重新拉起。签名期间切到了别的设备就不动它的会话
                 if g.device.as_ref().is_some_and(|d| d.udid == signed_udid) {
-                    self.drop_session(g).await;
+                    self.drop_session(g, StopReason::WdaReinstalled).await;
                     self.refresh_device_profile(g).await;
                     g.backoff.reset();
                 }
