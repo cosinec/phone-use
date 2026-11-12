@@ -103,7 +103,7 @@ mod tests {
     use super::*;
     #[test]
     fn legacy_migration_requires_same_account_and_explicit_boundary() {
-        let root = std::env::temp_dir().join(format!("sign-cache-{}", uuid::Uuid::new_v4()));
+        let root = fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("sign-cache-{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
         for (session, id) in [("a", "ACCOUNT-A"), ("b", "ACCOUNT-B")] {
             let account = data.join(session).join("account");
@@ -129,7 +129,7 @@ mod tests {
     }
     #[test]
     fn symlinked_legacy_store_is_not_imported() {
-        let root = std::env::temp_dir().join(format!("sign-cache-{}", uuid::Uuid::new_v4()));
+        let root = fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("sign-cache-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("account")).unwrap();
         fs::write(root.join("store"), b"{}").unwrap();
         std::os::unix::fs::symlink(root.join("store"), root.join("account/accounts.json")).unwrap();
