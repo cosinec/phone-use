@@ -6,7 +6,8 @@ use wasm_bindgen_futures::future_to_promise;
 struct Actions {
     client: JsValue,
     options: JsValue,
-    in_flight: bool,
+    in_flight: Option<(JsValue, u64)>,
+    next_run: u64,
     stops: HashMap<String, Promise>,
 }
 impl Actions {
@@ -28,16 +29,19 @@ impl Actions {
 }
 #[wasm_bindgen(js_name=createTaskActions)]
 pub fn create_task_actions(client: JsValue, options: JsValue) -> JsValue {
-    let state = Rc::new(RefCell::new(Actions { client, options, in_flight: false, stops: HashMap::new() }));
+    let state = Rc::new(RefCell::new(Actions { client, options, in_flight: None, next_run: 0, stops: HashMap::new() }));
     let run_state = state.clone();
     let run = callback(move |operation| {
-        if run_state.borrow().in_flight {
-            return Promise::resolve(&JsValue::UNDEFINED).into();
-        }
-        run_state.borrow_mut().in_flight = true;
-        let (options, client, session) = {
-            let s = run_state.borrow();
-            (s.options.clone(), s.client.clone(), get(&s.session(), "id"))
+        let (options, client, session, epoch) = {
+            let mut s = run_state.borrow_mut();
+            let session = get(&s.session(), "id");
+            if s.in_flight.as_ref().is_some_and(|(id, _)| *id == session) {
+                return Promise::resolve(&JsValue::UNDEFINED).into();
+            }
+            s.next_run += 1;
+            let epoch = s.next_run;
+            s.in_flight = Some((session.clone(), epoch));
+            (s.options.clone(), s.client.clone(), session, epoch)
         };
         let _ = apply(&get(&options, "onBusy"), &JsValue::UNDEFINED, &[true.into()]);
         let _ = apply(&get(&options, "onError"), &JsValue::UNDEFINED, &["".into()]);
@@ -58,8 +62,10 @@ pub fn create_task_actions(client: JsValue, options: JsValue) -> JsValue {
             {
                 let _ = apply(&get(&options, "onError"), &JsValue::UNDEFINED, &[message(&e).into()]);
             }
-            state.borrow_mut().in_flight = false;
-            let _ = apply(&get(&options, "onBusy"), &JsValue::UNDEFINED, &[false.into()]);
+            if state.borrow().in_flight.as_ref().is_some_and(|(_, active)| *active == epoch) {
+                state.borrow_mut().in_flight = None;
+                let _ = apply(&get(&options, "onBusy"), &JsValue::UNDEFINED, &[false.into()]);
+            }
             Ok(JsValue::UNDEFINED)
         })
         .into()

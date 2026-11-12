@@ -1,16 +1,10 @@
 use super::*;
 use crate::interaction::{Pointer, Rect, pointer_command, to_phone_point};
 use web_sys::{HtmlImageElement, PointerEvent};
-fn pointer(event: &PointerEvent, ui: Ui) -> Option<Pointer> {
+fn pointer(event: &PointerEvent) -> Option<Pointer> {
     let image = event.current_target()?.dyn_into::<HtmlImageElement>().ok()?;
     let rect = image.get_bounding_client_rect();
-    let (mut width, mut height) = (image.natural_width() as f64, image.natural_height() as f64);
-    if !ui.preview_url.get_untracked().is_empty() {
-        let session = ui.session();
-        let screen = &session["daemon"]["persisted"]["screen"];
-        let (w, h) = (screen["width"].as_f64()?, screen["height"].as_f64()?);
-        (width, height) = if width > height { (h.max(w), h.min(w)) } else { (h.min(w), h.max(w)) };
-    }
+    let (width, height) = (image.natural_width() as f64, image.natural_height() as f64);
     Some(Pointer {
         point: to_phone_point(
             event.client_x() as f64,
@@ -24,13 +18,6 @@ fn pointer(event: &PointerEvent, ui: Ui) -> Option<Pointer> {
         time: now(),
     })
 }
-fn stop_preview(ui: Ui) {
-    ui.preview_url.set(String::new());
-    let pending = ui.client.get_value().stop_preview();
-    spawn_local(async move {
-        let _ = resolved(pending.into()).await;
-    });
-}
 #[component]
 pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     let down = StoredValue::new_local(None::<Pointer>);
@@ -38,68 +25,14 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     let position = RwSignal::new(String::new());
     let loaded = RwSignal::new(false);
     let landscape = RwSignal::new(false);
-    let preview_paused = RwSignal::new(false);
-    let stream_started = StoredValue::new_local((String::new(), 0.0));
-    let image_ref = NodeRef::<leptos::html::Img>::new();
-    // Chrome only emits load for the initial MJPEG image. Poll intrinsic dimensions
-    // with session status so rotation of later frames also updates the phone layout.
-    Effect::new(move |_| {
-        let _ = ui.state.get();
-        let stream = ui.preview_url.get();
-        if stream.is_empty() {
-            stream_started.set_value((String::new(), 0.0));
-            return;
-        }
-        let (previous, mut started) = stream_started.get_value();
-        if previous != stream {
-            started = now();
-            stream_started.set_value((stream, started));
-            preview_paused.set(false);
-        }
-        // A multipart response may stay open across upstream retries, so Chrome
-        // need not emit error when transport protection pauses the video stream.
-        // Release that subscription and let normal screenshot polling take over.
-        if now() - started >= 5000.0 && ui.session()["preview"]["ageMs"].as_u64().is_none_or(|age| age > 5000) {
-            preview_paused.set(true);
-            stop_preview(ui);
-            loaded.set(false);
-            return;
-        }
-        if let Some(image) = image_ref.get()
-            && image.natural_width() > 0
-            && image.natural_height() > 0
-        {
-            loaded.set(true);
-            landscape.set(image.natural_width() > image.natural_height());
-        }
-    });
-    let disabled = move || {
-        !ui.can_control()
-            || ui.busy.get()
-            || (!ui.preview_url.get().is_empty()
-                && ui.session()["preview"]["ageMs"].as_u64().is_none_or(|age| age > 5000))
-    };
+    let disabled = move || !ui.can_control() || ui.busy.get();
     view! {
         <section class="phone-card card">
             <div class="card-header">
                 <div>
                     <span class="section-label">"设备屏幕"</span>
-                    <h2>"实时画面"</h2>
+                    <h2>"设备截图"</h2>
                 </div>
-                <Show when=move || !ui.preview_url.get().is_empty()>
-                    <button
-                        class="button small"
-                        aria-label="暂停连续画面"
-                        title="暂停连续画面，改用单张截图"
-                        on:click=move |_| {
-                            preview_paused.set(true);
-                            loaded.set(false);
-                            stop_preview(ui);
-                        }
-                    >
-                        "暂停预览"
-                    </button>
-                </Show>
                 <button
                     class="icon-button"
                     aria-label="刷新屏幕"
@@ -114,19 +47,19 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                 <div class=move || {
                     format!(
                         "phone-frame {} {}",
-                        if ui.screen.get().is_null() && ui.preview_url.get().is_empty() { "" } else { "has-screen" },
+                        if ui.screen.get().is_null() { "" } else { "has-screen" },
                         if landscape.get() { "wide" } else { "" },
                     )
                 }>
                     <Show
-                        when=move || !ui.screen.get().is_null() || !ui.preview_url.get().is_empty()
+                        when=move || !ui.screen.get().is_null()
                         fallback=move || {
                             view! {
                                 <div class="empty-phone">
                                     <div class="empty-usb">"⌁"</div>
                                     <strong>{move || ui.status()}</strong>
                                     <p>
-                                        "连接后，这里会显示"<br />"手机的真实屏幕"
+                                        "不会自动采集屏幕。"<br />"需要时点击刷新屏幕"
                                     </p>
                                     <span class="empty-phone-line" />
                                 </div>
@@ -134,11 +67,8 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         }
                     >
                         <img
-                            node_ref=image_ref
                             class="phone-screen"
                             src=move || {
-                                let stream = ui.preview_url.get();
-                                if !stream.is_empty() { return stream; }
                                 format!(
                                     "data:image/jpeg;base64,{}",
                                     string(&ui.screen.get(), "imageBase64"),
@@ -156,10 +86,6 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                 }
                             }
                             on:error=move |_| {
-                                if !ui.preview_url.get_untracked().is_empty() {
-                                    preview_paused.set(true);
-                                    stop_preview(ui);
-                                }
                                 loaded.set(false);
                                 landscape.set(false);
                             }
@@ -173,12 +99,12 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                 {
                                     let _ = image.set_pointer_capture(e.pointer_id());
                                 }
-                                down.set_value(pointer(&e, ui));
+                                down.set_value(pointer(&e));
                             }
                             on:pointermove=move |e| {
                                 position
                                     .set(
-                                        pointer(&e, ui)
+                                        pointer(&e)
                                             .and_then(|p| p.point)
                                             .map(|p| format!("{}, {}", p.x, p.y))
                                             .unwrap_or_default(),
@@ -191,7 +117,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                     return;
                                 }
                                 if let Some(command) = start
-                                    .zip(pointer(&e, ui))
+                                    .zip(pointer(&e))
                                     .and_then(|(s, e)| pointer_command(s, e))
                                 {
                                     ui.manual(string(&command, "tool"), command["args"].clone());
@@ -208,21 +134,9 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         format!("tiny-dot {}", if ui.screen.get().is_null() { "" } else { "live" })
                     } />
                     {move || {
-                        if !ui.preview_url.get().is_empty() {
-                            let age = ui.session()["preview"]["ageMs"].as_u64();
-                            return match age { Some(age) if age <= 5000 => "连续画面", _ => "画面重连中" };
-                        }
-                        if preview_paused.get() {
-                            return if ui.screen.get().is_null() { "连续画面已暂停，等待截图" } else { "截图预览（连续画面已暂停）" };
-                        }
-                        if ui.screen.get().is_null() {
-                            "等待设备画面"
-                        } else {
-                            "设备截图"
-                        }
+                        if ui.screen.get().is_null() { "按需截图" } else { "最近一次截图（非实时）" }
                     }}
                     {move || {
-                        if !ui.preview_url.get().is_empty() { return None; }
                         ui.screen
                             .get()["timings"]["screenshotMs"]
                             .as_f64()
@@ -246,7 +160,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                     }}
                 </code>
             </div>
-            <p class="screen-hint">"点按、拖动滑动，按住 0.5 秒可长按。"</p>
+            <p class="screen-hint">"点击刷新获取截图。任务按需采图，空闲时不采图。点按、滑动可控制手机。"</p>
             <div class="hardware-buttons">
                 <Show when=move || ui.android()>
                     <button

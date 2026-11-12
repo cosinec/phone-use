@@ -258,10 +258,10 @@ impl Daemon {
         let runner_alive = g.runner.as_ref().is_some_and(|r| r.alive());
         let health_started = Instant::now();
         let health = match (&g.wda, runner_alive) {
-            (Some(w), true) => w.ready().await.map_err(|error| error.to_string()),
+            (Some(w), true) => w.ready().await,
             _ => Ok(false),
         };
-        if health == Ok(true) {
+        if matches!(health, Ok(true)) {
             g.wda_misses.reset();
             self.refresh_hid_rotation(g).await;
             if g.state != DeviceState::Ready {
@@ -283,12 +283,20 @@ impl Daemon {
             return;
         }
         if runner_alive {
-            let reason = health.as_ref().err().map(String::as_str).unwrap_or("/status returned ready=false");
-            let restart = g.wda_misses.hit();
+            let (category, response_failure) = health_failure(&health);
+            let now = Instant::now();
+            let restart = if response_failure {
+                g.wda_misses.hit(now)
+            } else {
+                g.wda_misses.reset();
+                false
+            };
+            let reason =
+                health.as_ref().err().map(ToString::to_string).unwrap_or_else(|| "/status returned ready=false".into());
             self.log.log(&format!(
-                "event=wda_health_failed elapsed_ms={} misses={:?} restart={restart} reason={reason}",
-                health_started.elapsed().as_millis(),
-                g.wda_misses
+                "event=wda_health_failed elapsed_ms={} category={category} consecutive_failures={} failure_window_ms={} confirm_window_ms={} restart={restart} runner_alive=true reason={reason}",
+                health_started.elapsed().as_millis(), g.wda_misses.count(), g.wda_misses.elapsed(now).as_millis(),
+                crate::machine::Misses::CONFIRM_WINDOW.as_millis()
             ));
             if !restart {
                 return;
@@ -296,7 +304,12 @@ impl Daemon {
         }
         if g.runner.is_some() {
             let reason = g.runner.as_ref().and_then(WdaRunner::exit_reason).unwrap_or_else(|| {
-                if runner_alive { "three consecutive health failures" } else { "runner task finished" }.to_owned()
+                if runner_alive {
+                    "sustained WDA response failures (at least 3 probes over 60 seconds)"
+                } else {
+                    "runner task finished"
+                }
+                .to_owned()
             });
             self.log.log(&format!("WDA 不可用 event=wda_restart runner_alive={runner_alive} reason={reason}"));
             // 隧道和 HID 也一起丢：WDA 掉线常常是底层连接断了（例如 usbmuxd 重启），
@@ -532,5 +545,32 @@ impl Daemon {
         };
         self.publish(g);
         r
+    }
+}
+
+/// Connection/dispatch failures say nothing about whether XCTest is responsive.
+fn health_failure(result: &ictl_wda::Result<bool>) -> (&'static str, bool) {
+    use ictl_wda::WdaError;
+    match result {
+        Err(WdaError::Unavailable(_)) => ("transport_unavailable", false),
+        Err(WdaError::Timeout(_)) => ("response_timeout", true),
+        Err(WdaError::Interrupted(_)) => ("response_interrupted", true),
+        Err(_) => ("response_error", true),
+        Ok(false) => ("not_ready", true),
+        Ok(true) => ("ready", false),
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    #[test]
+    fn a_link_failure_cannot_trigger_a_live_runner_restart() {
+        assert_eq!(
+            health_failure(&Err(ictl_wda::WdaError::Unavailable("connect timeout".into()))),
+            ("transport_unavailable", false)
+        );
+        assert_eq!(health_failure(&Err(ictl_wda::WdaError::Timeout("read".into()))), ("response_timeout", true));
+        assert_eq!(health_failure(&Ok(false)), ("not_ready", true));
     }
 }

@@ -25,7 +25,8 @@ const v2Marker = "// phone-use: device-install stream lifecycle v2";
 const v3Marker = "// phone-use: device-install stream lifecycle v3";
 const v4Marker = "// phone-use: device-install stream lifecycle v4";
 const v5Marker = "// phone-use: device-install stream lifecycle v5";
-const marker = "// phone-use: device-install stream lifecycle v6";
+const v6Marker = "// phone-use: device-install stream lifecycle v6";
+const marker = "// phone-use: device-install stream lifecycle v7";
 const streamReplacements = [
   [
     "  async handleFrame(t) {\n    switch (t.type) {",
@@ -489,7 +490,7 @@ function queueDeviceAck(stream) {
 
 // Keep the v5 layout above intact so existing installations can be authenticated
 // and migrated. Bound the opposite (phone -> browser -> VPS) direction as well.
-const replacements = [
+const v6Replacements = [
   ...v5Replacements,
   [
     '  let n, r;\n  const a = {',
@@ -546,7 +547,7 @@ const replacements = [
     `  async send(t) { await sendBoundedRelayFrame(this, t); }`,
   ],
 ];
-const helpers = v5Helpers.replace(v5Marker, marker)
+const v6Helpers = v5Helpers.replace(v5Marker, v6Marker)
   .replace('  if (discard) stream.queue.length = 0;', `  if (discard) {
     stream.queue.length = 0;
     stream.readRetainedBytes = 0;
@@ -627,12 +628,29 @@ async function sendBoundedRelayFrame(relay, frame) {
 }
 `;
 
+// Port 9100 also serves one-frame task observations. Only an explicitly enabled
+// continuous viewer may impose its cooldown on subsequent stream opens.
+const replacements = v6Replacements.map(([before, after]) => [before,
+  after.replace('r === 9100 && performance.now()',
+    'r === 9100 && this.continuousPreviewEnabled === true && performance.now()')]);
+const helpers = v6Helpers.replace(v6Marker, marker)
+  .replace('const preview = stream?.dport === 9100;',
+    'const preview = stream?.dport === 9100; // Reserve control capacity for ALL media, including single frames.')
+  .replace('if (preview && elapsed >= 2000)',
+    'if (preview && relay.continuousPreviewEnabled === true && elapsed >= 2000)')
+  .replace('      if (elapsed >= 20000) {', `      if (preview && relay.continuousPreviewEnabled !== true && elapsed >= 8000) {
+        throw new Error("Screenshot uplink congested");
+      }
+      if (elapsed >= 20000) {`);
+
 function digest(text) {
   return createHash("sha256").update(text).digest("hex");
 }
 // Reverse our exact edits to authenticate both fresh and previously patched files.
 const applied = source.includes(marker)
   ? { helpers, replacements }
+  : source.includes(v6Marker)
+    ? { helpers: v6Helpers, replacements: v6Replacements }
   : source.includes(v5Marker)
     ? { helpers: v5Helpers, replacements: v5Replacements }
   : source.includes(v4Marker)

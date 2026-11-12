@@ -18,7 +18,6 @@ pub(super) struct Ui {
     pub state: RwSignal<Value>,
     pub ai: RwSignal<Value>,
     pub screen: RwSignal<Value>,
-    pub preview_url: RwSignal<String>,
     pub base: RwSignal<String>,
     pub error: RwSignal<String>,
     pub config_error: RwSignal<String>,
@@ -189,7 +188,6 @@ fn App(options: JsValue) -> impl IntoView {
         state,
         ai: RwSignal::new(Value::Null),
         screen: RwSignal::new(Value::Null),
-        preview_url: RwSignal::new(String::new()),
         base: RwSignal::new(String::new()),
         error: RwSignal::new(String::new()),
         config_error: RwSignal::new(String::new()),
@@ -253,26 +251,10 @@ fn App(options: JsValue) -> impl IntoView {
         });
     });
     let session_id = Memo::new(move |_| string(&ui.session(), "id"));
-    let preview_identity = Memo::new(move |_| (string(&ui.session(), "id"), ui.ready(), ui.android()));
-    Effect::new(move |_| {
-        let (id, ready, android) = preview_identity.get();
-        ui.preview_url.set(String::new());
-        if id.is_empty() || !ready || android {
-            return;
-        }
-        let pending = ui.client.get_value().preview_stream();
-        spawn_local(async move {
-            if let Ok(url) = resolved(pending.into()).await
-                && ui.current_session(&id)
-                && ui.ready()
-            {
-                ui.preview_url.set(url.as_string().unwrap_or_default());
-            }
-        });
-    });
     let poll_stop = StoredValue::new_local(JsValue::NULL);
     Effect::new(move |_| {
         let id = session_id.get();
+        ui.busy.set(false); // An old session's pending capture cannot block this one.
         let previous = poll_stop.get_value();
         if previous.is_function() {
             let _ = apply(&previous, &JsValue::UNDEFINED, &[]);
@@ -286,14 +268,9 @@ fn App(options: JsValue) -> impl IntoView {
         let stop = start_session_polling(
             ui.client.get_value().into(),
             obj(&[
-                (
-                    "previewActive",
-                    callback(move |_| {
-                        (!ui.preview_url.get_untracked().is_empty()
-                            && ui.session()["preview"]["ageMs"].as_u64().is_some_and(|age| age <= 5000))
-                        .into()
-                    }),
-                ),
+                // iPhone captures are explicit or task-driven; idle status polling
+                // must not create MJPEG/screenshot traffic on the shared USB link.
+                ("screenshots", (ui.state.get_untracked()["session"]["platform"] == "android").into()),
                 (
                     "onScreen",
                     callback(move |image| {

@@ -89,7 +89,9 @@ pub fn start_session_polling(client: JsValue, options: JsValue) -> JsValue {
     let session = get(&get(&call(&client, "snapshot", &[]).unwrap_or_default(), "session"), "id");
     let state = Rc::new(RefCell::new(Polling { client, options, session, stopped: false, timers: vec![] }));
     tick(state.clone(), false);
-    tick(state.clone(), true);
+    if truth(&get(&state.borrow().options, "screenshots")) {
+        tick(state.clone(), true);
+    }
     callback(move |_| {
         let timers = {
             let mut s = state.borrow_mut();

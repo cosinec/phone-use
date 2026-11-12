@@ -257,7 +257,18 @@ impl BrowserClient {
     }
     #[wasm_bindgen(js_name=stopPreview)]
     pub fn stop_preview(&self) -> Promise {
-        self.session_promise("/preview/stream", "DELETE", JsValue::UNDEFINED)
+        let attempt = self.inner.borrow().attempt.clone();
+        let pending = self.session_promise("/preview/stream", "DELETE", JsValue::UNDEFINED);
+        let this = self.clone();
+        future_to_promise(async move {
+            let result = resolved(pending.into()).await?;
+            if let Some(attempt) = attempt.filter(|a| this.current(a)) {
+                let relay = attempt.borrow().relay.clone();
+                set(&relay, "continuousPreviewEnabled", &false.into());
+                set(&relay, "previewSuspendedUntil", &0.into());
+            }
+            Ok(result)
+        })
     }
     #[wasm_bindgen(js_name=previewStream)]
     pub fn preview_stream(&self) -> Promise {
@@ -277,6 +288,7 @@ impl BrowserClient {
             if !route.starts_with(&format!("/api/sessions/{id}/preview/mjpeg/")) {
                 return Err(error("无效的预览地址"));
             }
+            set(&attempt.borrow().relay, "continuousPreviewEnabled", &true.into());
             Ok(format!("{base}{route}").into())
         })
     }
@@ -641,6 +653,9 @@ impl BrowserClient {
         }
         let result = result?;
         a.borrow_mut().relay = get(&result, "relay");
+        if truth(&a.borrow().relay) {
+            set(&a.borrow().relay, "continuousPreviewEnabled", &false.into());
+        }
         if a.borrow().cancelled {
             return Ok(());
         }

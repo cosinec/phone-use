@@ -108,6 +108,7 @@ const fetchImpl = async (url, options = {}) => {
         (resolve) => (releasePreview = () => resolve(reply(held))),
       );
     }
+    if (fixture.freezeImage) return reply(fixture.image);
     fixture.frames = (fixture.frames || 0) + 1;
     canvas.getContext("2d").fillStyle = fixture.frames % 2 ? "#234" : "#567";
     canvas.getContext("2d").fillRect(0, 0, 100, 200);

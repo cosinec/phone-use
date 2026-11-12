@@ -97,7 +97,7 @@ async function pageFor(t, fixture = true) {
   await page.getByRole("heading", { name: "让手机帮你做事." }).waitFor();
   return page;
 }
-async function connect(page, platform = "ios") {
+async function connect(page, platform = "ios", capture = true) {
   await page.locator("#device-platform").selectOption(platform);
   await page.locator("#server-token").fill("explicit-fixture-controller");
   await page
@@ -112,6 +112,10 @@ async function connect(page, platform = "ios") {
       .querySelector(".connection-status")
       .textContent.includes("可以控制"),
   );
+  if (capture && platform === "ios") {
+    await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
+    await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth > 0);
+  }
 }
 
 test("production bootstrap loads Rust WASM UI with honest empty phone and accessible offline controls", async (t) => {
@@ -300,7 +304,7 @@ test("screen refresh preserves image pointer capture and text focus while manual
     await image.evaluate((node) => node === window.capturedImage),
     true,
   );
-  assert.notEqual(await image.getAttribute("src"), initialSource);
+  assert.equal(await image.getAttribute("src"), initialSource, 'idle status polling must not capture');
   assert.equal(
     await page
       .locator("#phone-text")
@@ -322,6 +326,7 @@ test("screen refresh preserves image pointer capture and text focus while manual
   await page.waitForFunction(
     () => !document.querySelector("#phone-text").disabled,
   );
+  await page.waitForFunction(source => document.querySelector('.phone-screen')?.getAttribute('src') !== source, initialSource);
   const box = await image.boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   assert.notEqual(
@@ -488,64 +493,42 @@ test("task composer supports selecting, pasting, dropping and removing reference
 });
 
 
-test('MJPEG image renders while task is running and maps native pixels back to phone points', async t => {
+test('iPhone idle and readiness changes create no video or screenshot traffic; manual capture remains available', async t => {
   const page = await pageFor(t);
-  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
-    const canvas = document.createElement('canvas'); canvas.width = 400; canvas.height = 800;
-    canvas.getContext('2d').fillRect(0, 0, 400, 800);
-    return canvas.toDataURL('image/jpeg').split(',')[1];
-  }), 'base64');
-  await page.evaluate(() => {
-    fixture.enableStream = true;
-    fixture.state.daemon.persisted = { screen: { width: 100, height: 200 } };
-    fixture.state.preview = { state: 'streaming', ageMs: 10 };
-  });
+  await page.evaluate(() => { fixture.enableStream = true; });
+  await connect(page, 'ios', false);
+  await page.getByRole('heading', {name: '设备截图', exact: true}).waitFor();
+  await page.waitForFunction(() => fixture.calls.filter(c => c.url?.endsWith('/session-1')).length >= 4);
+  assert.equal(await page.locator('.phone-screen').count(), 0);
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview')).length), 0);
+  await page.evaluate(() => { fixture.state.daemon.state.state = 'wda_starting'; });
+  await page.waitForFunction(() => document.querySelector('.connection-status').textContent.includes('WDA 准备中'));
+  await page.evaluate(() => { fixture.state.daemon.state.state = 'ready'; });
+  await page.waitForFunction(() => document.querySelector('.connection-status').textContent.includes('可以控制'));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview')).length), 0);
+  await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 100);
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length), 1);
+  await page.locator('.screen-meta').filter({hasText: '最近一次截图（非实时）'}).waitFor();
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview/stream')).length), 0);
+});
+
+test('on-demand screenshots retain rotation and manual gestures without a continuous viewer', async t => {
+  const page = await pageFor(t);
   await connect(page);
-  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 400);
-  await page.getByText('连续画面', { exact: true }).waitFor();
   const image = page.locator('.phone-screen');
   const box = await image.boundingBox();
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   await page.waitForFunction(() => fixture.calls.some(c => c.body?.tool === 'iphone_tap'));
   const tap = await page.evaluate(() => fixture.calls.find(c => c.body?.tool === 'iphone_tap').body);
   assert.ok(Math.abs(tap.args.x - 50) < 1); assert.ok(Math.abs(tap.args.y - 100) < 1);
-  await page.locator('#task-instruction').fill('Inspect current screen');
-  await page.getByRole('button', { name: /开始任务/ }).click();
-  await page.waitForFunction(() => document.querySelector('.task-status')?.textContent.includes('等待你的确认'));
-  assert.equal(await image.getAttribute('src'), '/api/sessions/session-1/preview/mjpeg/browser-fixture');
-  assert.equal(await image.evaluate(img => img.naturalHeight), 800);
-  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
-    const canvas = document.createElement('canvas'); canvas.width = 800; canvas.height = 400;
-    canvas.getContext('2d').fillRect(0, 0, 800, 400);
-    return canvas.toDataURL('image/jpeg').split(',')[1];
-  }), 'base64');
-  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 800);
-  await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'), null, { timeout: 4000 });
-  await page.getByRole('button', {name: '暂停连续画面', exact: true}).click();
-  await page.waitForFunction(() => fixture.calls.some(c => c.url?.endsWith('/preview/stream') && c.method === 'DELETE'));
-  await page.waitForFunction(() => document.querySelector('.phone-screen')?.src.startsWith('data:image/jpeg;base64,'));
-});
-
-test('a stale continuous preview falls back to fresh screenshots and permits manual control', async t => {
-  const page = await pageFor(t);
-  t.after(() => { streamFixtureBytes = undefined; });
-  streamFixtureBytes = Buffer.from(await page.evaluate(() => fixture.image.imageBase64), 'base64');
+  // Change the fixture's next image to landscape.
   await page.evaluate(() => {
-    fixture.enableStream = true;
-    fixture.state.preview = {state: 'streaming', ageMs: 10};
+    const canvas = document.createElement('canvas'); canvas.width = 200; canvas.height = 100;
+    fixture.image.imageBase64 = canvas.toDataURL('image/jpeg').split(',')[1];
+    fixture.freezeImage = true;
   });
-  await connect(page);
-  await page.getByText('连续画面', {exact: true}).waitFor();
-  // Upstream can keep the multipart HTTP response open while its USB video
-  // connection is paused. A browser error event is not required for fallback.
-  await page.evaluate(() => { fixture.state.preview = {state: 'waiting'}; });
-  await page.locator('.screen-meta').filter({hasText: '截图预览（连续画面已暂停）'}).waitFor({timeout: 12000});
-  await page.waitForFunction(() => document.querySelector('.phone-screen')?.src.startsWith('data:image/jpeg;base64,'));
-  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview/stream') && c.method === 'DELETE').length), 1);
-  const image = page.locator('.phone-screen');
-  const box = await image.boundingBox();
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  await page.waitForFunction(() => fixture.calls.some(c => c.body?.tool === 'iphone_tap'));
-  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.body?.tool === 'iphone_tap').length), 1);
-  assert.equal(await page.getByRole('button', {name: '刷新屏幕', exact: true}).isEnabled(), true);
+  await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview/stream')).length), 0);
 });

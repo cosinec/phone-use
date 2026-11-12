@@ -145,7 +145,12 @@ impl<T: Transport> WdaClient<T> {
         let encoding = StepTimer::new("request_json_encode");
         let body = body.map(|b| b.to_string().into_bytes());
         encoding.finish(true);
-        let (status, raw) = self.transport.send(method, path, body, timeout).await.map_err(|e| match e.kind() {
+        let response = if method == "GET" && path == "/status" {
+            self.transport.health().await
+        } else {
+            self.transport.send(method, path, body, timeout).await
+        };
+        let (status, raw) = response.map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => WdaError::Timeout(e.to_string()),
             crate::http::AFTER_SENT => WdaError::Interrupted(e.to_string()),
             _ => WdaError::Unavailable(e.to_string()),
@@ -246,7 +251,7 @@ impl<T: Transport> WdaClient<T> {
     }
 
     pub async fn ready(&self) -> Result<bool> {
-        Ok(self.call("GET", "/status", None, Duration::from_secs(5)).await?["value"]["ready"] == true)
+        Ok(self.call("GET", "/status", None, Duration::from_secs(15)).await?["value"]["ready"] == true)
     }
 
     /// 当前方向下的屏幕点尺寸（转屏后宽高跟着变）

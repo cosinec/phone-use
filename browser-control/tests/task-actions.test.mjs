@@ -140,3 +140,23 @@ for (const heldRoute of ["confirm", "status"])
     );
     await client.disconnect();
   });
+
+
+test('a held action in an old session cannot block a new capture or clear its busy state', async () => {
+  const old = deferred(), fresh = deferred();
+  let session = {id: 'old'}, busy = false, refreshes = 0;
+  const actions = mod.createTaskActions({
+    snapshot: () => ({session}), refresh: async () => { refreshes++; },
+  }, {onBusy: value => { busy = value; }, onError() {}});
+  const first = actions.run(() => old.promise);
+  session = {id: 'new'};
+  let captures = 0;
+  const second = actions.run(() => { captures++; return fresh.promise; });
+  assert.equal(captures, 1);
+  old.resolve(); await first;
+  assert.equal(busy, true, 'a stale completion must not release the new session action');
+  assert.equal(refreshes, 0);
+  fresh.resolve(); await second;
+  assert.equal(busy, false);
+  assert.equal(refreshes, 1);
+});

@@ -72,10 +72,14 @@ function fixture(overrides = {}) {
   };
 }
 test('stopping continuous preview sends an authenticated DELETE without disconnecting the phone', async t => {
-  const {client, calls} = fixture();
+  const {client, calls, relay} = fixture();
   t.after(() => client.disconnect());
   await client.connect({apiBase: 'http://cloud', accessToken: 'token'});
+  relay.continuousPreviewEnabled = true;
+  relay.previewSuspendedUntil = 999999;
   await client.stopPreview();
+  assert.equal(relay.continuousPreviewEnabled, false);
+  assert.equal(relay.previewSuspendedUntil, 0);
   assert.ok(calls.some(c => c[0] === 'fetch' && c[1].endsWith('/preview/stream') && c[2].method === 'DELETE'));
   assert.ok(!calls.some(c => c[0] === 'relay.close'));
 });

@@ -132,3 +132,18 @@ Appium WDA v16.15.3 的 `FBScreenshot.takeWithScreenID` 最终将图片转换为
 现在 vendor 保留原上游 `89702099`，只在进程启动返回路径解析原始归档的 NSError：输出 domain、code、选定的本地化描述/失败原因以及 underlying error 链。新增 `phone_process_launch_failed` 包含 error_domain/error_code/error_depth，并继承 runner_id；解析出的有界错误链进入既有 `xctest_exited.reason` 和启动失败状态。不会输出整个归档、未知 userInfo、启动环境或参数。解析上限为 256 KiB 归档、4096 个对象、16 次 UID 间接引用、8 层错误链、每段文本 512 字符、最终消息 2048 字符；循环和非法引用安全停止。没有改变成功 PID 的解释、启动策略或增加重试。
 
 手动点开 WDA 后退出与服务端 XCTest 启动返回错误应分别记录；手动表现本身不足以确定拒绝启动的根因。实际原因必须重新发起一次受控启动，读到解码后的 domain/code/underlying error 后再判断。
+
+
+## 按需采图与探活确认窗口（2026-11-12）
+
+本节是当前策略，替代前文 v6 的自动预览及截图轮询行为。
+
+- iPhone 网页连接或 WDA 恢复就绪后不再请求连续预览，也不启动后台截图轮询。每秒会话状态刷新不采图。用户点击“刷新屏幕”、手动控制后的核对、AI 任务自身观察仍按需截图；Android 保留既有截图刷新。
+- 9100 仍用于读取单帧 JPEG，关闭实时画面不等于禁用截图服务。所有 9100 媒体保留 128 KiB WebSocket 额度，8100 控制/探活保留更大的额度；这只是共享链路的容量隔离，不会抢占已发送的数据或 WDA 内部正在执行的操作。
+- SDK v7 仅在 `continuousPreviewEnabled=true` 时启用连续预览的 2 秒拥塞保护与 30 秒冷却。单帧不受旧冷却阻挡，持续拥塞 8 秒后只关闭该截图流；不关闭整个 relay，不设置后续截图冷却。显式停止预览成功后清除该标志与冷却。安装器验证 v1～v6 到 v7 的迁移和校验。
+- `/status` 探活使用独立连接池，不等待普通 HTTP 请求占用的连接锁。建连上限 10 秒，应答阶段预算 5 秒，请求总上限 15 秒（含连接池等待及重试）；取消或失败连接不放回池。普通控制请求的时限和“不重放已发动作”规则保持不变。
+- 连接、连接池等待或请求派发失败归类为 `transport_unavailable`，不累计为杀死存活 runner 的证据。至少 3 次连续应答失败、且首尾失败间隔达到 60 秒，才重启仍存活的 WDA；任一次探活成功或无法确认的传输故障清空该证据。真实 XCTest 退出继续立即进入原有恢复流程。这能减少短暂延迟触发的重启，不能证明 WDA 内部永不挂起；如果端口持续不可达而 XCTest 任务仍存活，本策略不会仅据此无限重启，需排查连接或重新连接设备。
+
+每次健康失败写入 `event=wda_health_failed`，包括 `category`（`transport_unavailable` / `response_timeout` / `response_interrupted` / `response_error` / `not_ready`）、`consecutive_failures`、`failure_window_ms`、`confirm_window_ms`、`elapsed_ms`、`runner_alive` 和 `restart`。HTTP `http_budget` 区分探活并记录总预算与应答预算；`http_complete` 继续记录具体等待阶段。结合 `wda_restart` 与手机生命周期回调，可区分服务端主动重启和 XCTest 自行退出。
+
+验证需包含：空闲及就绪状态切换无媒体请求、手动截图与手势、旧会话延迟请求不阻塞新会话、慢建连后的响应预算、普通请求占用连接时探活仍可进行、真实无应答仍有界、持续失败与恢复清零、SDK 冷却隔离及控制通道保留。合成测试不能代替部署后的真机稳定性验证。

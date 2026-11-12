@@ -888,6 +888,7 @@ test('the native WebSocket queue stays within its preview budget under continuou
 
 test('sustained preview congestion resets the preview, enforces cooldown, and preserves the control connection', async t => {
   const f = await fixture(t), preview = await f.open(1, 9100), control = await f.open(2);
+  f.relay.continuousPreviewEnabled = true;
   let now = 100;
   t.mock.method(performance, 'now', () => now);
   f.relay.socket.bufferedAmount = 128 * 1024;
@@ -978,4 +979,28 @@ test('the stream count bounds total receive retention and refuses excess opens e
   assert.equal(f.relay.streams.size, 64);
   assert.equal(f.target.session.streams.size, 64);
   assert.equal(JSON.parse(new TextDecoder().decode(f.frames.find(frame => frame.type === 3 && frame.streamId === 65).payload)).ok, false);
+});
+
+
+test('one-frame captures bypass viewer cooldown, retain media limits and do not pause subsequent screenshots', async t => {
+  const f = await fixture(t);
+  let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  f.relay.previewSuspendedUntil = 30100;
+  f.relay.continuousPreviewEnabled = false;
+  const screenshot = await f.open(1, 9100), control = await f.open(2);
+  assert.ok(screenshot, 'a viewer cooldown must not block task observations');
+  f.relay.socket.bufferedAmount = 128 * 1024;
+  f.packet(screenshot, 16, new Uint8Array([1]));
+  await f.wait(() => f.relay.uplinkWaiters === 1);
+  now += 2001;
+  f.packet(control, 16, new Uint8Array([42]));
+  await f.wait(() => f.frames.some(frame => frame.type === 4 && frame.streamId === 2));
+  assert.equal(f.frames.filter(frame => frame.type === 4 && frame.streamId === 1).length, 0);
+  assert.equal(f.relay.previewPauses ?? 0, 0);
+  now += 6000;
+  await f.wait(() => f.frames.some(frame => frame.type === 5 && frame.streamId === 1));
+  assert.equal(f.relay.closed, false);
+  assert.equal(f.relay.streams.get(2), control);
+  assert.ok(await f.open(3, 9100));
 });

@@ -126,20 +126,35 @@ impl MuxWatch {
     }
 }
 
-/// WDA 连续几次探测不通才算挂（避免一次慢请求就重启它）
+/// Only sustained response failures justify restarting a still-live runner.
+/// Link/connect failures reset this evidence; they do not prove WDA is hung.
 #[derive(Debug, Default)]
-pub struct Misses(u32);
+pub struct Misses {
+    count: u32,
+    since: Option<Instant>,
+}
 
 impl Misses {
     pub const LIMIT: u32 = 3;
 
-    pub fn hit(&mut self) -> bool {
-        self.0 += 1;
-        self.0 >= Self::LIMIT
+    pub const CONFIRM_WINDOW: Duration = Duration::from_secs(60);
+
+    pub fn hit(&mut self, now: Instant) -> bool {
+        let since = *self.since.get_or_insert(now);
+        self.count = self.count.saturating_add(1);
+        self.count >= Self::LIMIT && now.saturating_duration_since(since) >= Self::CONFIRM_WINDOW
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub fn elapsed(&self, now: Instant) -> Duration {
+        self.since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
     pub fn reset(&mut self) {
-        self.0 = 0;
+        *self = Self::default();
     }
 }
 
@@ -229,14 +244,17 @@ mod tests {
     }
 
     #[test]
-    fn misses_need_three_in_a_row() {
+    fn misses_need_sustained_failures_and_reset_after_recovery_or_link_uncertainty() {
+        let now = Instant::now();
         let mut m = Misses::default();
-        assert!(!m.hit());
-        assert!(!m.hit());
-        m.reset();
-        assert!(!m.hit());
-        assert!(!m.hit());
-        assert!(m.hit());
+        assert!(!m.hit(now));
+        assert!(!m.hit(now + Duration::from_secs(10)));
+        assert!(!m.hit(now + Duration::from_secs(20)), "three fast misses cannot kill a live runner");
+        assert!(m.hit(now + Duration::from_secs(60)));
+        m.reset(); // A successful response OR an unconfirmed link failure breaks the sequence.
+        assert!(!m.hit(now + Duration::from_secs(61)));
+        assert!(!m.hit(now + Duration::from_secs(121)), "also require at least three failures");
+        assert!(m.hit(now + Duration::from_secs(122)));
     }
 
     #[test]

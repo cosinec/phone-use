@@ -12,7 +12,7 @@ test('a stalled screenshot does not block status polling, and late frames are di
     screen: () => new Promise(resolve => { release = resolve; }),
   };
   const stop = startSessionPolling(client, {
-    onScreen: value => frames.push(value), onError: value => errors.push(value),
+    screenshots: true, onScreen: value => frames.push(value), onError: value => errors.push(value),
     schedule: (fn, ms) => { const id = Symbol(); timers.set(id, { fn, ms }); return id; },
     unschedule: id => timers.delete(id),
   });
@@ -37,9 +37,34 @@ test('a reconnect to the same phone cannot receive the previous session image', 
   const stop = startSessionPolling({
     snapshot: () => ({ session }), refresh: async () => session,
     screen: () => new Promise(resolve => { release = resolve; }),
-  }, { onScreen: frame => frames.push(frame), onError: () => {} });
+  }, { screenshots: true, onScreen: frame => frames.push(frame), onError: () => {} });
   session = { ...session, id: 'new' };
   release({ deviceId: 'phone', imageBase64: 'old-image' });
   await new Promise(resolve => setImmediate(resolve));
   stop(); assert.deepEqual(frames, []);
+});
+
+
+test('default idle polling refreshes status without opening any screen requests', async () => {
+  const timers = new Map(); let screens = 0, refreshes = 0;
+  const session = { id: 'ios', deviceId: 'phone', ready: true, daemon: {state: {state: 'ready'}} };
+  const stop = startSessionPolling({
+    snapshot: () => ({session}), refresh: async () => { refreshes++; return session; },
+    screen: async () => { screens++; return {deviceId: 'phone'}; },
+  }, {
+    onScreen() {}, onError() {},
+    schedule: (fn, ms) => { const id = Symbol(); timers.set(id, {fn, ms}); return id; },
+    unschedule: id => timers.delete(id),
+  });
+  for (let i = 0; i < 5; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+    const [id, timer] = [...timers.entries()][0];
+    assert.equal(timer.ms, 1000);
+    timers.delete(id); timer.fn();
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  stop();
+  assert.equal(screens, 0);
+  assert.equal(refreshes, 6);
+  assert.equal(timers.size, 0);
 });

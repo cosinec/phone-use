@@ -117,6 +117,12 @@ pub trait Transport: Send + Sync {
         async { Ok(None) }
     }
 
+    /// Read-only liveness probe. Device transports reserve a separate connection
+    /// and give the response its own budget after connecting.
+    fn health(&self) -> impl Future<Output = std::io::Result<(u16, Vec<u8>)>> + Send {
+        self.send("GET", "/status", None, Duration::from_secs(15))
+    }
+
     fn send(
         &self,
         method: &str,
@@ -132,6 +138,7 @@ pub struct DeviceTransport {
     provider: Arc<dyn IdeviceProvider>,
     port: u16,
     idle: Arc<Mutex<Option<IdleConnection>>>,
+    health_idle: Arc<Mutex<Option<IdleConnection>>>,
 }
 
 struct IdleConnection {
@@ -141,7 +148,7 @@ struct IdleConnection {
 
 impl DeviceTransport {
     pub fn new(provider: Arc<dyn IdeviceProvider>, port: u16) -> Self {
-        Self { provider, port, idle: Arc::new(Mutex::new(None)) }
+        Self { provider, port, idle: Arc::new(Mutex::new(None)), health_idle: Arc::new(Mutex::new(None)) }
     }
 }
 
@@ -182,7 +189,11 @@ impl Transport for DeviceTransport {
         result.map(Some)
     }
 
-    #[tracing::instrument(name = "wda_http", skip_all, fields(http_id = NEXT_HTTP.fetch_add(1, Ordering::Relaxed), native_pid = std::process::id(), method = method, route = path.split('?').next().unwrap_or(path)))]
+    async fn health(&self) -> std::io::Result<(u16, Vec<u8>)> {
+        let transport = Self { idle: self.health_idle.clone(), ..self.clone() };
+        transport.request("GET", "/status", None, Duration::from_secs(15), Some(Duration::from_secs(5))).await
+    }
+
     async fn send(
         &self,
         method: &str,
@@ -190,8 +201,24 @@ impl Transport for DeviceTransport {
         body: Option<Vec<u8>>,
         timeout: Duration,
     ) -> std::io::Result<(u16, Vec<u8>)> {
+        self.request(method, path, body, timeout, None).await
+    }
+}
+
+impl DeviceTransport {
+    #[tracing::instrument(name = "wda_http", skip_all, fields(http_id = NEXT_HTTP.fetch_add(1, Ordering::Relaxed), native_pid = std::process::id(), method = method, route = path.split('?').next().unwrap_or(path)))]
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+        response_timeout: Option<Duration>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
         let started = Instant::now();
         let req = build_request(method, path, body.as_deref());
+        tracing::info!(event = "http_budget", health = response_timeout.is_some(), total_budget_ms = timeout.as_millis() as u64,
+            response_budget_ms = ?response_timeout.map(|t| t.as_millis() as u64));
         let mut trace = HttpTrace::new(req.len());
         let mut stage = "pool";
         let mut write_started = false;
@@ -246,7 +273,17 @@ impl Transport for DeviceTransport {
                 // From the first write onward a mutation may have reached WDA.
                 // Keep this true even if a GET retries its stale connection.
                 write_started = true;
-                let response = exchange(&mut *socket, &req, &mut stage, &mut trace).await;
+                let response = if let Some(budget) = response_timeout {
+                    match tokio::time::timeout(budget, exchange(&mut *socket, &req, &mut stage, &mut trace)).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            timed_out = true;
+                            return Err(std::io::ErrorKind::TimedOut.into());
+                        }
+                    }
+                } else {
+                    exchange(&mut *socket, &req, &mut stage, &mut trace).await
+                };
                 match response {
                     Ok((status, body, reusable)) => {
                         if reusable {
@@ -278,6 +315,11 @@ impl Transport for DeviceTransport {
             );
             tracing::warn!("{detail}");
             result = Err(std::io::Error::new(kind, detail));
+        }
+        // Failure before a health response starts is link/dispatch uncertainty,
+        // not evidence that a live XCTest process should be terminated.
+        if response_timeout.is_some() && stage != "read" {
+            result = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string()));
         }
         tracing::debug!(
             "wda {method} {short} ({:.2}s), stage={stage}, reused={reused_connection}, ok={}",
@@ -625,6 +667,54 @@ mod tests {
             assert!(text.contains("max_read_wait_ms="), "{text}");
             assert!(text.contains(if cancelled { "cancelled" } else { "response_body_bytes=23" }), "{text}");
             assert!(!text.contains("private-token") && !text.contains("very-private-image-data"), "{text}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_has_a_separate_pool_and_response_budget_after_slow_connect() {
+        let (client, peer) = tokio::io::duplex(65536);
+        let provider = Arc::new(Provider {
+            sockets: SyncMutex::new(VecDeque::from([client])),
+            connects: AtomicUsize::new(0),
+            connect_delay: Duration::from_secs(4),
+        });
+        let transport = DeviceTransport::new(provider, 8100);
+        let _busy_action_pool = transport.idle.lock().await;
+        let server = tokio::spawn(async move {
+            let mut peer = peer;
+            let bytes = request(&mut peer).await;
+            assert!(bytes.starts_with(b"GET /status "));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            ok(&mut peer).await;
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(transport.health().await.unwrap().0, 200);
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_response_deadline_and_connection_deadline_remain_bounded() {
+        for connect_delay in [Duration::from_secs(4), Duration::from_secs(20)] {
+            let (client, _peer) = tokio::io::duplex(65536);
+            let provider = Arc::new(Provider {
+                sockets: SyncMutex::new(VecDeque::from([client])),
+                connects: AtomicUsize::new(0),
+                connect_delay,
+            });
+            let transport = DeviceTransport::new(provider, 8100);
+            let started = tokio::time::Instant::now();
+            let error = transport.health().await.unwrap_err();
+            if connect_delay.as_secs() == 4 {
+                assert_eq!(started.elapsed(), Duration::from_secs(9));
+                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("stage=read"));
+            } else {
+                assert_eq!(started.elapsed(), Duration::from_secs(10));
+                assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+                assert!(error.to_string().contains("stage=connect"));
+            }
+            assert!(transport.health_idle.lock().await.is_none());
         }
     }
 
