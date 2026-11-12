@@ -1,222 +1,113 @@
-name: Release
+name: Build and deploy VPS
 
-# 推送 v* tag 时：多架构镜像推到 ghcr（各架构在原生 runner 上构建，不用 QEMU 模拟），
-# 附 SBOM 和构建来源证明；Linux 和 macOS 二进制及 sha256 附在 GitHub Release 上，发布说明取自 CHANGELOG.md 和 CHANGELOG.zh-CN.md。
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
 
 permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/derrors/iphone-control
+  IMAGE: ghcr.io/trash-boy/phone-use
 
 jobs:
-  # 从源码运行（不用 Docker）的用户直接下载。在 Ubuntu 22.04 上编译（glibc 2.35），
-  # 所以 Debian 12、Ubuntu 22.04 及更新的发行版都能运行
-  binaries:
-    strategy:
-      matrix:
-        include:
-          # 文件名用 linux-<arch>（arch 与 uname -m 一致），不用 Rust 的 target 名（x86_64-unknown-linux-gnu）
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            arch: x86_64
-          - runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            arch: aarch64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-      - run: cargo build --release --locked -p iphone-control
-      - name: Package
-        run: |
-          name="iphone-control-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
-          mkdir -p "dist/$name"
-          cp target/release/iphone-control LICENSE THIRD_PARTY.md README.md README.zh-CN.md CHANGELOG.md CHANGELOG.zh-CN.md "dist/$name/"
-          cp -r deploy "dist/$name/"
-          cp .env.example "dist/$name/env.example"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-      - uses: actions/upload-artifact@v7
-        with:
-          name: bin-${{ matrix.arch }}
-          path: dist/*.tar.gz*
-          if-no-files-found: error
-
   image:
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            platform: linux/amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux/arm64
-    runs-on: ${{ matrix.runner }}
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
     steps:
       - uses: actions/checkout@v7
-      - name: Platform name
-        run: echo "PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
-        env:
-          PLATFORM: ${{ matrix.platform }}
-      - id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE }}
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # 按 digest 推送，最后一步再合成一个多架构清单打标签
-      - id: build
+      - name: Build complete web and native image
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: docker/Dockerfile
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ env.PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ env.PAIR }}
-          sbom: true
-          provenance: mode=max
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          touch "/tmp/digests/${DIGEST#sha256:}"
+          file: browser-control/Dockerfile
+          platforms: linux/amd64
+          build-args: WEB_BASE=/iphone/
+          load: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=web-vps-amd64
+          cache-to: type=gha,mode=max,scope=web-vps-amd64
+      - name: Smoke test the release image before publishing
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-      - uses: actions/upload-artifact@v7
-        with:
-          name: digests-${{ env.PAIR }}
-          path: /tmp/digests/*
-          if-no-files-found: error
+          RELEASE_IMAGE: ${{ env.IMAGE }}:sha-${{ github.sha }}
+        run: bash deploy/smoke-image.sh "$RELEASE_IMAGE"
+      - name: Publish immutable image digest
+        id: publish
+        env:
+          RELEASE_IMAGE: ${{ env.IMAGE }}:sha-${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$RELEASE_IMAGE"
+          image=$(docker image inspect "$RELEASE_IMAGE" --format '{{index .RepoDigests 0}}')
+          [[ "$image" =~ ^ghcr.io/trash-boy/phone-use@sha256:[0-9a-f]{64}$ ]]
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
-  publish-image:
+  deploy:
     needs: image
-    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-      - id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE }}
-          # v1.2.3 → 1.2.3、1.2、latest（预发布版本如 v1.2.3-rc.1 只打自己的版本号，不动 latest）
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create multi-arch manifest
-        working-directory: /tmp/digests
-        run: |
-          # shellcheck disable=SC2046
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "$IMAGE@sha256:%s " *)
-      - name: Inspect
-        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-
-  release:
-    needs: [binaries, publish-image]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+      packages: read
+    environment:
+      name: vps-production
+      url: https://amazingly.top/iphone/
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          pattern: bin-*
-          merge-multiple: true
-      # 英文、中文各一节，末尾一行镜像和下载说明。两个文件都要有这个版本的一节，缺了就失败
-      - name: Release notes from CHANGELOG.md and CHANGELOG.zh-CN.md
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          section() {
-            # 「## [1.2.3]」到下一个「## [」之间，去掉链接定义行和首尾空行
-            awk -v v="$version" '
-              /^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
-              found && !/^\[[^]]+\]: / { print }
-            ' "$1" | sed -e '/./,$!d' | sed -e ':a' -e '/^\n*$/{$d;N;ba' -e '}'
-          }
-          en=$(section CHANGELOG.md)
-          zh=$(section CHANGELOG.zh-CN.md)
-          for f in en zh; do
-            if [ -z "${!f}" ]; then
-              echo "更新日志（$f）里没有 ## [$version] 一节" >&2
-              exit 1
-            fi
-          done
-          {
-            echo "## English"; echo; echo "$en"; echo
-            echo "## 中文"; echo; echo "$zh"; echo
-            echo "---"; echo
-            echo "**Docker:** \`${IMAGE}:${version}\` (linux/amd64, linux/arm64)"; echo
-            echo "**Binaries / 二进制:** \`linux-x86_64\`, \`linux-aarch64\` (glibc 2.34+), \`macos-arm64\` (macOS 11+, Apple Silicon)"
-          } > notes.md
-      - name: Create release
-        run: |
-          flags=()
-          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"
+      - name: Configure dedicated SSH key and pinned host key
         env:
-          GH_TOKEN: ${{ github.token }}
-
-  # macOS（Apple Silicon）二进制，Release 建好后再传上去：GitHub 的 macOS runner 经常排队，
-  # 排不上时（15 分钟后被取消）不拖住镜像和 Linux 二进制，重跑这个任务就能补上。
-  # 文件名里的 arm64 与 Mac 上 uname -m 一致。没有公证（要付费开发者账号）：链接器自带 ad-hoc 签名能直接运行，
-  # 用终端 curl 下载不带隔离标记；浏览器下载的要去掉 com.apple.quarantine（见 macOS 指南）
-  macos-binary:
-    needs: release
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-aarch64-apple-darwin
-      - run: cargo build --release --locked -p iphone-control
-      - name: Check
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        shell: bash
         run: |
-          file target/release/iphone-control
-          codesign --verify --verbose target/release/iphone-control
-          target/release/iphone-control --version
-      # 不带 deploy/（systemd 服务文件，Mac 上用不到）
-      - name: Package
-        run: |
-          name="iphone-control-${GITHUB_REF_NAME}-macos-arm64"
-          mkdir -p "dist/$name"
-          cp target/release/iphone-control LICENSE THIRD_PARTY.md README.md README.zh-CN.md CHANGELOG.md CHANGELOG.zh-CN.md "dist/$name/"
-          cp .env.example "dist/$name/env.example"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
-      - name: Upload to the release
-        run: gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/vps-ssh"
+          printf '%s\n' "$VPS_SSH_KEY" > "$RUNNER_TEMP/vps-ssh/key"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$RUNNER_TEMP/vps-ssh/known_hosts"
+      - name: Deploy exact digest and verify, with rollback on failure
         env:
-          GH_TOKEN: ${{ github.token }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          RELEASE_IMAGE: ${{ needs.image.outputs.image }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # JSON travels on stdin; neither the token nor server config is an SSH argument.
+          python3 - <<'PY' | ssh -T -i "$RUNNER_TEMP/vps-ssh/key" -p "$VPS_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/vps-ssh/known_hosts" \
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+            "$VPS_USER@$VPS_HOST"
+          import json, os
+          print(json.dumps({
+              "image": os.environ["RELEASE_IMAGE"],
+              "revision": os.environ["GITHUB_SHA"],
+              "branch": os.environ["GITHUB_REF_NAME"],
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "registryUser": os.environ["GITHUB_ACTOR"],
+              "registryToken": os.environ["GH_TOKEN"],
+          }))
+          PY
+      - name: Remove SSH material
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/vps-ssh"
