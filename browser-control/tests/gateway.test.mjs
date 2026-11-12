@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { fixtureImageBase64 } from './fixtures/screen-image.mjs';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import net from 'node:net';
@@ -265,7 +266,7 @@ test('two sessions are isolated, duplicate sockets reject, commands validate/ded
   assert.equal(JSON.parse(values[0].text).taps, 1);
   assert.equal((await app.api(route, first.token, { ...command, args: { x: 2, y: 2 } })).status, 409);
   const screen = await (await app.api(`/api/sessions/${first.id}/screen`, first.token)).json();
-  assert.equal(screen.imageBase64, 'aW1hZ2U=');
+  assert.equal(screen.imageBase64, fixtureImageBase64);
   assert.equal(screen.caption, 'fixture points 390×844');
   assert.equal(screen.deviceId, device.serialNumber);
   assert.equal(JSON.parse(screen.elementsText).request.op, 'list_elements');
