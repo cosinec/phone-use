@@ -74,6 +74,14 @@ class DeployTests(unittest.TestCase):
         config_dir = login[0][2]
         self.assertFalse(Path(config_dir).exists())
 
+    def test_opaque_registry_token_reaches_docker_stdin_without_becoming_an_argument(self):
+        payload = request()
+        payload["registryToken"] = "opaque.token-with+/=~punctuation"
+        self.deploy(payload)
+        login = next((args, kwargs) for args, kwargs in self.calls if "login" in args)
+        self.assertEqual(login[1]["input"], payload["registryToken"])
+        self.assertNotIn(payload["registryToken"], " ".join(login[0]))
+
     def test_failed_health_restores_compose_and_record_and_restarts(self):
         self.health.side_effect = [RuntimeError("new image unhealthy"), None]
         with self.assertRaisesRegex(RuntimeError, "rolled back"):
@@ -95,7 +103,9 @@ class DeployTests(unittest.TestCase):
                            ("revision", "HEAD; rm -rf /"), ("branch", "main"),
                            ("branch", "release-x/subbranch"), ("branch", "release-"),
                            ("runId", "../escape"), ("attempt", "0"),
-                           ("registryUser", "--config=evil"), ("registryToken", "a\nb")]:
+                           ("registryUser", "--config=evil"), ("registryToken", "a\nb"),
+                           ("registryToken", ""), ("registryToken", "a" * 8193),
+                           ("registryToken", "a\x00b")]:
             with self.subTest(key=key, value=value):
                 payload = request()
                 payload[key] = value

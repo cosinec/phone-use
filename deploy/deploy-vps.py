@@ -36,7 +36,8 @@ def validate(payload):
         "runId": r"[1-9][0-9]{0,19}",
         "attempt": r"[1-9][0-9]{0,3}",
         "registryUser": r"[A-Za-z0-9][A-Za-z0-9_\[\]-]{0,99}",
-        "registryToken": r"[A-Za-z0-9_]{1,4096}",
+        # Registry credentials are opaque and travel only on stdin, never in shell commands.
+        "registryToken": r"[\x21-\x7e]{1,8192}",
     }
     if not isinstance(payload, dict):
         raise ValueError("Expected an object")
