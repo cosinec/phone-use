@@ -76,7 +76,7 @@ python3.11 -m venv .venv
 
 `--prepare` 预先下载 `PP-OCRv5_mobile_det` 和 `PP-OCRv5_mobile_rec`。模型支持中英文，缓存默认位于运行用户的 `~/.paddlex`，可用 `PADDLE_PDX_CACHE_HOME` 指定目录。网关按需启动同一容器内的常驻 Python 子进程，初始化一次并逐张识别。文档方向分类、文档矫正和文本行方向分类均关闭，文字坐标对应输入图片像素。工作进程的标准输出仅传输 JSONL，依赖库的原生输出被抑制，失败返回固定错误信息。
 
-固定依赖为 PaddlePaddle 3.3.1、PaddleOCR 3.7.0 和 PaddleX 3.7.2。CPU 容器使用 Linux amd64，Mac arm64 可用于本地开发。镜像构建时安装 Python 依赖并预下载模型，`OCR_PYTHON=/opt/ocr/bin/python3`、`OCR_WORKER=/app/ocr/worker.py` 已写入镜像。模型缓存保留在容器内运行用户目录。版本与参数依据 [官方安装说明](https://www.paddleocr.ai/main/en/quick_start.html)、[官方 OCR 参数](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/OCR.en.md)、[PaddlePaddle PyPI](https://pypi.org/project/paddlepaddle/3.3.1/) 和 [PaddleOCR PyPI](https://pypi.org/project/paddleocr/3.7.0/)。
+固定依赖为 PaddlePaddle 3.2.2（3.3.x 在 Linux amd64 CPU 上开启 oneDNN 时推理会崩溃）、PaddleOCR 3.7.0 和 PaddleX 3.7.2。CPU 容器使用 Linux amd64，Mac arm64 可用于本地开发。镜像构建时安装 Python 依赖并预下载模型，`OCR_PYTHON=/opt/ocr/bin/python3`、`OCR_WORKER=/app/ocr/worker.py` 已写入镜像。模型缓存保留在容器内运行用户目录。版本与参数依据 [官方安装说明](https://www.paddleocr.ai/main/en/quick_start.html)、[官方 OCR 参数](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/OCR.en.md)、[PaddlePaddle PyPI](https://pypi.org/project/paddlepaddle/3.2.2/) 和 [PaddleOCR PyPI](https://pypi.org/project/paddleocr/3.7.0/)。
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，在页面粘贴服务器访问令牌并点击「连接 iPhone」。令牌仅在本页内存中使用。首次连接需要解锁手机、信任电脑，并根据原生向导完成开发者模式、Apple 账号与 WDA 签名。
 

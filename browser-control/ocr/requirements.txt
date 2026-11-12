@@ -1,6 +1,9 @@
 # CPU wheels, verified against the official PyPI packages and PaddleOCR 3.x API.
 # Linux runtime targets amd64. macOS arm64 is supported for local development.
-paddlepaddle==3.3.1
+# 3.3.x crashes on Linux amd64 CPU with oneDNN enabled (PIR onednn_instruction:
+# "ConvertPirAttribute2RuntimeAttribute not support ArrayAttribute<DoubleAttribute>").
+# 3.2.2 runs the same PP-OCRv5 mobile models with oneDNN, about 1 s per full frame.
+paddlepaddle==3.2.2
 paddleocr==3.7.0
 paddlex==3.7.2
 numpy==2.2.6
