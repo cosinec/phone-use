@@ -7,3 +7,5 @@ Task 2 (boundary fixes): in progress from278b9b5, sole source editor boundary_fi
 Task 2 checkpoint: capture RED reproduced four fallback/policy paths; capture GREEN completed. Deadline/parser RED reproduced missing expiry check and malformed/null acceptance; implementation continues.
 Task 2: production source stable,201 Rust tests+app1 passed; focused9 boundary tests passed. Full79 initially77 passed/2 fixture-counter schema failures; strict expectations corrected,focused2 passed. Final full79 run in progress. Independent review found no production blocker, test integration fix awaiting final gate.
 Task 2 final verification: full actual gateway79/79 pass,0 failures/skips;201 Rust library tests+app1 passed; review P2 fixture schema resolved and spec/code approved. Awaiting implementation commit only.
+
+Task 2: complete in implementation50427f5; final actual gateway79/79 pass, Rust201+app1, Clippy/fmt/diff pass; independent spec/code-quality review approved. Completion metadata committed separately; no push, deployment or real-device action.
