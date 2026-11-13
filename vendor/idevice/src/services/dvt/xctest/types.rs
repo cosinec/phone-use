@@ -429,6 +429,8 @@ pub struct XCTestConfiguration {
     // --- fixed defaults ---------------------------------------------------
     /// IDE capabilities sent along with the configuration.
     pub ide_capabilities: XCTCapabilities,
+    /// Whether the runner reports each XCTest activity to the host (`reportActivities`).
+    pub report_activities: bool,
 }
 
 impl XCTestConfiguration {
@@ -573,7 +575,7 @@ impl XCTestConfiguration {
             "initializeForUITesting".into(),
             ArchiveBuilder::bool_value(true),
         );
-        obj.insert("reportActivities".into(), ArchiveBuilder::bool_value(true));
+        obj.insert("reportActivities".into(), ArchiveBuilder::bool_value(self.report_activities));
         obj.insert(
             "reportResultsToIDE".into(),
             ArchiveBuilder::bool_value(true),

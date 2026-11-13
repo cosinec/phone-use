@@ -289,6 +289,7 @@ mod tests {
                 tests_to_run: None,
                 tests_to_skip: None,
                 ide_capabilities: super::super::types::XCTCapabilities::empty(),
+                report_activities: true,
             };
             let lifecycle = async {
                 rx.await.unwrap();

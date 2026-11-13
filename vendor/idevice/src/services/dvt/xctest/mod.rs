@@ -133,6 +133,9 @@ pub struct TestConfig {
     pub runner_env: Option<Dictionary>,
     /// Additional arguments appended to the runner launch args.
     pub runner_args: Option<Vec<String>>,
+    /// `reportActivities` in the XCTestConfiguration. When true (the upstream default),
+    /// the runner reports every XCTest activity to the host.
+    pub report_activities: bool,
 }
 
 impl TestConfig {
@@ -225,6 +228,7 @@ impl TestConfig {
             tests_to_skip: None,
             runner_env: None,
             runner_args: None,
+            report_activities: true,
         })
     }
 
@@ -290,6 +294,7 @@ impl TestConfig {
             tests_to_run: self.tests_to_run.clone(),
             tests_to_skip: self.tests_to_skip.clone(),
             ide_capabilities: XCTCapabilities::ide_defaults(),
+            report_activities: self.report_activities,
         })
     }
 }

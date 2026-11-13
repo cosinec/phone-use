@@ -115,6 +115,13 @@ fn emit_exit_summary(p: &Progress, diagnostics: &RunnerDiagnostics, lifetime: Du
     );
 }
 
+/// `ICTL_XCTEST_REPORT_ACTIVITIES=0` (or `false`/`off`) asks the runner not to report each
+/// XCTest activity to the host. Experimental: a real session sent ~16k debug messages
+/// (~12 MB) over the browser uplink in 12 minutes. Unset keeps the upstream default.
+fn report_activities(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0" | "false" | "off"))
+}
+
 struct ErrorListener(Arc<Mutex<Progress>>);
 
 impl ErrorListener {
@@ -274,13 +281,15 @@ impl WdaRunner {
                 other => WdaError::StartFailed(other.to_string()),
             })
         };
-        let cfg = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await.map_err(|_| {
+        let mut cfg = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await.map_err(|_| {
             WdaError::StartFailed(ictl_l10n::trf!(
                 "查 WDA 安装信息超时（{} 秒）",
                 "querying the WDA install info timed out ({} s)",
                 LOOKUP_TIMEOUT.as_secs()
             ))
         })??;
+        cfg.report_activities = report_activities(std::env::var("ICTL_XCTEST_REPORT_ACTIVITIES").ok().as_deref());
+        tracing::info!(event = "xctest_report_activities", enabled = cfg.report_activities);
 
         let progress =
             Arc::new(Mutex::new(Progress { runner_id, diagnostics: Some(diagnostics.clone()), ..Progress::default() }));
@@ -421,6 +430,15 @@ impl Drop for WdaRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn report_activities_is_only_disabled_explicitly() {
+        for on in [None, Some(""), Some("1"), Some("true")] {
+            assert!(report_activities(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" false "), Some("off")] {
+            assert!(!report_activities(off), "{off:?}");
+        }
+    }
 
     #[test]
     fn transport_closes_before_native_stop_emits_unknown_local_attribution() {
