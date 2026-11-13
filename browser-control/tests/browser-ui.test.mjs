@@ -594,3 +594,21 @@ test('each task observation is shown without the user refreshing', async t => {
   await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'thinking', observationId: 'o2' }; });
   await page.waitForFunction(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length === 2);
 });
+
+test('each task step shows its observation, model and action time', async t => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: 'task', instruction: 'Inspect', state: 'thinking', confirmation: null, observationId: 'o2',
+      timings: { observationMs: 700, modelMs: 4490 },
+      steps: [
+        { id: 's1', tool: 'iphone_tap', reason: 'Open search', state: 'succeeded', timings: { observationMs: 904, modelMs: 3719, actionMs: 852 } },
+        { id: 's2', tool: 'iphone_type_text', reason: 'Search', state: 'executing', timings: null },
+      ],
+    };
+  });
+  await page.locator('.step-timing').first().waitFor();
+  assert.equal(await page.locator('.step-timing').count(), 1, 'a step without timings shows none');
+  assert.equal(await page.locator('.step-timing').textContent(), '观察 0.90 秒 · 模型 3.72 秒 · 操作 0.85 秒');
+});

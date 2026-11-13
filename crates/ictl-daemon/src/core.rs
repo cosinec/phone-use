@@ -56,6 +56,9 @@ pub struct Persisted {
     /// 运行中选定要控制的设备（`iphone-control select`、`iphone_select_device`）；None 是自动选。
     /// 设了 `IPHONE_UDID` 时以它为准，这个不起作用
     pub selected_udid: Option<String>,
+    /// Unix seconds of the last automatic re-sign triggered by iOS refusing to launch the
+    /// installed WDA. Survives daemon restarts so each reconnect cannot re-sign again.
+    pub launch_resign_at: Option<u64>,
 }
 
 impl Persisted {
@@ -237,6 +240,8 @@ pub(crate) struct Inner {
     pub elements_cache: Option<(Instant, ictl_wda::elements::Tree)>,
     pub dedup: Dedup,
     pub next_resign: Instant,
+    /// The next scheduled re-sign must sign and install even if the profile still looks valid.
+    pub resign_force_pending: bool,
     pub next_session_check: Instant,
     pub apps: HashMap<bool, Vec<AppInfo>>,
 }
@@ -345,6 +350,7 @@ impl Daemon {
             dedup: Dedup::default(),
             // 启动一分钟后再做第一次重签检查和会话验证，先让设备就绪
             next_resign: now + Duration::from_secs(60),
+            resign_force_pending: false,
             next_session_check: now + Duration::from_secs(90),
             apps: HashMap::new(),
         };

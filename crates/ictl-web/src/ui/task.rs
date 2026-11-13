@@ -29,6 +29,14 @@ fn state_label(state: &str) -> String {
     }
     .to_string()
 }
+/// "观察 0.90 秒 · 模型 3.12 秒 · 操作 0.85 秒" for the stages a timing record contains.
+fn timing_text(timings: &Value) -> String {
+    [("观察", "observationMs"), ("模型", "modelMs"), ("操作", "actionMs")]
+        .into_iter()
+        .filter_map(|(label, key)| timings[key].as_f64().map(|ms| format!("{label} {:.2} 秒", ms / 1000.0)))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
 fn step_label(state: &str) -> String {
     match state {
         "pending" => "等待",
@@ -301,22 +309,7 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                     </Show>
                     <Show when=move || !ui.task()["timings"].is_null()>
                         <p class="card-description" aria-label="最近一轮耗时">
-                            {move || {
-                                let timings = ui.task()["timings"].clone();
-                                [
-                                    ("观察", "observationMs"),
-                                    ("模型", "modelMs"),
-                                    ("操作", "actionMs"),
-                                ]
-                                    .into_iter()
-                                    .filter_map(|(label, key)| {
-                                        timings[key]
-                                            .as_f64()
-                                            .map(|ms| format!("{label} {:.2} 秒", ms / 1000.0))
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" · ")
-                            }}
+                            {move || timing_text(&ui.task()["timings"])}
                         </p>
                     </Show>
                     <ol class="step-list">
@@ -334,6 +327,17 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                                             <div>
                                                 <strong>{tool_label(&string(&step, "tool"))}</strong>
                                                 <p>{string(&step, "reason")}</p>
+                                                {
+                                                    let timing = timing_text(&step["timings"]);
+                                                    (!timing.is_empty())
+                                                        .then(|| {
+                                                            view! {
+                                                                <small class="step-timing" aria-label="本步耗时">
+                                                                    {timing}
+                                                                </small>
+                                                            }
+                                                        })
+                                                }
                                             </div>
                                             <span class=format!(
                                                 "step-state {}",

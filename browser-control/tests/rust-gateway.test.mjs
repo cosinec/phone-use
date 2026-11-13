@@ -529,16 +529,20 @@ contract('typing focus recovers only after a fresh observation and a focus tap',
     });
   }
 });
-contract('typing focus rejects a blind second typing action before dispatch', async t => {
+contract('typing focus returns blind typing to the model before dispatch, then halts at the re-plan limit', async t => {
   const fixture = await modelReplyTask(t, () => modelCompletion(JSON.stringify(typeDraft)), {
     FIXTURE_TYPE_TEXT_ERROR: missingKeyboard,
   });
   let state;
   await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'failed'; });
-  assert.equal(fixture.requests.length, 2);
+  // One dispatched (failed) typing, two blind attempts returned for re-planning, the third halts.
+  assert.equal(fixture.requests.length, 4);
   assert.equal(state.task.steps.length, 1);
   assert.equal((await nativeCounts(fixture)).typeRequests, 1);
   assert.match(state.task.error, /focus/i);
+  const replan = JSON.parse(fixture.requests[2].messages[1].content[0].text).recentHistory.at(-1);
+  assert.equal(replan.state, 'rejected');
+  assert.match(replan.result.message, /Tap the intended text field first/);
 });
 contract('typing focus stops after one unsuccessful focus recovery', async t => {
   const fixture = await modelReplyTask(t, n => modelCompletion(JSON.stringify(n === 2 ? focusField : typeDraft)), {

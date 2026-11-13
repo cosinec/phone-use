@@ -828,14 +828,21 @@ async fn setup(cli: &Cli) -> anyhow::Result<()> {
             "  If “Enter iPhone passcode for XCTest” appears, enter the passcode."
         )
     );
-    let ready = wait_until(Duration::from_secs(600), Duration::from_secs(10), || async {
-        snapshot(socket)
-            .await
-            .map(|s| {
-                s.state == ictl_daemon::machine::DeviceState::Ready
-                    && s.device.as_ref().is_some_and(|d| d.udid == device.udid)
-            })
-            .unwrap_or(false)
+    // Print each daemon state change (failure reasons, trust or passcode prompts) instead of
+    // waiting silently for up to 10 minutes.
+    let shown = std::cell::RefCell::new(String::new());
+    let shown = &shown;
+    let device = &device;
+    let ready = wait_until(Duration::from_secs(600), Duration::from_secs(10), move || async move {
+        let Ok(s) = snapshot(socket).await else { return false };
+        let ready = s.state == ictl_daemon::machine::DeviceState::Ready
+            && s.device.as_ref().is_some_and(|d| d.udid == device.udid);
+        let status = s.state.describe();
+        if !ready && *shown.borrow() != status {
+            println!("  {}{status}", ictl_l10n::tr!("状态：", "Status: "));
+            *shown.borrow_mut() = status;
+        }
+        ready
     })
     .await;
     println!(

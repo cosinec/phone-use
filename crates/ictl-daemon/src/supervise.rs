@@ -167,9 +167,10 @@ impl Daemon {
         if now >= g.next_resign {
             g.next_resign = now + self.cfg.resign_check;
             if g.device.is_some() && g.persisted.wda_bundle.is_some() {
+                let force = std::mem::take(&mut g.resign_force_pending);
                 let d = self.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = d.resign_now(false, None).await {
+                    if let Err(e) = d.resign_now(force, None).await {
                         let mut g = d.inner.lock().await;
                         d.notify(&mut g, Event::ResignFailed(e));
                     }
@@ -437,7 +438,30 @@ impl Daemon {
             StartOutcome::Wda(e) => {
                 g.backoff.failed(Instant::now());
                 self.log.log(&format!("WDA 启动失败：{e}"));
-                self.set_state(g, DeviceState::WdaStarting { last_error: Some(e.to_string()) });
+                let mut last_error = e.to_string();
+                // The profile check cannot see a revoked certificate: iOS then refuses to spawn the
+                // runner on every retry. Re-sign and reinstall once instead of retrying forever.
+                if launch_rejected(&last_error) && g.persisted.wda_bundle.is_some() {
+                    let now = unix_now();
+                    if launch_resign_allowed(g.persisted.launch_resign_at, now) {
+                        g.persisted.launch_resign_at = Some(now);
+                        g.persisted.save(&self.cfg.state_file());
+                        g.resign_force_pending = true;
+                        g.next_resign = Instant::now();
+                        self.log.log("iOS 拒绝启动已安装的 WDA（签名可能已失效），自动重签并重新安装");
+                        last_error = ictl_l10n::tr!(
+                            "iOS 拒绝启动已安装的 WDA（签名可能已失效），正在自动重签并重新安装",
+                            "iOS refused to launch the installed WDA (its signature may be invalid); re-signing and reinstalling automatically"
+                        )
+                        .into();
+                    } else {
+                        last_error = ictl_l10n::trf!(
+                            "iOS 仍拒绝启动 WDA：请在手机 设置 → 通用 → VPN 与设备管理 中信任开发者 App，并保持手机解锁（{e}）",
+                            "iOS still refuses to launch WDA: trust the developer app in Settings → General → VPN & Device Management and keep the phone unlocked ({e})"
+                        );
+                    }
+                }
+                self.set_state(g, DeviceState::WdaStarting { last_error: Some(last_error) });
             }
         }
     }
@@ -584,6 +608,24 @@ impl Daemon {
     }
 }
 
+/// After an automatic re-sign, a further refusal within this window is reported (trust the
+/// developer, unlock the phone) instead of re-signing again.
+const LAUNCH_RESIGN_COOLDOWN_SECS: u64 = 6 * 3600;
+
+/// iOS refused to spawn the installed runner itself (bad or untrusted code signature),
+/// as opposed to transport, locked-phone or automation-passcode failures.
+fn launch_rejected(error: &str) -> bool {
+    error.contains("Launchd job spawn failed") || error.contains("denied by service delegate")
+}
+
+fn launch_resign_allowed(last: Option<u64>, now: u64) -> bool {
+    last.is_none_or(|at| now.saturating_sub(at) >= LAUNCH_RESIGN_COOLDOWN_SECS)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
 /// Connection/dispatch failures say nothing about whether XCTest is responsive.
 fn health_failure(result: &ictl_wda::Result<bool>) -> (&'static str, bool) {
     use ictl_wda::WdaError;
@@ -600,6 +642,17 @@ fn health_failure(result: &ictl_wda::Result<bool>) -> (&'static str, bool) {
 #[cfg(test)]
 mod health_tests {
     use super::*;
+    #[test]
+    fn only_ios_spawn_refusals_trigger_a_rate_limited_resign() {
+        let refused = "process launch failed: com.apple.dt.deviceprocesscontrolservice (code 2): The request was denied by service delegate (SBMainWorkspace).; caused by NSPOSIXErrorDomain (code 85): Launchd job spawn failed";
+        assert!(launch_rejected(refused));
+        for other in ["手机上没有安装 WDA（x），先运行 iphone-control sign", "connect timeout", "Enable UI Automation"] {
+            assert!(!launch_rejected(other), "{other}");
+        }
+        assert!(launch_resign_allowed(None, 1_000));
+        assert!(!launch_resign_allowed(Some(1_000), 1_000 + LAUNCH_RESIGN_COOLDOWN_SECS - 1));
+        assert!(launch_resign_allowed(Some(1_000), 1_000 + LAUNCH_RESIGN_COOLDOWN_SECS));
+    }
     #[test]
     fn a_link_failure_cannot_trigger_a_live_runner_restart() {
         assert_eq!(

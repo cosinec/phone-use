@@ -436,6 +436,13 @@ async fn run(
             Err(error) => return Err(error),
         };
         if typing_blocked && request["op"] == "type_text" {
+            // Nothing is sent: return the action to the model to tap the field first,
+            // within the same re-plan budget as other gateway rejections.
+            if rejected_actions < MAX_REJECTED_ACTIONS {
+                rejected_actions += 1;
+                history.push(rejected_history(&action, &ApiError::new(409, FOCUS_FIRST)));
+                continue;
+            }
             return Err(ApiError::unavailable("Focus an editable field before typing again; task halted"));
         }
         let step_id = uuid::Uuid::new_v4().to_string();
@@ -626,6 +633,7 @@ fn direct_command(instruction: &str) -> Option<Value> {
         json!({"type":"action","tool":tool,"args":args,"reason":"执行用户明确指定的单步操作，随后观察并验证结果","requiresConfirmation":false}),
     )
 }
+const FOCUS_FIRST: &str = "No editable field has focus: the previous typing found no keyboard. Tap the intended text field first and confirm the keyboard in the next observation before typing.";
 fn rejected_message(error: &ApiError) -> String {
     format!("Rejected by the gateway before reaching the device, nothing was done: {}", error.message)
 }
@@ -721,6 +729,15 @@ mod tests {
             message.contains("before reaching the device") && message.ends_with("Back is supported on Android only")
         );
         assert!(command_request("iphone_unknown", &json!({})).unwrap_err().status == 400);
+    }
+
+    #[test]
+    fn typing_before_a_focus_tap_is_returned_to_the_model_without_dispatch() {
+        let action = json!({"tool":"iphone_type_text","args":{"text":"bilibili"},"reason":"Search"});
+        let entry = rejected_history(&action, &ApiError::new(409, FOCUS_FIRST));
+        assert_eq!(entry["state"], "rejected");
+        let message = entry["result"]["message"].as_str().unwrap();
+        assert!(message.contains("before reaching the device") && message.contains("Tap the intended text field first"));
     }
 
     #[test]
