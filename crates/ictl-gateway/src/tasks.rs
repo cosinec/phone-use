@@ -737,7 +737,9 @@ mod tests {
         let entry = rejected_history(&action, &ApiError::new(409, FOCUS_FIRST));
         assert_eq!(entry["state"], "rejected");
         let message = entry["result"]["message"].as_str().unwrap();
-        assert!(message.contains("before reaching the device") && message.contains("Tap the intended text field first"));
+        assert!(
+            message.contains("before reaching the device") && message.contains("Tap the intended text field first")
+        );
     }
 
     #[test]

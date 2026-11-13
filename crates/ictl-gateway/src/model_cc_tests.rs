@@ -107,7 +107,10 @@ async fn configured_allowlist_and_task_selection_are_isolated() {
     env.insert("CC_MODELS".into(), " sonnet, opus,sonnet, custom-model ".into());
     env.insert("CC_MODEL".into(), " sonnet ".into());
     let model = Model::new(&env).unwrap();
-    assert_eq!(model.model_names().await, (vec![String::from("sonnet"), String::from("opus"), String::from("custom-model")], false));
+    assert_eq!(
+        model.model_names().await,
+        (vec![String::from("sonnet"), String::from("opus"), String::from("custom-model")], false)
+    );
 
     let opus = model.select(Some(&json!("opus"))).await.unwrap();
     let custom = model.select(Some(&json!("custom-model"))).await.unwrap();

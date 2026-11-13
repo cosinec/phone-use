@@ -646,7 +646,8 @@ mod health_tests {
     fn only_ios_spawn_refusals_trigger_a_rate_limited_resign() {
         let refused = "process launch failed: com.apple.dt.deviceprocesscontrolservice (code 2): The request was denied by service delegate (SBMainWorkspace).; caused by NSPOSIXErrorDomain (code 85): Launchd job spawn failed";
         assert!(launch_rejected(refused));
-        for other in ["手机上没有安装 WDA（x），先运行 iphone-control sign", "connect timeout", "Enable UI Automation"] {
+        for other in ["手机上没有安装 WDA（x），先运行 iphone-control sign", "connect timeout", "Enable UI Automation"]
+        {
             assert!(!launch_rejected(other), "{other}");
         }
         assert!(launch_resign_allowed(None, 1_000));
