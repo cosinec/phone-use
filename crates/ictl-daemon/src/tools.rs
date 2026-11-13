@@ -314,6 +314,16 @@ impl Daemon {
             None => Err(wda_down(&g.state, g.info.as_ref())),
         };
         fetching.finish(wda_frame.is_ok());
+        self.process_frame(g, region, wda_frame).await
+    }
+
+    /// Validates (or replaces through HID) a fetched WDA frame, then scales and encodes it.
+    async fn process_frame(
+        &self,
+        g: &mut Inner,
+        region: Option<(f64, f64, f64, f64)>,
+        wda_frame: Result<Vec<u8>, String>,
+    ) -> Result<CapturedFrame, String> {
         // HID touches refresh rotation immediately before validating a fresh frame.
         // Keep that auxiliary query off the capture path.
         let (png, via) = capture_with_fallback(self.cfg.capture_policy, wda_frame, || async {
@@ -385,7 +395,26 @@ impl Daemon {
     pub(crate) async fn observe(&self, g: &mut Inner, limit: usize, budget: Duration) -> Result<Response, String> {
         let started = Instant::now();
         self.ensure_unlocked(g).await?;
-        let CapturedFrame { image: frame, view, source_bytes, source_format } = self.capture_frame(g, None).await?;
+        let wants_elements = limit > 0 && !budget.is_zero();
+        // 刚滑动停稳时读到的树就是当前界面：直接用，省一次 `/source`
+        let settled = if wants_elements {
+            g.settled_tree.take().filter(|(at, _)| at.elapsed() < SETTLED_TREE_REUSE)
+        } else {
+            None
+        };
+        // Otherwise read the tree while the frame is captured, not after it.
+        let mut source = None;
+        let captured = match self.wda(g) {
+            Some(w) if wants_elements && settled.is_none() => {
+                let fetching = StepTimer::new("screenshot_fetch");
+                let (frame, xml) = w.screenshot_with_source(budget).await;
+                fetching.finish(frame.is_ok());
+                source = Some(xml);
+                self.process_frame(g, None, frame.map_err(|error| error.to_string())).await
+            }
+            _ => self.capture_frame(g, None).await,
+        };
+        let CapturedFrame { image: frame, view, source_bytes, source_format } = captured?;
         let Response::Image { jpeg_base64, caption, coordinate_mapping } = frame else { return Ok(frame) };
         let mut observation = serde_json::json!({
             "deviceId": g.device.as_ref().map(|d| d.udid.as_str()),
@@ -394,21 +423,27 @@ impl Daemon {
             "timings":{"screenshotMs":started.elapsed().as_millis() as u64,"sourceBytes":source_bytes,"sourceFormat":source_format}
         });
         let reading = Instant::now();
-        if limit > 0 && !budget.is_zero() {
-            // 刚滑动停稳时读到的树就是当前界面：直接用，省一次 `/source`
-            let settled = g.settled_tree.take().filter(|(at, _)| at.elapsed() < SETTLED_TREE_REUSE);
+        if wants_elements {
             let read = async {
-                if let Some((_, tree)) = settled {
-                    let text = tree.elements.iter().take(limit).map(|e| e.describe()).collect::<Vec<_>>().join("\n");
-                    g.elements_cache = Some((Instant::now(), tree));
-                    return Ok::<_, String>(text);
-                }
-                let wda = self.require_wda(g)?;
-                let view = match view {
-                    Some(view) => view,
-                    None => wda.view().await.map_err(|e| e.to_string())?,
+                let tree = match (settled, source) {
+                    (Some((_, tree)), _) => tree,
+                    (None, Some(xml)) => {
+                        let xml = xml.map_err(|e| e.to_string())?;
+                        let view = match view {
+                            Some(view) => view,
+                            None => self.require_wda(g)?.view().await.map_err(|e| e.to_string())?,
+                        };
+                        elements::parse_tree(&xml, view)
+                    }
+                    (None, None) => {
+                        let wda = self.require_wda(g)?;
+                        let view = match view {
+                            Some(view) => view,
+                            None => wda.view().await.map_err(|e| e.to_string())?,
+                        };
+                        wda.tree_in_view(view).await.map_err(|e| e.to_string())?
+                    }
                 };
-                let tree = wda.tree_in_view(view).await.map_err(|e| e.to_string())?;
                 let text = tree.elements.iter().take(limit).map(|e| e.describe()).collect::<Vec<_>>().join("\n");
                 g.elements_cache = Some((Instant::now(), tree));
                 Ok::<_, String>(text)

@@ -125,7 +125,8 @@ impl Model {
                     cc_models.push(name.to_owned());
                 }
             }
-            let name = env.get("CC_MODEL").map(|name| name.trim()).unwrap_or("opus").to_owned();
+            // One action per step: a faster default model shortens every step of a task.
+            let name = env.get("CC_MODEL").map(|name| name.trim()).unwrap_or("sonnet").to_owned();
             anyhow::ensure!(valid_model_id(&name) && cc_models.contains(&name), "CC_MODEL must be in CC_MODELS");
             (name, String::new(), String::new())
         } else {

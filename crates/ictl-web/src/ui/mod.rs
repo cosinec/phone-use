@@ -18,6 +18,8 @@ pub(super) struct Ui {
     pub state: RwSignal<Value>,
     pub ai: RwSignal<Value>,
     pub screen: RwSignal<Value>,
+    /// Opt-in continuous MJPEG preview URL; empty while showing single screenshots.
+    pub preview_url: RwSignal<String>,
     pub base: RwSignal<String>,
     pub error: RwSignal<String>,
     pub config_error: RwSignal<String>,
@@ -188,6 +190,7 @@ fn App(options: JsValue) -> impl IntoView {
         state,
         ai: RwSignal::new(Value::Null),
         screen: RwSignal::new(Value::Null),
+        preview_url: RwSignal::new(String::new()),
         base: RwSignal::new(String::new()),
         error: RwSignal::new(String::new()),
         config_error: RwSignal::new(String::new()),
@@ -251,6 +254,34 @@ fn App(options: JsValue) -> impl IntoView {
         });
     });
     let session_id = Memo::new(move |_| string(&ui.session(), "id"));
+    // The continuous preview belongs to one session and is never restarted automatically.
+    Effect::new(move |_| {
+        let _ = session_id.get();
+        ui.preview_url.set(String::new());
+    });
+    // Show every task observation as the model receives it. While a task owns the
+    // device, `/preview` returns the gateway's cached observation without a capture.
+    // When the task ends, one on-demand frame shows the final result.
+    let task_frame = Memo::new(move |_| {
+        let task = ui.task();
+        let observation = string(&task, "observationId");
+        let ended = !task.is_null() && !ui.running();
+        let captured = ended || (!observation.is_empty() && task["state"] != "observing");
+        (string(&ui.session(), "id"), string(&task, "id"), observation, ended, captured)
+    });
+    Effect::new(move |_| {
+        let (session, task, _, _, captured) = task_frame.get();
+        // Read device state untracked: only a new observation (or the task end) captures.
+        if session.is_empty() || task.is_empty() || !captured || untrack(|| ui.android() || !ui.ready()) {
+            return;
+        }
+        let pending = ui.client.get_value().screen();
+        spawn_local(async move {
+            if let Ok(image) = resolved(pending.into()).await {
+                ui.accept_screen(&session, image);
+            }
+        });
+    });
     let poll_stop = StoredValue::new_local(JsValue::NULL);
     Effect::new(move |_| {
         let id = session_id.get();

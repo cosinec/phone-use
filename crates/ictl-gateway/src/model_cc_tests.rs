@@ -94,7 +94,7 @@ fn explicit_cc_ignores_legacy_llm_configuration_without_a_bridge() {
     assert!(!socket.exists());
     assert!(model.cc, "explicit selection must not depend on socket discovery");
     assert!(model.ready(), "CC is configured even when its bridge is offline");
-    assert_eq!(model.name.as_deref(), Some("opus"));
+    assert_eq!(model.name.as_deref(), Some("sonnet"));
     assert_eq!(model.cc_models, ["opus", "sonnet", "haiku"]);
     assert_eq!(model.endpoint.as_ref().unwrap().as_str(), "http://localhost/plan");
     assert!(model.key.is_empty(), "legacy API credentials must not enter the CC backend");
@@ -156,7 +156,7 @@ async fn configuration_reports_missing_bridge_without_losing_configured_models()
     assert_eq!(
         config,
         json!({
-            "backend":"cc", "aiReady":false, "model":"opus", "models":["opus","sonnet","haiku"],
+            "backend":"cc", "aiReady":false, "model":"sonnet", "models":["opus","sonnet","haiku"],
             "aiError":"CC bridge is unavailable"
         })
     );
@@ -171,13 +171,13 @@ async fn configuration_uses_unix_bridge_health() {
         tokio::join!(bounded(bridge.model.configuration()), bounded(bridge.respond(json!({"ok":true}))));
     assert!(headers.starts_with("GET /health HTTP/1.1\r\n"));
     assert_eq!(body, Value::Null);
-    assert_eq!(config, json!({"backend":"cc","aiReady":true,"model":"opus","models":["opus","sonnet","haiku"]}));
+    assert_eq!(config, json!({"backend":"cc","aiReady":true,"model":"sonnet","models":["opus","sonnet","haiku"]}));
 }
 
 #[tokio::test]
 async fn screenshot_plan_sends_selected_model_evidence_and_schema_over_unix_http() {
     let bridge = Bridge::new();
-    let selected = bridge.model.select(Some(&json!("sonnet"))).await.unwrap();
+    let selected = bridge.model.select(Some(&json!("opus"))).await.unwrap();
     let mut jpeg = std::io::Cursor::new(Vec::new());
     image::RgbImage::new(2, 3).write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
     let screenshot = base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner());
@@ -194,8 +194,8 @@ async fn screenshot_plan_sends_selected_model_evidence_and_schema_over_unix_http
     assert_eq!(result.unwrap(), reply);
     assert!(headers.starts_with("POST /plan HTTP/1.1\r\n"));
     assert!(!headers.to_ascii_lowercase().contains("authorization:"));
-    assert_eq!(request["model"], "sonnet");
-    assert_eq!(bridge.model.name.as_deref(), Some("opus"));
+    assert_eq!(request["model"], "opus");
+    assert_eq!(bridge.model.name.as_deref(), Some("sonnet"));
     let system = request["system"].as_str().unwrap();
     let (_, schema) = system.rsplit_once("Respond only with a JSON object matching this schema: ").unwrap();
     assert_eq!(
@@ -246,7 +246,7 @@ async fn cancelling_an_inflight_plan_closes_the_unix_socket() {
         let (mut stream, _) = bridge.listener.accept().await.unwrap();
         let (headers, request) = read_request(&mut stream).await;
         assert!(headers.starts_with("POST /plan HTTP/1.1\r\n"));
-        assert_eq!(request["model"], "opus");
+        assert_eq!(request["model"], "sonnet");
         // Withhold the HTTP response: the client must disconnect while its
         // request is pending, even though Model retains its reqwest client.
         cancel.cancel();

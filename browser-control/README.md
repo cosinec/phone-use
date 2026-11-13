@@ -138,7 +138,7 @@ WDA HTTP 连接按完整响应边界复用。超时、取消、不完整响应�
 | `ICTL_LOW_LATENCY` | 浏览器启动的原生引擎默认 `1`；`0` 关闭设备端 JPEG/持久等待配置，重连生效 |
 | `WEB_DIST_DIR` | 前端构建目录，默认 `dist`，从仓库根目录运行时自动识别 `browser-control/dist` |
 | `LLM_BACKEND` | `cc` 或 `openai`；未设置时，runtime 下存在 `cc/bridge.sock` 则选 CC，否则使用兼容 API |
-| `CC_MODEL` / `CC_MODELS` | CC 默认模型及允许选择的逗号分隔列表，默认 `opus` / `opus,sonnet,haiku` |
+| `CC_MODEL` / `CC_MODELS` | CC 默认模型及允许选择的逗号分隔列表，默认 `sonnet` / `opus,sonnet,haiku` |
 | `CC_SOCKET` | 可选宿主机 CC 桥接 Unix socket 的容器内绝对路径，默认 `RUNTIME_DIR/cc/bridge.sock` |
 | `LLM_BASE_URL` | 可选模型兼容 API 根地址，如 `https://provider.example/v1`，不含账号、query 或 fragment |
 | `LLM_MODEL` | 默认模型名称，页面可从服务商模型列表中另选 |

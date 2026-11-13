@@ -19,6 +19,9 @@ MAX_REQUEST = 16 * 1024 * 1024
 MAX_OUTPUT = 1024 * 1024
 MAX_HEADERS = 16 * 1024
 TIMEOUT = 90
+# A pre-started CLI waits on stdin for the next step of the same task. Unused
+# ones are reclaimed after this long (a task step normally follows in seconds).
+WARM_IDLE = 300
 
 
 class BridgeError(Exception):
@@ -131,12 +134,94 @@ async def read_request(reader):
 
 
 class Bridge:
-    def __init__(self, claude_bin, work_dir, timeout=TIMEOUT):
+    def __init__(self, claude_bin, work_dir, timeout=TIMEOUT, warm_idle=WARM_IDLE):
         self.claude_bin = claude_bin
         self.work_dir = str(work_dir)
         self.timeout = timeout
+        self.warm_idle = warm_idle
         self.active = 0
         self.handlers = set()
+        # (key, process, expiry task) of at most one pre-started CLI.
+        self.warm = None
+        self.background = set()
+        self.closed = False
+
+    async def spawn(self, model, system):
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        command = [self.claude_bin, "-p", "--input-format", "stream-json",
+                   "--output-format", "stream-json", "--verbose", "--tools", "", "--strict-mcp-config",
+                   "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
+                   "--disable-slash-commands", "--no-session-persistence", "--safe-mode",
+                   "--permission-mode", "dontAsk", "--system-prompt", system,
+                   "--model", model, "--settings", '{"disableAllHooks":true}']
+        try:
+            return await asyncio.create_subprocess_exec(
+                *command, cwd=self.work_dir, env=env, start_new_session=True,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+        except (OSError, ValueError):
+            raise BridgeError(502, "Could not start Claude") from None
+
+    @staticmethod
+    async def kill(proc):
+        # Kill descendants even when the CLI leader has already exited.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+
+    def take_warm(self, key):
+        """Return the pre-started CLI for key, or None. A mismatched one is released."""
+        warm, self.warm = self.warm, None
+        if warm is None:
+            return None
+        warm_key, proc, expiry = warm
+        expiry.cancel()
+        if warm_key == key and proc.returncode is None:
+            return proc
+        self.run_background(self.kill(proc))
+        return None
+
+    def run_background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.background.add(task)
+        task.add_done_callback(self.background.discard)
+        return task
+
+    async def prewarm(self, key):
+        """Start the CLI for the next step now, so its startup overlaps device work."""
+        if self.closed:
+            return
+        try:
+            proc = await self.spawn(*key)
+        except BridgeError:
+            return
+        if self.closed:
+            await self.kill(proc)
+            return
+        self.take_warm(None)  # Keep at most one: release any other pre-started CLI.
+
+        async def expire():
+            await asyncio.sleep(self.warm_idle)
+            if self.warm is not None and self.warm[1] is proc:
+                self.warm = None
+                await self.kill(proc)
+
+        self.warm = (key, proc, self.run_background(expire()))
+
+    async def close(self):
+        self.closed = True
+        warm, self.warm = self.warm, None
+        if warm is not None:
+            warm[2].cancel()
+            await self.kill(warm[1])
+        pending = list(self.background)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def plan(self, body, reader):
         model, system, blocks = translate_plan(body)
@@ -145,23 +230,9 @@ class Bridge:
         self.active += 1
         proc = None
         tasks = []
+        succeeded = False
         try:
-            env = os.environ.copy()
-            env.pop("CLAUDECODE", None)
-            env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-            command = [self.claude_bin, "-p", "--input-format", "stream-json",
-                       "--output-format", "stream-json", "--verbose", "--tools", "", "--strict-mcp-config",
-                       "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
-                       "--disable-slash-commands", "--no-session-persistence", "--safe-mode",
-                       "--permission-mode", "dontAsk", "--system-prompt", system,
-                       "--model", model, "--settings", '{"disableAllHooks":true}']
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *command, cwd=self.work_dir, env=env, start_new_session=True,
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE)
-            except (OSError, ValueError):
-                raise BridgeError(502, "Could not start Claude") from None
+            proc = self.take_warm((model, system)) or await self.spawn(model, system)
             used = 0
 
             async def drain(stream, retain):
@@ -202,20 +273,20 @@ class Bridge:
                 raise BridgeError(499, "Client disconnected")
             if work not in done:
                 raise BridgeError(504, "Claude request timed out")
-            return work.result()
+            result = work.result()
+            succeeded = True
+            return result
         finally:
             if proc is not None:
-                # Kill descendants even when the CLI leader has already exited.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+                await self.kill(proc)
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.active -= 1
+            # A task plans step after step with the same model and system prompt.
+            if succeeded and not self.closed:
+                self.run_background(self.prewarm((model, system)))
 
     async def handle(self, reader, writer):
         task = asyncio.current_task()
@@ -316,6 +387,7 @@ async def serve(args):
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        await bridge.close()
         if identity is not None:
             try:
                 current = os.lstat(args.socket)

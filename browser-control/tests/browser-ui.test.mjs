@@ -532,3 +532,65 @@ test('on-demand screenshots retain rotation and manual gestures without a contin
   await page.waitForFunction(() => document.querySelector('.phone-frame')?.classList.contains('wide'));
   assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview/stream')).length), 0);
 });
+
+test('opt-in live preview maps MJPEG pixels to phone points and stops back to screenshots', async t => {
+  const page = await pageFor(t);
+  t.after(() => { streamFixtureBytes = undefined; });
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 400; canvas.height = 800;
+    canvas.getContext('2d').fillRect(0, 0, 400, 800);
+    return canvas.toDataURL('image/jpeg').split(',')[1];
+  }), 'base64');
+  await page.evaluate(() => {
+    fixture.enableStream = true;
+    fixture.state.daemon.persisted = { screen: { width: 100, height: 200 } };
+    fixture.state.preview = { state: 'streaming', ageMs: 10 };
+  });
+  await connect(page, 'ios', false);
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview/stream')).length), 0);
+  await page.getByRole('button', { name: '实时画面', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 400);
+  await page.getByRole('heading', { name: '实时画面', exact: true }).waitFor();
+  const image = page.locator('.phone-screen');
+  const box = await image.boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(() => fixture.calls.some(c => c.body?.tool === 'iphone_tap'));
+  const tap = await page.evaluate(() => fixture.calls.find(c => c.body?.tool === 'iphone_tap').body);
+  assert.ok(Math.abs(tap.args.x - 50) < 1); assert.ok(Math.abs(tap.args.y - 100) < 1);
+  await page.getByRole('button', { name: '停止实时', exact: true }).click();
+  await page.waitForFunction(() => fixture.calls.some(c => c.url?.endsWith('/preview/stream') && c.method === 'DELETE'));
+  await page.getByRole('heading', { name: '设备截图', exact: true }).waitFor();
+});
+
+test('a stale live preview is released and replaced by one screenshot', async t => {
+  const page = await pageFor(t);
+  t.after(() => { streamFixtureBytes = undefined; });
+  streamFixtureBytes = Buffer.from(await page.evaluate(() => fixture.image.imageBase64), 'base64');
+  await page.evaluate(() => { fixture.enableStream = true; fixture.state.preview = { state: 'streaming', ageMs: 10 }; });
+  await connect(page, 'ios', false);
+  await page.getByRole('button', { name: '实时画面', exact: true }).click();
+  await page.locator('.screen-meta').filter({ hasText: '实时画面' }).waitFor();
+  await page.evaluate(() => { fixture.state.preview = { state: 'waiting' }; });
+  await page.getByText('实时画面暂停', { exact: false }).waitFor({ timeout: 12000 });
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.src.startsWith('data:image/jpeg;base64,'));
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview/stream') && c.method === 'DELETE').length), 1);
+});
+
+test('each task observation is shown without the user refreshing', async t => {
+  const page = await pageFor(t);
+  await connect(page, 'ios', false);
+  const previews = () => page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length);
+  assert.equal(await previews(), 0);
+  await page.evaluate(() => {
+    fixture.state.task = { id: 'task', instruction: 'Inspect', state: 'observing', observationId: 'o1', confirmation: null, steps: [] };
+  });
+  await page.locator('.task-status').waitFor();
+  assert.equal(await previews(), 0, 'no capture while the task is still observing');
+  await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'thinking' }; });
+  await page.waitForFunction(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length === 1);
+  await page.locator('.phone-screen').waitFor();
+  await page.locator('.screen-meta').filter({ hasText: '任务最近一次观察' }).waitFor();
+  await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'executing' }; });
+  await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'thinking', observationId: 'o2' }; });
+  await page.waitForFunction(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length === 2);
+});

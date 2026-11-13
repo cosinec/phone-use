@@ -17,6 +17,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// MJPEG 抓帧的缩放比例。整屏最终缩到「点」尺寸（约原始像素的 1/3）给模型看，40% 仍比点尺寸略大，
 /// 不损失画质；每帧经浏览器上行的字节比 50% 少约 36%
 const MJPEG_SCALING_PERCENT: u32 = 40;
+const MJPEG_FRAMERATE: u32 = 5;
 /// 同一操作内（滑动后轮询元素树、输入后核对等）复用刚问到的方向
 const ORIENTATION_REUSE: Duration = Duration::from_millis(1500);
 /// 截图横竖和缓存一致时，方向最多复用这么久（任务里一步约 6–9 秒，相邻两步可复用）
@@ -219,8 +220,10 @@ impl<T: Transport> WdaClient<T> {
             .to_owned();
         self.session = Some(id.clone());
         if self.low_latency {
+            // A one-frame capture waits for the server's next tick: 5 fps bounds that wait at 200 ms
+            // (3 fps: 333 ms) while keeping the opt-in continuous preview light on the shared USB link.
             let settings = json!({"settings":{"screenshotQuality":1,"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.0,
-                    "mjpegServerFramerate":3,"mjpegScalingFactor":MJPEG_SCALING_PERCENT,"mjpegServerScreenshotQuality":40}});
+                    "mjpegServerFramerate":MJPEG_FRAMERATE,"mjpegScalingFactor":MJPEG_SCALING_PERCENT,"mjpegServerScreenshotQuality":40}});
             match self.call("POST", &format!("/session/{id}/appium/settings"), Some(settings), DEFAULT_TIMEOUT).await {
                 Ok(value)
                     if value["value"]["screenshotQuality"].as_f64() == Some(1.0)
@@ -438,6 +441,31 @@ impl<T: Transport> WdaClient<T> {
     pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
         if self.low_latency || self.bounded_capture {
             self.session_id().await?;
+        }
+        self.capture_encoded().await
+    }
+
+    /// A screenshot and the element-tree XML, read concurrently. The MJPEG frame has its
+    /// own connection, so the `/source` round trip overlaps the capture instead of
+    /// following it. `/source` is bounded by `source_budget`; the capture keeps its own limits.
+    pub async fn screenshot_with_source(&mut self, source_budget: Duration) -> (Result<Vec<u8>>, Result<String>) {
+        if (self.low_latency || self.bounded_capture)
+            && let Err(error) = self.session_id().await
+        {
+            let source = Err(WdaError::Unavailable(error.to_string()));
+            return (Err(error), source);
+        }
+        let source = async {
+            tokio::time::timeout(source_budget, self.source_xml())
+                .await
+                .unwrap_or_else(|_| Err(WdaError::Timeout("UI element snapshot budget exceeded".into())))
+        };
+        tokio::join!(self.capture_encoded(), source)
+    }
+
+    /// Encoded screenshot bytes; requires an existing session for MJPEG capture.
+    async fn capture_encoded(&self) -> Result<Vec<u8>> {
+        if self.low_latency || self.bounded_capture {
             // WDA 16.15.3 converts /screenshot back to PNG even when the source
             // quality is JPEG. Capture one MJPEG frame before the WAN instead.
             // A failed read must not trigger a multi-megabyte PNG fallback.
@@ -883,7 +911,7 @@ mod tests {
         );
         let profile: Value = serde_json::from_str(seen[1].2.as_deref().unwrap()).unwrap();
         assert_eq!(profile["settings"]["screenshotQuality"], 1);
-        assert_eq!(profile["settings"]["mjpegServerFramerate"], 3);
+        assert_eq!(profile["settings"]["mjpegServerFramerate"], 5);
         assert_eq!(profile["settings"]["mjpegScalingFactor"], MJPEG_SCALING_PERCENT);
         assert_eq!(profile["settings"]["mjpegServerScreenshotQuality"], 40);
     }
@@ -940,6 +968,39 @@ mod tests {
                 "even a failed JPEG read must not start a PNG transfer"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn screenshot_with_source_returns_the_frame_and_tree_from_one_call() {
+        let transport = JpegTransport {
+            http: Mock::with(&[
+                (200, r#"{"sessionId":"A"}"#),
+                (200, r#"{"value":{"screenshotQuality":1,"waitForIdleTimeout":1,"animationCoolOffTimeout":0}}"#),
+                (200, r#"{"value":"<XCUIElementTypeApplication/>"}"#),
+            ]),
+            fail: false,
+            captures: AtomicU64::new(0),
+        };
+        let mut client = WdaClient::new(&transport).with_low_latency(true);
+        let (frame, source) = client.screenshot_with_source(Duration::from_secs(1)).await;
+        assert_eq!(frame.unwrap(), [255, 216, 255, 217]);
+        assert_eq!(source.unwrap(), "<XCUIElementTypeApplication/>");
+        assert_eq!(transport.captures.load(Ordering::Relaxed), 1);
+        let seen = transport.http.seen.lock().unwrap();
+        assert!(seen[2].1.starts_with("/source?"), "tree read must not wait for a PNG: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn screenshot_with_source_reports_a_session_failure_for_both_reads() {
+        let transport = JpegTransport {
+            http: Mock::with(&[(500, r#"{"value":{"error":"unknown error","message":"no"}}"#)]),
+            fail: false,
+            captures: AtomicU64::new(0),
+        };
+        let mut client = WdaClient::new(&transport).with_low_latency(true);
+        let (frame, source) = client.screenshot_with_source(Duration::from_secs(1)).await;
+        assert!(frame.is_err() && source.is_err());
+        assert_eq!(transport.captures.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

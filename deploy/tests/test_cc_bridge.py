@@ -40,7 +40,7 @@ if model == 'failure':
     sys.stderr.write('SECRET AUTH PAYLOAD')
     sys.exit(1)
 message = json.loads(sys.stdin.readline())
-reply = {'args': args, 'message': message, 'cwd': os.getcwd(),
+reply = {'args': args, 'message': message, 'cwd': os.getcwd(), 'pid': os.getpid(),
          'nested': [os.environ.get('CLAUDECODE'), os.environ.get('CLAUDE_CODE_ENTRYPOINT')],
          'auth': os.environ.get('BRIDGE_TEST_AUTH')}
 print(json.dumps({'type': 'result', 'result': json.dumps(reply)}))
@@ -146,6 +146,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        await self.bridge.close()
 
     async def connect(self, model="sonnet", method="POST", target="/plan"):
         reader, writer = await asyncio.open_unix_connection(str(self.path))
@@ -189,6 +190,52 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[args.index(key) + 1], value)
         for flag in ("--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--safe-mode"):
             self.assertIn(flag, args)
+
+    async def wait_warm(self):
+        async with asyncio.timeout(3):
+            while self.bridge.warm is None:
+                await asyncio.sleep(0.01)
+        return self.bridge.warm[1]
+
+    async def test_next_step_reuses_a_prestarted_cli(self):
+        reader, _ = await self.connect()
+        first = (await self.response(reader))[1]["reply"]["pid"]
+        warm = await self.wait_warm()
+        self.assertNotEqual(warm.pid, first)
+        reader, _ = await self.connect()
+        status, result = await self.response(reader)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["reply"]["pid"], warm.pid)
+        self.assertEqual(result["reply"]["message"]["message"]["content"], PLAN["content"])
+        replacement = await self.wait_warm()
+        self.assertNotEqual(replacement.pid, warm.pid)
+
+    async def test_prestarted_cli_is_not_used_for_another_model(self):
+        reader, _ = await self.connect()
+        await self.response(reader)
+        warm = await self.wait_warm()
+        reader, _ = await self.connect(model="haiku")
+        status, result = await self.response(reader)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(result["reply"]["pid"], warm.pid)
+        self.assertEqual(result["reply"]["args"][result["reply"]["args"].index("--model") + 1], "haiku")
+        async with asyncio.timeout(3):
+            await warm.wait()
+
+    async def test_failed_plans_do_not_prestart(self):
+        reader, _ = await self.connect(model="failure")
+        self.assertEqual((await self.response(reader))[0], 502)
+        await asyncio.sleep(0.2)
+        self.assertIsNone(self.bridge.warm)
+
+    async def test_idle_prestarted_cli_expires(self):
+        self.bridge.warm_idle = 0.2
+        reader, _ = await self.connect()
+        await self.response(reader)
+        warm = await self.wait_warm()
+        async with asyncio.timeout(3):
+            await warm.wait()
+        self.assertIsNone(self.bridge.warm)
 
     async def test_health_and_not_found(self):
         reader, _ = await self.connect(method="GET", target="/health")
