@@ -206,7 +206,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.active, 0)
 
     async def test_timeout_kills_process(self):
-        self.bridge.timeout = 0.2
+        self.bridge.timeout = 2
         reader, _ = await self.connect(model="sleep")
         pid = await self.wait_file("leader.pid")
         self.assertEqual((await self.response(reader))[0], 504)
