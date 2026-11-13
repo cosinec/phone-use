@@ -6,6 +6,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -51,6 +52,9 @@ pub struct Model {
     endpoint: Option<reqwest::Url>,
     pub name: Option<String>,
     key: String,
+    /// Pinned at construction and retained by task-local model selections.
+    cc: bool,
+    cc_models: Vec<String>,
     catalog: Arc<Mutex<Catalog>>,
     format_refused: Arc<Mutex<HashSet<String>>>,
     ocr: Arc<crate::ocr::Ocr>,
@@ -94,11 +98,43 @@ impl Model {
     pub fn new(env: &HashMap<String, String>) -> anyhow::Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let get = |k: &str| env.get(k).cloned().unwrap_or_default().trim().to_owned();
-        let base = get("LLM_BASE_URL");
-        let name = get("LLM_MODEL");
-        let key = get("LLM_API_KEY");
-        let ready = !base.is_empty() && !name.is_empty() && !key.is_empty();
-        let endpoint = if ready {
+        let runtime = PathBuf::from(env.get("RUNTIME_DIR").map(String::as_str).unwrap_or(".runtime"));
+        let socket_override = get("CC_SOCKET");
+        let socket = if socket_override.is_empty() {
+            runtime.join("cc/bridge.sock")
+        } else {
+            let path = PathBuf::from(&socket_override);
+            anyhow::ensure!(
+                path.is_absolute() && !socket_override.chars().any(char::is_control),
+                "CC_SOCKET must be an absolute socket path"
+            );
+            path
+        };
+        let cc = match get("LLM_BACKEND").as_str() {
+            "" => socket.exists(),
+            "cc" => true,
+            "openai" => false,
+            _ => anyhow::bail!("LLM_BACKEND must be openai or cc"),
+        };
+        let mut cc_models = Vec::new();
+        let (name, key, base) = if cc {
+            for name in env.get("CC_MODELS").map(String::as_str).unwrap_or("opus,sonnet,haiku").split(',') {
+                let name = name.trim();
+                anyhow::ensure!(valid_model_id(name), "Invalid CC_MODELS configuration");
+                if !cc_models.iter().any(|existing| existing == name) {
+                    cc_models.push(name.to_owned());
+                }
+            }
+            let name = env.get("CC_MODEL").map(|name| name.trim()).unwrap_or("opus").to_owned();
+            anyhow::ensure!(valid_model_id(&name) && cc_models.contains(&name), "CC_MODEL must be in CC_MODELS");
+            (name, String::new(), String::new())
+        } else {
+            (get("LLM_MODEL"), get("LLM_API_KEY"), get("LLM_BASE_URL"))
+        };
+        let ready = cc || (!base.is_empty() && !name.is_empty() && !key.is_empty());
+        let endpoint = if cc {
+            Some(reqwest::Url::parse("http://localhost/plan")?)
+        } else if ready {
             let url = reqwest::Url::parse(&(base.trim_end_matches('/').to_owned() + "/chat/completions"))?;
             anyhow::ensure!(
                 ["http", "https"].contains(&url.scheme())
@@ -116,13 +152,15 @@ impl Model {
         };
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(60))
-            .build()?;
+            .timeout(Duration::from_secs(if cc { 95 } else { 60 }));
+        let client = if cc { client.unix_socket(socket).no_proxy() } else { client }.build()?;
         Ok(Self {
             client,
             endpoint,
             name: ready.then_some(name),
             key,
+            cc,
+            cc_models,
             catalog: Arc::default(),
             format_refused: Arc::default(),
             ocr: Arc::new(crate::ocr::Ocr::new(env)),
@@ -148,6 +186,9 @@ impl Model {
         self.endpoint.is_some()
     }
     async fn model_names(&self) -> (Vec<String>, bool) {
+        if self.cc {
+            return (self.cc_models.clone(), false);
+        }
         let mut catalog = self.catalog.lock().await;
         let ttl = if catalog.failed { 15 } else { 60 };
         if catalog.fetched.is_none_or(|at| at.elapsed() >= Duration::from_secs(ttl)) {
@@ -198,11 +239,31 @@ impl Model {
         (names, catalog.failed)
     }
     pub async fn configuration(&self) -> Value {
+        if self.cc {
+            let health = async {
+                let response = self
+                    .client
+                    .get("http://localhost/health")
+                    .send()
+                    .await
+                    .map_err(|_| ApiError::unavailable("CC bridge is unavailable"))?;
+                let bytes = bounded_cc_body(response, 4096).await?;
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| ApiError::unavailable("CC bridge returned invalid health"))?;
+                Ok::<_, ApiError>(value["ok"] == true)
+            };
+            let ready = matches!(tokio::time::timeout(Duration::from_secs(2), health).await, Ok(Ok(true)));
+            let mut config = json!({"backend":"cc","aiReady":ready,"model":self.name,"models":self.cc_models});
+            if !ready {
+                config["aiError"] = json!("CC bridge is unavailable");
+            }
+            return config;
+        }
         if !self.ready() {
-            return json!({"aiReady":false,"model":null});
+            return json!({"backend":"openai","aiReady":false,"model":null});
         }
         let (models, failed) = self.model_names().await;
-        let mut config = json!({"aiReady":true,"model":self.name,"models":models});
+        let mut config = json!({"backend":"openai","aiReady":true,"model":self.name,"models":models});
         if failed {
             config["modelsError"] = json!("模型列表暂时无法更新，显示默认模型或上次列表。");
         }
@@ -234,6 +295,28 @@ impl Model {
         images: &[crate::attachments::ReferenceImage],
         cancel: CancellationToken,
     ) -> Result<Value> {
+        let operation = self.generate_inner(instruction, observation, history, images, cancel.clone());
+        if !self.cc {
+            return operation.await;
+        }
+        // Dropping the operation closes the in-flight Unix HTTP request. The
+        // bridge observes the disconnect and terminates its planner subprocess.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ApiError::unavailable("Model request cancelled")),
+            result = tokio::time::timeout(Duration::from_secs(95), operation) => {
+                result.unwrap_or_else(|_| Err(ApiError::unavailable("Model request timed out")))
+            }
+        }
+    }
+    async fn generate_inner(
+        &self,
+        instruction: &str,
+        observation: Value,
+        history: Vec<Value>,
+        images: &[crate::attachments::ReferenceImage],
+        cancel: CancellationToken,
+    ) -> Result<Value> {
         let endpoint = self.endpoint.clone().ok_or_else(|| ApiError::unavailable("AI is not configured"))?;
         let observation_id = observation["observationId"].as_str().unwrap_or("");
         let content = match self.observation_mode {
@@ -246,6 +329,27 @@ impl Model {
             }
         };
         let system_prompt = self.observation_mode.system_prompt();
+        if self.cc {
+            let schema: Value = serde_json::from_str(include_str!("model-reply.schema.json"))
+                .map_err(|_| ApiError::unavailable("Invalid model reply schema"))?;
+            let system = format!("{system_prompt}\nRespond only with a JSON object matching this schema: {schema}");
+            let response = self
+                .client
+                .post(endpoint)
+                .json(&json!({"model":self.name,"system":system,"content":content}))
+                .send()
+                .await
+                .map_err(|_| ApiError::unavailable("CC bridge request failed"))?;
+            let bytes = bounded_cc_body(response, 1024 * 1024).await?;
+            let envelope: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::unavailable("CC bridge returned an invalid JSON envelope"))?;
+            return validate_reply(
+                envelope
+                    .get("reply")
+                    .cloned()
+                    .ok_or_else(|| ApiError::unavailable("CC bridge response is missing reply"))?,
+            );
+        }
         let operation = async {
             let mut messages =
                 vec![json!({"role":"system","content":system_prompt}), json!({"role":"user","content":content})];
@@ -480,6 +584,24 @@ impl Model {
             return Ok(choice.clone());
         }
     }
+}
+
+/// Never expose bridge response bodies or transport details to API consumers.
+async fn bounded_cc_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!("CC bridge returned HTTP {}", response.status().as_u16())));
+    }
+    if response.content_length().is_some_and(|length| length > limit as u64) {
+        return Err(ApiError::unavailable("CC bridge response too large"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| ApiError::unavailable("CC bridge request failed"))? {
+        if chunk.len() > limit - bytes.len() {
+            return Err(ApiError::unavailable("CC bridge response too large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 // Deliberately names no concrete tool. A concrete example (formerly
@@ -1184,3 +1306,7 @@ for line in sys.stdin:
         );
     }
 }
+
+#[cfg(test)]
+#[path = "model_cc_tests.rs"]
+mod cc_tests;

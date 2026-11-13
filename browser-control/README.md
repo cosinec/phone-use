@@ -137,11 +137,16 @@ WDA HTTP 连接按完整响应边界复用。超时、取消、不完整响应�
 | `ICTL_BIN` | 从当前源码构建的 `iphone-control` 可执行路径 |
 | `ICTL_LOW_LATENCY` | 浏览器启动的原生引擎默认 `1`；`0` 关闭设备端 JPEG/持久等待配置，重连生效 |
 | `WEB_DIST_DIR` | 前端构建目录，默认 `dist`，从仓库根目录运行时自动识别 `browser-control/dist` |
+| `LLM_BACKEND` | `cc` 或 `openai`；未设置时，runtime 下存在 `cc/bridge.sock` 则选 CC，否则使用兼容 API |
+| `CC_MODEL` / `CC_MODELS` | CC 默认模型及允许选择的逗号分隔列表，默认 `opus` / `opus,sonnet,haiku` |
+| `CC_SOCKET` | 可选宿主机 CC 桥接 Unix socket 的容器内绝对路径，默认 `RUNTIME_DIR/cc/bridge.sock` |
 | `LLM_BASE_URL` | 可选模型兼容 API 根地址，如 `https://provider.example/v1`，不含账号、query 或 fragment |
 | `LLM_MODEL` | 默认模型名称，页面可从服务商模型列表中另选 |
 | `LLM_API_KEY` | 可选模型 key，仅配置于服务器环境 |
 
-模型三个变量缺一即为未配置。当前客户端向 `/chat/completions` 发送包含 OCR 文字与坐标的 Chat Completions 请求，使用 `temperature: 0`、`max_tokens: 1024`，要求模型返回校验后的纯 JSON 操作或完成消息。它不使用 function tools。服务商需要兼容这些请求参数与响应格式；已配置只表示配置完整，不能证明服务商健康。o-series 等需要不同 token/temperature 参数的模型仍需后续适配，当前没有宣称通用模型兼容性或真实模型评测。
+CC 后端通过宿主机已登录的 Claude Code CLI 处理截图、任务和近期记录，每次仅返回一个操作或完成消息。网关继续负责会话独占、参数校验、敏感操作确认及手机操作。CC 不获得内置工具或原生手机 socket；取消任务会终止当前规划进程。桥接服务安装方式见 [部署说明](../deploy/README.md#claude-code-on-the-vps)。CC 模式不需要配置上述三个 `LLM_*` 模型变量，也不会在 CC 故障时回退 Magpie。
+
+以下为 `openai` 后端行为：模型三个变量缺一即为未配置。客户端向 `/chat/completions` 发送包含 OCR 文字与坐标的 Chat Completions 请求，使用 `temperature: 0`、`max_tokens: 1024`，要求模型返回校验后的纯 JSON 操作或完成消息。它不使用 function tools。服务商需要兼容这些请求参数与响应格式；已配置只表示配置完整，不能证明服务商健康。o-series 等需要不同 token/temperature 参数的模型仍需后续适配，当前没有宣称通用模型兼容性或真实模型评测。
 
 任务模型下拉框来自同一 `LLM_BASE_URL` 的 `/models`，API key 仅由服务器发送。列表成功缓存 60 秒，失败缓存 15 秒，失败时提示并保留默认模型或上次列表。可点「刷新列表」重新读取服务器当前列表。所有返回的合法模型 ID 均可选择，账号权限、结构化输出支持和模型可用性取决于服务商。任务创建可携带 `model`，服务器校验它属于模型列表或默认模型；省略则使用 `LLM_MODEL`。每个任务固定自己的模型，运行期间下拉框禁用，执行记录展示本次模型。切换不会修改其他设备或任务的默认模型。
 

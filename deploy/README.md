@@ -53,6 +53,27 @@ sudo docker compose -f /opt/stacks/iphone-control/compose.yaml up -d --no-build 
 
 Avoid deploying concurrently through another administrator tool. CI detects Compose changes during its image pull and aborts rather than overwriting them. Manual deployment tooling should honor the same `.ci-deploy.lock` file.
 
+## Claude Code on the VPS
+
+The gateway can use a host Claude Code CLI instead of an OpenAI-compatible endpoint. CC plans one action from the current screenshot and bounded task history. The Rust task loop still owns the phone lease, command validation, confirmation, cancellation, and execution. CC has no built-in tools or native phone socket access. Model errors never fall back to another provider.
+
+`browser-control/cc/bridge.py` runs as the host account already authenticated with CC. It exposes only a mode-0600 Unix socket, under the runtime directory already shared with the container. It does not expose a TCP port or copy the host's credentials into the image. A disconnected planning request terminates its CC child process group. Requests, responses, duration, and concurrency are bounded.
+
+For the existing VPS layout, the host socket is `/srv/containers/iphone-control/cc/bridge.sock`; the container sees `/app/.runtime/cc/bridge.sock`. With `LLM_BACKEND` unset, the gateway selects CC when that socket exists at startup. Set `LLM_BACKEND=cc` to require CC, or `LLM_BACKEND=openai` to explicitly keep the old endpoint. `CC_MODEL` defaults to `opus`, and `CC_MODELS` defaults to `opus,sonnet,haiku`. A custom `CC_SOCKET` must be absolute. Restart the gateway after changing backend settings or initially creating the socket. `/api/config` reports the chosen backend and checks bridge health; authentication and model availability require a real planning request to verify.
+
+Start the bridge with an explicit CLI path and a dedicated working directory, for example:
+
+```bash
+python3 -I browser-control/cc/bridge.py \
+  --socket /srv/containers/iphone-control/cc/bridge.sock \
+  --work-dir /srv/containers/iphone-control/cc/work \
+  --claude-bin /absolute/path/to/claude
+```
+
+The CLI must support print mode, stream-json input/output and the tool/settings isolation flags used by the bridge. It uses the host account's existing CC authentication/provider environment. Authentication injected only into an interactive runner is not automatically available to systemd: verify login in the service account's environment or provide the existing provider settings through the protected service environment file. Never copy runner-internal credentials into that file. No API key belongs in Git or in this command. A successful health response establishes bridge availability; it does not prove model billing/authentication works.
+
+`deploy/phone-use-cc-bridge.service` is an optional systemd template with this VPS's paths. Review its user, executable and environment file before explicitly installing it. CI does not install services, modify server-owned Compose/environment files, or grant host access. Install and start the host service before the first CC-enabled gateway deployment if using automatic socket detection. Service installation requires administrator approval/access. Removing the socket while leaving an old OpenAI configuration enabled can select OpenAI at the next startup; pin `LLM_BACKEND=cc` in the server environment when CC is required permanently.
+
 ## Validation
 
 ```bash

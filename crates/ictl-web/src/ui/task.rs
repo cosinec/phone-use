@@ -215,6 +215,8 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         {move || {
                             if ui.ai.get().is_null() {
                                 "正在检查 AI 配置".into()
+                            } else if ui.ai.get()["aiReady"] == true && ui.ai.get()["backend"] == "cc" {
+                                format!("Claude Code · {}", selected())
                             } else if ui.ai.get()["aiReady"] == true {
                                 format!(
                                     "已选择 {}",
@@ -224,6 +226,8 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                                         selected()
                                     },
                                 )
+                            } else if ui.ai.get()["backend"] == "cc" {
+                                "Claude Code 暂不可用".into()
                             } else {
                                 "AI 尚未配置".into()
                             }
@@ -231,7 +235,11 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                     </strong>
                     <p>
                         {move || {
-                            if ui.ai.get()["aiReady"] == true {
+                            if ui.ai.get()["backend"] == "cc" && ui.ai.get()["aiReady"] == true {
+                                "由服务器上的 Claude Code 规划操作，敏感步骤仍需确认。"
+                            } else if ui.ai.get()["backend"] == "cc" {
+                                "请检查服务器上的 Claude Code 桥接服务。设备就绪后仍可手动控制。"
+                            } else if ui.ai.get()["aiReady"] == true {
                                 "模型在服务器运行。设备准备好后即可开始。"
                             } else {
                                 "请让服务器管理员配置模型。设备就绪后仍可手动控制。"
