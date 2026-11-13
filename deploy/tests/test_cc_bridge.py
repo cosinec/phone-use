@@ -253,7 +253,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_server_socket_mode_and_shutdown_cleanup(self):
         self.server.close()
         await self.server.wait_closed()
-        self.path.unlink()
+        self.path.unlink(missing_ok=True)
         proc = await asyncio.create_subprocess_exec(
             "python3", "-I", str(BRIDGE_PATH), "--socket", str(self.path),
             "--work-dir", str(self.work), "--claude-bin", str(self.executable),
