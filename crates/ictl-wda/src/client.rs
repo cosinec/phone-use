@@ -20,8 +20,10 @@ const MJPEG_SCALING_PERCENT: u32 = 40;
 const MJPEG_FRAMERATE: u32 = 5;
 /// 同一操作内（滑动后轮询元素树、输入后核对等）复用刚问到的方向
 const ORIENTATION_REUSE: Duration = Duration::from_millis(1500);
-/// 截图横竖和缓存一致时，方向最多复用这么久（任务里一步约 6–9 秒，相邻两步可复用）
-const FRAME_ORIENTATION_REUSE: Duration = Duration::from_secs(15);
+/// 截图横竖和缓存一致时，方向最多复用这么久。横竖一变（转屏、进出横屏 App）截图形状就变了，会立刻重新问；
+/// 这个时限只兜底同为横屏的左右翻转。真机任务（2026-11-13）：一步常超过 15 秒，58 步问了 31 次，
+/// 慢链路上每次平均 3.2 秒、最长 9 秒（WDA 要等界面静止才回答）
+const FRAME_ORIENTATION_REUSE: Duration = Duration::from_secs(120);
 /// 普通点击按下的时长（毫秒）。太短可能不被识别成点击；解锁按键另有自己的时长
 const TAP_PRESS_MS: u64 = 50;
 
@@ -1192,8 +1194,8 @@ mod tests {
         let orientation_calls =
             |m: &Mock| m.seen.lock().unwrap().iter().filter(|r| r.1.ends_with("/orientation")).count();
         assert_eq!(c.view_for_frame(false).await.unwrap().orientation, Some(elements::Orientation::Portrait));
-        tokio::time::advance(Duration::from_secs(10)).await;
-        // 相邻一步、截图仍是竖的：不问
+        tokio::time::advance(Duration::from_secs(30)).await;
+        // 相邻一步（慢链路上一步可能超过 15 秒）、截图仍是竖的：不问
         assert_eq!(c.view_for_frame(false).await.unwrap().screen, ScreenSize { width: 390.0, height: 844.0 });
         assert_eq!(orientation_calls(&m), 1);
         // 截图变成横的：马上重新问
