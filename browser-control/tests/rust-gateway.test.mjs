@@ -587,7 +587,7 @@ contract('provider model catalog is cached and each task keeps its own validated
   t.after(() => { provider.closeAllConnections(); provider.close(); });
   const app = await harness(t, { LLM_BASE_URL: `http://127.0.0.1:${provider.address().port}/v1`, LLM_MODEL: 'codex/default', LLM_API_KEY: 'fixture-catalog-key' });
   const configs = await Promise.all(Array.from({ length: 6 }, async () => (await app.api('/api/config')).json()));
-  for (const config of configs) assert.deepEqual(config, { aiReady: true, model: 'codex/default', models: ['codex/default', 'other/text', 'other/vision'] });
+  for (const config of configs) assert.deepEqual(config, { backend: 'openai', aiReady: true, model: 'codex/default', models: ['codex/default', 'other/text', 'other/vision'] });
   assert.equal(catalogCalls, 1); assert.ok(!JSON.stringify(configs).includes('fixture-catalog-key'));
   const first = await app.session(); await peer(t, first); await ready(app, first);
   const second = await app.session({ device: { ...device, serialNumber: '00008110-001234567890001F' } });
@@ -735,7 +735,7 @@ contract('query-only evidence cannot dispatch coordinate taps until a fresh imag
 
 contract('Rust entry point preserves auth, normalized identities, setup, screenshots and command deduplication', async t => {
   const app = await harness(t);
-  assert.deepEqual(await (await app.api('/api/config')).json(), { aiReady: false, model: null });
+  assert.deepEqual(await (await app.api('/api/config')).json(), { backend: 'openai', aiReady: false, model: null });
   assert.equal((await app.api('/api/sessions', 'bad', { device })).status, 401);
   assert.equal((await app.api('/api/config', token, undefined, { Origin: 'https://evil.test' })).status, 403);
   const s = await app.session({ device: { ...device, serialNumber: device.serialNumber.replace('-', '').toLowerCase() + '\0\0' } });
