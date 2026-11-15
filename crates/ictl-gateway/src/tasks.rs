@@ -4,6 +4,7 @@ use crate::{
     gateway::Session,
     model::{Model, validate_reply},
 };
+use base64::Engine;
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -30,6 +31,16 @@ const MAX_REJECTED_ACTIONS: u32 = 2;
 /// A timed-out iphone_wait_for is read-only, so it is reported back to the
 /// model instead of halting, at most this many times per task.
 const MAX_WAIT_MISSES: u32 = 3;
+/// Consecutive successful actions that left the screen unchanged before the
+/// model is warned, and before the task stops instead of repeating itself.
+const WARN_NO_EFFECT: u32 = 3;
+const MAX_NO_EFFECT: u32 = 6;
+/// Average-hash bits (of 256) two observations may differ by and still be the same screen.
+const SAME_SCREEN_BITS: u32 = 6;
+/// Latest history entries sent with full detail; older steps are summarized in a step log.
+const DETAILED_HISTORY: usize = 8;
+/// Most earlier steps repeated to the model in the step log.
+const STEP_LOG_ENTRIES: usize = 40;
 /// Goal updates accepted while one task runs.
 const MAX_INSTRUCTION_UPDATES: usize = 20;
 /// Earlier goals repeated to the model after the user changes the goal.
@@ -85,7 +96,12 @@ struct Task {
 }
 pub struct TaskManager {
     task: Mutex<Option<Task>>,
+    /// Summaries of this session's finished tasks, oldest first, so a new task
+    /// knows what the user asked and what happened before it.
+    previous: Mutex<Vec<Value>>,
 }
+/// Finished tasks of a session repeated to the model for context.
+const PREVIOUS_TASKS: usize = 5;
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -99,7 +115,7 @@ impl Default for TaskManager {
 }
 impl TaskManager {
     pub fn new() -> Self {
-        Self { task: Mutex::new(None) }
+        Self { task: Mutex::new(None), previous: Mutex::new(Vec::new()) }
     }
     pub async fn snapshot(&self) -> Value {
         self.task.lock().await.as_ref().map(|t| t.snapshot.clone()).unwrap_or(Value::Null)
@@ -142,12 +158,13 @@ impl TaskManager {
             interrupt: None,
         });
         drop(guard);
+        let previous = self.previous.lock().await.clone();
         tokio::spawn(async move {
             tokio::select! {biased;
                 _=session.cancel.cancelled()=>session.tasks.finish(&id,"stopped",Some("Session disconnected. Already sent actions cannot be undone.".into()),None).await,
                 _=cancel.cancelled()=>{},
                 _=tokio::time::sleep(Duration::from_secs(1800))=>session.tasks.finish(&id,"failed",None,Some("任务已达到 30 分钟时限".into())).await,
-                result=run(session.clone(),&id,model,images,cancel.clone(),&lease)=>match result{
+                result=run(session.clone(),&id,model,images,previous,cancel.clone(),&lease)=>match result{
                     Ok(message)=>session.tasks.finish(&id,"completed",Some(message),None).await,
                     Err(error)=>session.tasks.finish(&id,"failed",None,Some(error.message)).await,
                 }
@@ -188,6 +205,14 @@ impl TaskManager {
         task.snapshot["finishedAt"] = json!(now());
         task.snapshot["confirmation"] = Value::Null;
         task.snapshot["plan"] = json!([]);
+        let summary = task_summary(&task.snapshot);
+        {
+            let mut previous = self.previous.lock().await;
+            previous.push(summary);
+            if previous.len() > PREVIOUS_TASKS {
+                previous.remove(0);
+            }
+        }
         task.confirmation = None;
         task.interrupt = None;
         task.cancel.cancel();
@@ -400,6 +425,7 @@ async fn run(
     id: &str,
     model: Model,
     images: Vec<crate::attachments::ReferenceImage>,
+    previous_tasks: Vec<Value>,
     cancel: CancellationToken,
     lease: &crate::control::TaskLease,
 ) -> Result<String> {
@@ -413,6 +439,12 @@ async fn run(
     let mut done_questions = 0;
     // Set when the goal changes; cleared once an action is dispatched for the new goal.
     let mut steered = false;
+    // Every dispatched action, so the model keeps track of the whole task.
+    let mut step_log: Vec<Value> = Vec::new();
+    // The screen that planned the latest actions, and whether a mutating action ran since.
+    let mut last_screen: Option<ScreenFingerprint> = None;
+    let mut awaiting_effect = false;
+    let mut no_effect = 0;
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
@@ -426,6 +458,7 @@ async fn run(
             // The user changed the goal: actions planned for the old goal are void.
             seen_updates = instruction_updates(&snapshot);
             steered = true;
+            no_effect = 0;
             discard_plan(&s, id, &mut queue).await?;
         }
         let (action, observation_id, mut timings) = if let Some(action) = queue.pop_front() {
@@ -474,6 +507,31 @@ async fn run(
             observation_stage.finish(if observation_result.is_ok() { "ok" } else { "error" });
             let mut observation = observation_result?;
             observation["observationId"] = json!(observation_id);
+            if let Some(screen) = ScreenFingerprint::of(&observation).await {
+                if awaiting_effect
+                    && let Some(changed) = last_screen.as_ref().and_then(|before| before.changed(&screen))
+                {
+                    awaiting_effect = false;
+                    for entry in [history.iter_mut().rev().find(|e| e["state"] == "succeeded"), step_log.last_mut()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        entry["screenChanged"] = json!(changed);
+                    }
+                    no_effect = if changed { 0 } else { no_effect + 1 };
+                    if no_effect >= MAX_NO_EFFECT {
+                        let last = step_log.last().and_then(|s| s["reason"].as_str()).unwrap_or("").to_owned();
+                        return Err(ApiError::unavailable(format!(
+                            "连续 {MAX_NO_EFFECT} 步操作后屏幕都没有变化，任务已停止，避免继续重复操作。最后一步：{last}。请检查手机画面是否被弹窗挡住或页面没有响应。"
+                        )));
+                    }
+                    if no_effect == WARN_NO_EFFECT {
+                        history.push(json!({"tool":"gateway","state":"warning",
+                            "result":{"kind":"text","text":NO_EFFECT_WARNING}}));
+                    }
+                }
+                last_screen = Some(screen);
+            }
             let query_only = observation["queryOnly"] == true;
             if observation["deviceId"] != s.device.serial_number {
                 return Err(ApiError::new(409, "Observation device identity mismatch"));
@@ -488,7 +546,9 @@ async fn run(
                 })
                 .await?;
             compact_history(&mut history);
-            while history.len() > 8 || history.iter().map(|v| v.to_string().len()).sum::<usize>() > HISTORY_CHARS {
+            while history.len() > DETAILED_HISTORY
+                || history.iter().map(|v| v.to_string().len()).sum::<usize>() > HISTORY_CHARS
+            {
                 history.remove(0);
             }
             let thinking = Instant::now();
@@ -501,7 +561,7 @@ async fn run(
             } else {
                 let interrupt = s.tasks.arm_interrupt(id, &cancel, seen_updates).await?;
                 let result = model
-                    .generate(&model_instruction(&snapshot), observation, history.clone(), &images, interrupt)
+                    .generate(&model_instruction(&snapshot), observation, model_history(&previous_tasks, &step_log, &history), &images, interrupt)
                     .await
                     .and_then(validate_reply);
                 s.tasks.disarm_interrupt(id).await;
@@ -573,6 +633,7 @@ async fn run(
             Ok(request) => request,
             Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
                 rejected_actions += 1;
+                log_rejection(&s.id, id, &action, &error.message);
                 history.push(rejected_history(&action, &error));
                 discard_plan(&s, id, &mut queue).await?;
                 continue;
@@ -585,6 +646,7 @@ async fn run(
             discard_plan(&s, id, &mut queue).await?;
             if rejected_actions < MAX_REJECTED_ACTIONS {
                 rejected_actions += 1;
+                log_rejection(&s.id, id, &action, "focus_first");
                 history.push(rejected_history(&action, &ApiError::new(409, FOCUS_FIRST)));
                 continue;
             }
@@ -687,6 +749,7 @@ async fn run(
             Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
                 rejected_actions += 1;
                 rejected = true;
+                log_rejection(&s.id, id, &action, &error.message);
                 json!({"kind":"error","message":rejected_message(&error)})
             }
             Err(error)
@@ -720,6 +783,11 @@ async fn run(
             "succeeded"
         };
         history.push(json!({"tool":action["tool"],"args":action["args"],"reason":action["reason"],"state":state,"result":inference_result(&result)}));
+        step_log.push(step_summary(step_log.len() + 1, &action, state));
+        let tool = action["tool"].as_str().unwrap_or("");
+        if state == "succeeded" && !QUERY_TOOLS.contains(&tool) && tool != "iphone_wait_for" {
+            awaiting_effect = true;
+        }
         if result["kind"] == "image" {
             // The just-captured full frame/crop IS the next observation; do not
             // fetch another full image and send two pictures for the same query.
@@ -809,6 +877,127 @@ async fn run(
             input_pending = false;
         }
     }
+}
+
+const NO_EFFECT_WARNING: &str = "Warning from the gateway: the last actions did not change the screen (screenChanged:false). Do not repeat them unchanged. Try a different target, iphone_tap_element with an exact label from iphone_list_elements, a swipe or scroll, dismissing a dialog or keyboard, or reply done explaining what blocks the task.";
+
+/// A coarse screen identity: an average hash of the screenshot and a hash of the UI element text.
+struct ScreenFingerprint {
+    image: Option<[u64; 4]>,
+    elements: Option<u64>,
+}
+impl ScreenFingerprint {
+    async fn of(observation: &Value) -> Option<Self> {
+        let image = match observation["imageBase64"].as_str() {
+            Some(data) => {
+                let data = data.to_owned();
+                tokio::task::spawn_blocking(move || average_hash(&data)).await.ok().flatten()
+            }
+            None => None,
+        };
+        let elements = observation["elementsText"].as_str().filter(|text| !text.is_empty()).map(|text| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            hasher.finish()
+        });
+        (image.is_some() || elements.is_some()).then_some(Self { image, elements })
+    }
+    /// Whether the screen changed; unknown when the two observations share no evidence.
+    fn changed(&self, after: &Self) -> Option<bool> {
+        let same_image = self
+            .image
+            .zip(after.image)
+            .map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>() <= SAME_SCREEN_BITS);
+        let same_elements = self.elements.zip(after.elements).map(|(a, b)| a == b);
+        if same_image.is_none() && same_elements.is_none() {
+            return None;
+        }
+        Some(same_image != Some(true) && same_elements != Some(true))
+    }
+}
+/// 16x16 grayscale average hash of a base64 screenshot.
+fn average_hash(data: &str) -> Option<[u64; 4]> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let pixels = image::load_from_memory(&bytes).ok()?.thumbnail_exact(16, 16).to_luma8().into_raw();
+    if pixels.len() != 256 {
+        return None;
+    }
+    let mean = pixels.iter().map(|&p| u32::from(p)).sum::<u32>() / 256;
+    let mut bits = [0u64; 4];
+    for (index, &pixel) in pixels.iter().enumerate() {
+        if u32::from(pixel) > mean {
+            bits[index / 64] |= 1u64 << (index % 64);
+        }
+    }
+    Some(bits)
+}
+
+/// One line of the task step log sent to the model.
+fn step_summary(number: usize, action: &Value, state: &str) -> Value {
+    let mut args = action["args"].clone();
+    if let Some(text) = args.get("text").and_then(Value::as_str).map(|t| t.chars().take(40).collect::<String>()) {
+        args["text"] = json!(text);
+    }
+    json!({"step":number,"tool":action["tool"],"args":args,"state":state,
+        "reason":action["reason"].as_str().unwrap_or("").chars().take(80).collect::<String>()})
+}
+
+/// History sent to the model: once older entries were trimmed, a step log of the
+/// earlier steps comes first so the model does not redo completed work.
+fn with_step_log(step_log: &[Value], history: &[Value]) -> Vec<Value> {
+    if step_log.len() <= DETAILED_HISTORY {
+        return history.to_vec();
+    }
+    let earlier = &step_log[..step_log.len() - DETAILED_HISTORY];
+    let shown = &earlier[earlier.len().saturating_sub(STEP_LOG_ENTRIES)..];
+    let mut out = vec![json!({
+        "stepLog": shown, "omittedSteps": earlier.len() - shown.len(),
+        "note": "Earlier steps of this task, oldest first. The entries after this one detail the latest steps. Do not repeat completed steps."
+    })];
+    out.extend_from_slice(history);
+    out
+}
+
+/// History sent to the model: earlier tasks of this session, then this task's
+/// step log and detailed history.
+fn model_history(previous_tasks: &[Value], step_log: &[Value], history: &[Value]) -> Vec<Value> {
+    let mut out = with_step_log(step_log, history);
+    if !previous_tasks.is_empty() {
+        out.insert(0, json!({
+            "previousTasks": previous_tasks,
+            "note": "Earlier tasks in this session, oldest first. The current instruction may refer to them (for example continue, again, the same, undo). Use them as context; do not redo them unless the current instruction asks to."
+        }));
+    }
+    out
+}
+
+/// What a finished task asked for and how it ended, for the next task of the session.
+fn task_summary(snapshot: &Value) -> Value {
+    let bounded = |value: &Value, max: usize| value.as_str().map(|s| s.chars().take(max).collect::<String>());
+    let steps = snapshot["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let last_steps: Vec<Value> = steps[steps.len().saturating_sub(10)..]
+        .iter()
+        .map(|step| json!({"tool":step["tool"],"state":step["state"],"reason":bounded(&step["reason"], 80)}))
+        .collect();
+    let updates: Vec<Value> = snapshot["instructionUpdates"]
+        .as_array()
+        .map(|updates| updates.iter().map(|update| json!(bounded(&update["instruction"], 300))).collect())
+        .unwrap_or_default();
+    json!({
+        "instruction": bounded(&snapshot["instruction"], 500), "goalUpdates": updates, "state": snapshot["state"],
+        "result": bounded(&snapshot["message"], 500).or_else(|| bounded(&snapshot["error"], 500)),
+        "steps": steps.len(), "lastSteps": last_steps,
+    })
+}
+
+/// Content-free record of a gateway rejection; the message is gateway-generated.
+fn log_rejection(session_id: &str, task_id: &str, action: &Value, reason: &str) {
+    eprintln!(
+        "{}",
+        json!({"at":now(),"event":"task_action_rejected","session_id":session_id,"task_id":task_id,
+            "tool":action["tool"],"reason":reason.chars().take(160).collect::<String>()})
+    );
 }
 
 /// Number of goal updates the user has made to this task.
@@ -1069,6 +1258,64 @@ mod tests {
         assert!(!needs(&open, false));
         assert!(!needs(&message, true) && !needs(&delete, true));
         assert!(needs(&pay, true) && needs(&pay, false));
+    }
+
+    fn png(shade: u8) -> String {
+        let image = image::RgbImage::from_fn(32, 64, |x, _| {
+            if x < 16 { image::Rgb([shade, shade, shade]) } else { image::Rgb([255 - shade, 0, 0]) }
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+    }
+
+    #[tokio::test]
+    async fn screen_fingerprints_detect_unchanged_and_changed_screens() {
+        let a = ScreenFingerprint::of(&json!({"imageBase64":png(0),"elementsText":"Button: A"})).await.unwrap();
+        let same = ScreenFingerprint::of(&json!({"imageBase64":png(0),"elementsText":"Button: B"})).await.unwrap();
+        let other = ScreenFingerprint::of(&json!({"imageBase64":png(255),"elementsText":"Button: C"})).await.unwrap();
+        assert_eq!(a.changed(&same), Some(false), "same image, different tree");
+        assert_eq!(a.changed(&other), Some(true));
+        let tree = ScreenFingerprint::of(&json!({"elementsText":"Button: A"})).await.unwrap();
+        assert_eq!(a.changed(&tree), Some(false), "same tree without an image");
+        assert!(ScreenFingerprint::of(&json!({"queryOnly":true})).await.is_none());
+    }
+
+    #[test]
+    fn step_log_precedes_detailed_history_only_after_it_was_trimmed() {
+        let action = json!({"tool":"iphone_type_text","args":{"text":"x".repeat(100)},"reason":"r".repeat(200)});
+        let entry = step_summary(1, &action, "succeeded");
+        assert_eq!(entry["args"]["text"].as_str().unwrap().len(), 40);
+        assert_eq!(entry["reason"].as_str().unwrap().len(), 80);
+        let history = vec![json!({"tool":"iphone_tap"})];
+        let short: Vec<Value> = (1..=DETAILED_HISTORY).map(|n| step_summary(n, &action, "succeeded")).collect();
+        assert_eq!(with_step_log(&short, &history), history);
+        let long: Vec<Value> = (1..=60).map(|n| step_summary(n, &action, "succeeded")).collect();
+        let sent = with_step_log(&long, &history);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["stepLog"].as_array().unwrap().len(), STEP_LOG_ENTRIES);
+        assert_eq!(sent[0]["omittedSteps"], 60 - DETAILED_HISTORY - STEP_LOG_ENTRIES);
+        assert_eq!(sent[0]["stepLog"][0]["step"], 60 - DETAILED_HISTORY - STEP_LOG_ENTRIES + 1);
+    }
+
+    #[test]
+    fn previous_tasks_lead_the_model_history_with_bounded_summaries() {
+        let snapshot = json!({
+            "instruction": "打开时钟", "state": "completed", "message": "已打开时钟", "error": null,
+            "instructionUpdates": [{"instruction": "改为打开秒表"}],
+            "steps": (0..12).map(|n| json!({"tool":"iphone_tap","state":"succeeded","reason":format!("step {n}")})).collect::<Vec<_>>(),
+        });
+        let summary = task_summary(&snapshot);
+        assert_eq!(summary["result"], "已打开时钟");
+        assert_eq!(summary["goalUpdates"], json!(["改为打开秒表"]));
+        assert_eq!(summary["steps"], 12);
+        assert_eq!(summary["lastSteps"].as_array().unwrap().len(), 10);
+        assert_eq!(summary["lastSteps"][0]["reason"], "step 2");
+        let history = vec![json!({"tool":"iphone_tap"})];
+        assert_eq!(model_history(&[], &[], &history), history);
+        let sent = model_history(&[summary.clone()], &[], &history);
+        assert_eq!(sent[0]["previousTasks"], json!([summary]));
+        assert_eq!(sent[1], history[0]);
     }
 
     #[test]

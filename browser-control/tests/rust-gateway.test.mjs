@@ -1379,3 +1379,33 @@ contract('a done reply asking for confirmation is re-planned once instead of end
   assert.match(history.at(-1).result.message, /requiresConfirmation:true/);
   assert.equal((await nativeCounts(fixture)).counts.screenshot, 1, 'the re-plan reuses the same observation');
 });
+
+contract('repeated actions that leave the screen unchanged are warned about and then stopped', async t => {
+  // The fixture returns the same screenshot every time, so no tap changes the screen.
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(
+    { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: `Fixture tap ${call}` })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'failed', JSON.stringify(state.task));
+  assert.match(state.task.error, /屏幕都没有变化/);
+  assert.equal(state.task.steps.length, 6);
+  const warned = fixture.requests.map(r => JSON.parse(r.messages[1].content[0].text).recentHistory)
+    .find(history => history.some(entry => entry.state === 'warning'));
+  assert.ok(warned, 'the model was warned before the task stopped');
+  assert.ok(warned.filter(entry => entry.tool === 'iphone_tap').every(entry => entry.screenChanged === false));
+});
+
+contract('a new task in the same session sees the previous task as context', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(
+    { type: 'done', message: call === 1 ? 'First fixture result' : 'Second fixture result' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed'; });
+  const second = await fixture.app.api(fixture.route + '/tasks', fixture.session.token, { instruction: 'Continue the previous fixture task' });
+  assert.equal(second.status, 201, await second.clone().text());
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'completed' && fixture.requests.length === 2; });
+  const history = JSON.parse(fixture.requests[1].messages[1].content[0].text).recentHistory;
+  assert.equal(history[0].previousTasks.length, 1);
+  assert.equal(history[0].previousTasks[0].instruction, 'Inspect the fixture safely');
+  assert.equal(history[0].previousTasks[0].result, 'First fixture result');
+  assert.equal(JSON.parse(fixture.requests[0].messages[1].content[0].text).recentHistory.length, 0);
+});
