@@ -353,11 +353,26 @@ impl Device {
         .await
     }
 
+    /// 先读 lockdown 的 amfi 域 `DeveloperModeStatus`（Xcode 和 pymobiledevice3 的做法）；读不到再问 amfi 服务。
+    /// iOS 26 上 amfi 服务的 action 3 会出错，只靠它的话已经打开的开发者模式也会被当成没打开
     pub async fn developer_mode_enabled(&self) -> Result<bool> {
         limit(ictl_l10n::tr!("查开发者模式", "check Developer Mode"), QUERY, async {
+            match self.developer_mode_from_lockdown().await {
+                Ok(Some(enabled)) => return Ok(enabled),
+                Ok(None) => tracing::debug!("lockdown 没有给出 DeveloperModeStatus，改问 amfi 服务"),
+                Err(e) => tracing::debug!("lockdown 读 DeveloperModeStatus 失败，改问 amfi 服务：{e}"),
+            }
             Ok(AmfiClient::connect(&*self.provider).await?.get_developer_mode_status().await?)
         })
         .await
+    }
+
+    async fn developer_mode_from_lockdown(&self) -> std::result::Result<Option<bool>, IdeviceError> {
+        let pairing = self.provider.get_pairing_file().await?;
+        let mut lockdown = LockdownClient::connect(&*self.provider).await?;
+        lockdown.start_session(&pairing).await?;
+        let status = lockdown.get_value(Some("DeveloperModeStatus"), Some("com.apple.security.mac.amfi")).await?;
+        Ok(status.as_boolean())
     }
 
     /// 让「设置 → 隐私与安全性」里出现开发者模式开关（打开仍需用户在手机上操作）

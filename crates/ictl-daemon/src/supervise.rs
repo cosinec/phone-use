@@ -252,8 +252,13 @@ impl Daemon {
             // usbmuxd 出错：这一轮不下结论
             Err(e) => return tracing::debug!("查配对记录失败：{e}"),
         }
-        if g.state != DeviceState::Ready && !device.developer_mode_enabled().await.unwrap_or(true) {
-            return self.set_state(g, DeviceState::DeveloperModeOff);
+        if g.state != DeviceState::Ready {
+            match device.developer_mode_enabled().await {
+                Ok(false) => return self.set_state(g, DeviceState::DeveloperModeOff),
+                Ok(true) => {}
+                // 查不到时照常往下走（WDA 能起来就说明开着），但要留下原因
+                Err(e) => tracing::warn!(event = "developer_mode_query_failed", error = %e),
+            }
         }
         let Some(bundle) = g.persisted.wda_bundle.clone() else {
             return self.set_state(g, DeviceState::NeedsSigning);

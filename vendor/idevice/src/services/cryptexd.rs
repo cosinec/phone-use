@@ -301,7 +301,11 @@ impl<R: ReadWrite> CryptexdClient<R> {
                 .await?;
         }
 
-        let res = self.inner.recv().await?;
+        // iOS 26 answers `install` on the root channel instead of the reply
+        // channel, then closes the connection. Waiting on the reply channel
+        // alone never saw that answer and surfaced NotConnected / a timeout.
+        // Callers verify the result with `copy-installed` afterwards.
+        let res = self.inner.recv_any().await?;
         unwrap_reply("install", res)?;
         Ok(())
     }

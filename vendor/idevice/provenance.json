@@ -12,7 +12,8 @@
     "Observe PID liveness on a dedicated DVT socket over the existing RSD tunnel (or an independent lockdown connection), with a shared 5-second setup bound, 5-second request bound and 10-second delayed cadence.",
     "Retire the complete diagnostic socket on setup/request failure or timeout; own the monitor future within the XCTest lifecycle so cancellation drops its connection and no polling task survives.",
     "Parse isRunningPid replies strictly as Boolean; unsupported, malformed, failed, or timed-out observations remain unknown instead of false.",
-    "Expose XCTestConfiguration reportActivities through TestConfig.report_activities (default true, unchanged behavior) so a client can stop per-activity reports."
+    "Expose XCTestConfiguration reportActivities through TestConfig.report_activities (default true, unchanged behavior) so a client can stop per-activity reports.",
+    "cryptexd install waits for its reply on both the root and reply channels: iOS 26 answers install on the root channel and closes the connection, which previously surfaced as NotConnected or a mount timeout. The caller still verifies the DDI with copy-installed."
   ],
   "upstreamFiles": {
     "Cargo.toml": "a0ab1e19648854f4cfffc19264b215aca6459c1454222f02eab96a96a9327f65",
@@ -72,7 +73,6 @@
     "src/services/pcapd.rs": "e404b5bf94eb5040f209b26c04c6da5e2f2aa157c5778e5d08345f645c068915",
     "src/services/simulate_location.rs": "be30ec6852fe8a423e7e4f8f35a6aa100af5c5f1ee1140b136154f00287e6230",
     "src/services/mobilebackup2.rs": "bb3fc2d538e87d38c231595213d2dbbff15efb14d832af41ada95a9bd3bdfa7e",
-    "src/services/cryptexd.rs": "f5d3346eaa2d3ae7bcbec9185e59fb3ec9fb646697afc87a1856de58f120fa01",
     "src/services/core_device_proxy.rs": "b2817a3389e6fc0b51733c6ae930d4f76826dca5e497a6ac4e8ca0f2181b6a56",
     "src/services/bt_packet_logger.rs": "7d02ac898e5fc7f5d6855b8cdb1bd96454d590c4360a4ff3c12dca0fc6926d9f",
     "src/services/os_trace_relay.rs": "16c9b26946850ae4222c66ff15fe35c7bc8f50b3cedb2404de8976c21417480b",
@@ -158,6 +158,7 @@
     "src/services/dvt/errors.rs": "e89469fd3722b35e7957f7f6d817af22d3fc245ff3adaf2171ad07aa14b44197",
     "src/services/dvt/xctest/mod.rs": "2281feb48be76a7c3138cc539f76f247dafc7d0a0b440f15666b97032c66f18a",
     "src/services/dvt/xctest/diagnostics.rs": "f9ff9399899d4f0df6de5fe3c17fd9f567ae3ab65c91ed7f5d7b9c98d8553581",
-    "src/services/dvt/xctest/types.rs": "acce5b5d1dbacd28a84b0a14ca715c9292710bb4130d7c5ab1355fdb647e202d"
+    "src/services/dvt/xctest/types.rs": "acce5b5d1dbacd28a84b0a14ca715c9292710bb4130d7c5ab1355fdb647e202d",
+    "src/services/cryptexd.rs": "160a913c74b17376350589fed94a3e9281a729894f89e97b801f0e2ee182d9d0"
   }
 }
