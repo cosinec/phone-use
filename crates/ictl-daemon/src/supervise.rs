@@ -371,6 +371,15 @@ impl Daemon {
                     if t.ddi_mounted().await.map_err(|e| (e, false))?.is_some() {
                         return Ok(None);
                     }
+                    // iOS 26.3 的 cryptexd 收完镜像就断开、不回安装结果：先经 mobile_image_mounter
+                    // 个性化挂载（pymobiledevice3 在 iOS 17+ 的做法），不行再走 cryptexd。
+                    // ICTL_DDI_DIR 是用户自己的 Cryptex 目录，只走 cryptexd
+                    if user_dir.is_none() {
+                        match mount_personalized(&device, &cache).await {
+                            Ok(mounted) => return Ok(mounted),
+                            Err(e) => tracing::warn!(event = "personalized_ddi_failed", error = %e),
+                        }
+                    }
                     let dir = match &user_dir {
                         Some(d) => ictl_device::ddi::require_complete(d),
                         None => ictl_device::ddi::ensure_cache(&cache, &url).await,
@@ -642,6 +651,17 @@ fn health_failure(result: &ictl_wda::Result<bool>) -> (&'static str, bool) {
         Ok(false) => ("not_ready", true),
         Ok(true) => ("ready", false),
     }
+}
+
+/// 经 mobile_image_mounter 个性化挂载开发者镜像。已挂载返回 `Ok(None)`，挂上了返回 `Ok(Some(说明))`
+async fn mount_personalized(device: &Device, cache: &Path) -> Result<Option<String>, DeviceError> {
+    if device.personalized_ddi_mounted().await? {
+        return Ok(None);
+    }
+    let dir = cache.join("personalized");
+    let dir = ictl_device::ddi::ensure_personalized_cache(&dir, ictl_device::ddi::PERSONALIZED_BASE_URL).await?;
+    device.mount_personalized_ddi(&dir).await?;
+    Ok(Some("Personalized".into()))
 }
 
 #[cfg(test)]

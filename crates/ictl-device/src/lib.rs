@@ -29,6 +29,7 @@ use idevice::{
     installation_proxy::InstallationProxyClient,
     lockdown::LockdownClient,
     misagent::MisagentClient,
+    mobile_image_mounter::ImageMounter,
     provider::{IdeviceProvider, UsbmuxdProvider},
     rsd::RsdHandshake,
     tcp::handle::AdapterHandle,
@@ -363,6 +364,39 @@ impl Device {
                 Err(e) => tracing::debug!("lockdown 读 DeveloperModeStatus 失败，改问 amfi 服务：{e}"),
             }
             Ok(AmfiClient::connect(&*self.provider).await?.get_developer_mode_status().await?)
+        })
+        .await
+    }
+
+    /// 个性化开发者镜像是否已经挂载（经 mobile_image_mounter 查，不需要隧道）
+    pub async fn personalized_ddi_mounted(&self) -> Result<bool> {
+        limit(ictl_l10n::tr!("查询开发者镜像", "query the developer disk image"), QUERY, async {
+            let mut mounter = ImageMounter::connect(&*self.provider).await?;
+            match mounter.lookup_image("Personalized").await {
+                Ok(_) => Ok(true),
+                Err(IdeviceError::NotFound) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+    }
+
+    /// 经 mobile_image_mounter 个性化挂载开发者镜像（pymobiledevice3 在 iOS 17+ 的做法，含 TSS 联网签票）。
+    /// `dir` 见 [`ddi::ensure_personalized_cache`]
+    pub async fn mount_personalized_ddi(&self, dir: &Path) -> Result<()> {
+        let image = tokio::fs::read(dir.join("Image.dmg")).await?;
+        let trust_cache = tokio::fs::read(dir.join("Image.dmg.trustcache")).await?;
+        let manifest = tokio::fs::read(dir.join("BuildManifest.plist")).await?;
+        limit(ictl_l10n::tr!("挂载开发者镜像", "mount the developer disk image"), Duration::from_secs(180), async {
+            let pairing = self.provider.get_pairing_file().await?;
+            let mut lockdown = LockdownClient::connect(&*self.provider).await?;
+            lockdown.start_session(&pairing).await?;
+            let chip_id = lockdown.get_value(Some("UniqueChipID"), None).await?;
+            let missing = || DeviceError::Idevice("UniqueChipID is unavailable".into());
+            let ecid = chip_id.as_unsigned_integer().ok_or_else(missing)?;
+            let mut mounter = ImageMounter::connect(&*self.provider).await?;
+            mounter.mount_personalized(&*self.provider, image, trust_cache, &manifest, None, ecid).await?;
+            Ok(())
         })
         .await
     }

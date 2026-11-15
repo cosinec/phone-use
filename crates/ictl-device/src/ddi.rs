@@ -15,6 +15,13 @@ pub const DEFAULT_BASE_URL: &str =
 pub const FILES: [&str; 5] =
     ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache", "Image.dmg.cryptex_info", "Image.dmg.root_hash"];
 
+/// 个性化开发者镜像（`mobile_image_mounter` 用），同一仓库的 Personalized 目录
+pub const PERSONALIZED_BASE_URL: &str =
+    "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/Xcode_iOS_DDI_Personalized";
+
+/// 个性化镜像缓存里必须有的文件
+pub const PERSONALIZED_FILES: [&str; 3] = ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache"];
+
 /// 记录缓存来自哪个下载地址：换了地址就整套重新下载，免得新旧文件混在一起
 const SOURCE_STAMP: &str = ".source";
 
@@ -47,15 +54,34 @@ pub fn invalidate(dir: &Path) {
     }
 }
 
+/// 确保 `dir` 里有完整的个性化镜像（[`PERSONALIZED_FILES`]），缺的从 `base_url` 下载；返回该目录
+pub async fn ensure_personalized_cache(dir: &Path, base_url: &str) -> Result<PathBuf> {
+    ensure_files(dir, base_url, &PERSONALIZED_FILES).await
+}
+
+/// 删掉个性化镜像缓存
+pub fn invalidate_personalized(dir: &Path) {
+    for f in PERSONALIZED_FILES.iter().chain([&SOURCE_STAMP]) {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+}
+
 /// 确保 `dir` 里有完整的 DDI，缺的从 `base_url` 下载；返回该目录。
 /// 下载先写临时文件再改名，中途失败不会留下半个文件。
 pub async fn ensure_cache(dir: &Path, base_url: &str) -> Result<PathBuf> {
+    ensure_files(dir, base_url, &FILES).await
+}
+
+async fn ensure_files(dir: &Path, base_url: &str, files: &[&str]) -> Result<PathBuf> {
+    let complete = |dir: &Path| files.iter().all(|f| dir.join(f).is_file());
     let stamp = std::fs::read_to_string(dir.join(SOURCE_STAMP)).ok();
     if stamp.as_deref().is_some_and(|s| s.trim() != base_url) {
         tracing::info!("开发者镜像下载地址变了，重新下载");
-        invalidate(dir);
+        for f in files.iter().chain([&SOURCE_STAMP]) {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
     }
-    if cache_complete(dir) {
+    if complete(dir) {
         if stamp.is_none() {
             // 早期版本下载的缓存没有记录来源：认作当前地址
             let _ = std::fs::write(dir.join(SOURCE_STAMP), base_url);
@@ -67,7 +93,7 @@ pub async fn ensure_cache(dir: &Path, base_url: &str) -> Result<PathBuf> {
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| DeviceError::Download(e.to_string()))?;
-    for name in FILES {
+    for &name in files {
         let dest = dir.join(name);
         if dest.is_file() {
             continue;
