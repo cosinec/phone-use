@@ -145,7 +145,7 @@ impl TaskManager {
         let snapshot = json!({
             "id": id, "instruction": instruction, "model": model.name, "state": "observing", "steps": [],
             "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
-            "observationId":null,"attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100,
+            "observationId":null,"attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(),
             "instructionUpdates":[],"plan":[],"discardedPlanActions":0,"autoConfirm":auto_confirm
         });
         *guard = Some(Task {
@@ -626,9 +626,6 @@ async fn run(
             }
             (action, observation_id, timings)
         };
-        if snapshot["steps"].as_array().map_or(0, Vec::len) >= 100 {
-            return Err(ApiError::new(409, "任务已达到 100 步上限"));
-        }
         let request = match command_request(action["tool"].as_str().unwrap(), &action["args"]) {
             Ok(request) => request,
             Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
@@ -1313,7 +1310,7 @@ mod tests {
         assert_eq!(summary["lastSteps"][0]["reason"], "step 2");
         let history = vec![json!({"tool":"iphone_tap"})];
         assert_eq!(model_history(&[], &[], &history), history);
-        let sent = model_history(&[summary.clone()], &[], &history);
+        let sent = model_history(std::slice::from_ref(&summary), &[], &history);
         assert_eq!(sent[0]["previousTasks"], json!([summary]));
         assert_eq!(sent[1], history[0]);
     }

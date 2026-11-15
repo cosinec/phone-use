@@ -307,7 +307,7 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         {move || state_label(&string(&ui.task(), "state"))}
                         <span class="step-count">
                             {move || {
-                                format!("{} / {} 步", ui.task()["steps"].as_array().map_or(0, Vec::len), ui.task()["maxSteps"].as_u64().unwrap_or(100))
+                                format!("{} 步", ui.task()["steps"].as_array().map_or(0, Vec::len))
                             }}
                         </span>
                     </div>
