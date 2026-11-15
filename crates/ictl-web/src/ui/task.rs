@@ -51,6 +51,18 @@ fn step_label(state: &str) -> String {
     }
     .to_string()
 }
+/// Instruction for a new task resuming a failed or stopped one. The gateway also
+/// gives the model the previous task's summary as session history.
+fn continue_instruction(task: &Value) -> String {
+    let goal = string(task, "instruction");
+    let reason = [string(task, "error"), string(task, "message")].into_iter().find(|s| !s.is_empty());
+    let mut text = format!("继续完成上一个任务：{goal}\n");
+    if let Some(reason) = reason {
+        text.push_str(&format!("上次结束原因：{reason}\n"));
+    }
+    text.push_str("请先查看当前屏幕，从中断的地方接着做，不要重复已经完成的步骤。");
+    text.chars().take(3900).collect()
+}
 #[component]
 pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
     let instruction = RwSignal::new(String::new());
@@ -496,6 +508,32 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         <p class="field-hint">
                             "后续步骤已停止。停止前已发出的操作可能仍已执行，请检查手机。"
                         </p>
+                    </Show>
+                    <Show when=move || {
+                        matches!(string(&ui.task(), "state").as_str(), "failed" | "stopped") && ui.can_control()
+                    }>
+                        <div class="button-row">
+                            <button
+                                class="button primary small"
+                                disabled=move || ui.busy.get() || ui.ai.get()["aiReady"] != true
+                                on:click=move |_| {
+                                    let task = ui.task();
+                                    let text = continue_instruction(&task);
+                                    let model = string(&task, "model");
+                                    let auto = task["autoConfirm"] == true;
+                                    ui.run(move |client| {
+                                        client.start_task(
+                                            text,
+                                            if model.is_empty() { None } else { Some(model) },
+                                            JsValue::NULL,
+                                            Some(auto),
+                                        )
+                                    });
+                                }
+                            >
+                                "继续任务"
+                            </button>
+                        </div>
                     </Show>
                 </Show>
             </div>

@@ -1378,9 +1378,10 @@ contract('a done reply asking for confirmation is re-planned once instead of end
 });
 
 contract('repeated actions that leave the screen unchanged are warned about and then stopped', async t => {
-  // The fixture returns the same screenshot every time, so no tap changes the screen.
+  // The fixture returns the same screenshot and elements every time, so no tap changes the screen.
   const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(
-    { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: `Fixture tap ${call}` })));
+    { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: `Fixture tap ${call}` })),
+  { FIXTURE_STATIC_ELEMENTS: 'Button: Fixture' });
   let state;
   await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
   assert.equal(state.task.state, 'failed', JSON.stringify(state.task));

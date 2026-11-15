@@ -40,7 +40,10 @@ const SAME_SCREEN_BITS: u32 = 6;
 /// Latest history entries sent with full detail; older steps are summarized in a step log.
 const DETAILED_HISTORY: usize = 8;
 /// Most earlier steps repeated to the model in the step log.
-const STEP_LOG_ENTRIES: usize = 40;
+const STEP_LOG_ENTRIES: usize = 20;
+/// Longest iphone_wait_for a task may request; long waits for text that never
+/// appears were the slowest steps in on-device testing.
+const MAX_TASK_WAIT_SECONDS: f64 = 10.0;
 /// Goal updates accepted while one task runs.
 const MAX_INSTRUCTION_UPDATES: usize = 20;
 /// Earlier goals repeated to the model after the user changes the goal.
@@ -101,7 +104,7 @@ pub struct TaskManager {
     previous: Mutex<Vec<Value>>,
 }
 /// Finished tasks of a session repeated to the model for context.
-const PREVIOUS_TASKS: usize = 5;
+const PREVIOUS_TASKS: usize = 3;
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -626,6 +629,12 @@ async fn run(
             }
             (action, observation_id, timings)
         };
+        let mut action = action;
+        if action["tool"] == "iphone_wait_for"
+            && action["args"]["timeout"].as_f64().is_some_and(|timeout| timeout > MAX_TASK_WAIT_SECONDS)
+        {
+            action["args"]["timeout"] = json!(MAX_TASK_WAIT_SECONDS);
+        }
         let request = match command_request(action["tool"].as_str().unwrap(), &action["args"]) {
             Ok(request) => request,
             Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
@@ -907,10 +916,13 @@ impl ScreenFingerprint {
             .zip(after.image)
             .map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>() <= SAME_SCREEN_BITS);
         let same_elements = self.elements.zip(after.elements).map(|(a, b)| a == b);
-        if same_image.is_none() && same_elements.is_none() {
-            return None;
+        // Unchanged only when every available signal agrees: a scrolled list keeps a
+        // similar thumbnail but shows different elements.
+        match (same_image, same_elements) {
+            (None, None) => None,
+            (Some(same), None) | (None, Some(same)) => Some(!same),
+            (Some(image), Some(elements)) => Some(!(image && elements)),
         }
-        Some(same_image != Some(true) && same_elements != Some(true))
     }
 }
 /// 16x16 grayscale average hash of a base64 screenshot.
@@ -973,7 +985,7 @@ fn model_history(previous_tasks: &[Value], step_log: &[Value], history: &[Value]
 fn task_summary(snapshot: &Value) -> Value {
     let bounded = |value: &Value, max: usize| value.as_str().map(|s| s.chars().take(max).collect::<String>());
     let steps = snapshot["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let last_steps: Vec<Value> = steps[steps.len().saturating_sub(10)..]
+    let last_steps: Vec<Value> = steps[steps.len().saturating_sub(5)..]
         .iter()
         .map(|step| json!({"tool":step["tool"],"state":step["state"],"reason":bounded(&step["reason"], 80)}))
         .collect();
@@ -1269,9 +1281,11 @@ mod tests {
     #[tokio::test]
     async fn screen_fingerprints_detect_unchanged_and_changed_screens() {
         let a = ScreenFingerprint::of(&json!({"imageBase64":png(0),"elementsText":"Button: A"})).await.unwrap();
-        let same = ScreenFingerprint::of(&json!({"imageBase64":png(0),"elementsText":"Button: B"})).await.unwrap();
-        let other = ScreenFingerprint::of(&json!({"imageBase64":png(255),"elementsText":"Button: C"})).await.unwrap();
-        assert_eq!(a.changed(&same), Some(false), "same image, different tree");
+        let same = ScreenFingerprint::of(&json!({"imageBase64":png(0),"elementsText":"Button: A"})).await.unwrap();
+        let scrolled = ScreenFingerprint::of(&json!({"imageBase64":png(0),"elementsText":"Button: B"})).await.unwrap();
+        let other = ScreenFingerprint::of(&json!({"imageBase64":png(255),"elementsText":"Button: A"})).await.unwrap();
+        assert_eq!(a.changed(&same), Some(false));
+        assert_eq!(a.changed(&scrolled), Some(true), "a similar thumbnail with new elements is a change");
         assert_eq!(a.changed(&other), Some(true));
         let tree = ScreenFingerprint::of(&json!({"elementsText":"Button: A"})).await.unwrap();
         assert_eq!(a.changed(&tree), Some(false), "same tree without an image");
@@ -1306,8 +1320,8 @@ mod tests {
         assert_eq!(summary["result"], "已打开时钟");
         assert_eq!(summary["goalUpdates"], json!(["改为打开秒表"]));
         assert_eq!(summary["steps"], 12);
-        assert_eq!(summary["lastSteps"].as_array().unwrap().len(), 10);
-        assert_eq!(summary["lastSteps"][0]["reason"], "step 2");
+        assert_eq!(summary["lastSteps"].as_array().unwrap().len(), 5);
+        assert_eq!(summary["lastSteps"][0]["reason"], "step 7");
         let history = vec![json!({"tool":"iphone_tap"})];
         assert_eq!(model_history(&[], &[], &history), history);
         let sent = model_history(std::slice::from_ref(&summary), &[], &history);

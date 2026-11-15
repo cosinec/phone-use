@@ -60,7 +60,7 @@ if (process.argv[2] === 'descendant') {
         : request.op === 'type_text' && typingError
         ? { kind: 'error', message: typingError }
         : request.op === 'observe'
-        ? { kind: 'text', text: JSON.stringify({ deviceId: taps && process.env.FIXTURE_RECOVERY_FOREIGN_OBSERVATION ? 'different-device' : process.env.IPHONE_UDID, imageBase64: fixtureImageBase64, caption: taps ? 'fixture fresh screen after action' : 'fixture points 390×844', elementsText: elementDelay > budget ? '' : JSON.stringify({ request, taps, counts }), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
+        ? { kind: 'text', text: JSON.stringify({ deviceId: taps && process.env.FIXTURE_RECOVERY_FOREIGN_OBSERVATION ? 'different-device' : process.env.IPHONE_UDID, imageBase64: fixtureImageBase64, caption: taps ? 'fixture fresh screen after action' : 'fixture points 390×844', elementsText: process.env.FIXTURE_STATIC_ELEMENTS ?? (elementDelay > budget ? '' : JSON.stringify({ request, taps, counts })), ...(elementDelay > budget ? { elementsError: 'fixture element budget exceeded' } : {}), timings: { screenshotMs: 0, elementsMs: Math.min(elementDelay, budget), sourceBytes: 64 } }) }
         : request.op === 'screenshot'
         ? { kind: 'image', jpeg_base64: fixtureImageBase64, caption: 'fixture points 390×844', coordinateMapping: { offsetX: request.region?.[0] ?? 0, offsetY: request.region?.[1] ?? 0, scaleX: request.region ? request.region[2] / 390 : 1, scaleY: request.region ? request.region[3] / 844 : 1 } }
         : request.op === 'list_apps' ? { kind: 'text', text: 'Fixture App: com.example.fixture' }

@@ -57,6 +57,10 @@ pub struct Model {
     cc_models: Vec<String>,
     catalog: Arc<Mutex<Catalog>>,
     format_refused: Arc<Mutex<HashSet<String>>>,
+    /// `AI_REASONING_EFFORT` (default `low`, `off` to omit): shorter hidden reasoning
+    /// means faster steps on reasoning models.
+    reasoning_effort: Option<String>,
+    reasoning_refused: Arc<Mutex<HashSet<String>>>,
     ocr: Arc<crate::ocr::Ocr>,
     observation_mode: ObservationMode,
 }
@@ -164,6 +168,13 @@ impl Model {
             cc_models,
             catalog: Arc::default(),
             format_refused: Arc::default(),
+            reasoning_effort: match get("AI_REASONING_EFFORT").to_ascii_lowercase().as_str() {
+                "" => Some("low".to_owned()),
+                "off" | "none" => None,
+                effort if effort.len() <= 16 && effort.bytes().all(|b| b.is_ascii_lowercase()) => Some(effort.to_owned()),
+                _ => anyhow::bail!("AI_REASONING_EFFORT must be a lowercase effort name or off"),
+            },
+            reasoning_refused: Arc::default(),
             ocr: Arc::new(crate::ocr::Ocr::new(env)),
             observation_mode: ObservationMode::parse(&get("AI_OBSERVATION"))?,
         })
@@ -484,6 +495,11 @@ impl Model {
         if self.format_refused.lock().await.contains(name) {
             use_prompt_schema(&mut payload);
         }
+        if let Some(effort) = &self.reasoning_effort
+            && !self.reasoning_refused.lock().await.contains(name)
+        {
+            payload["reasoning_effort"] = json!(effort);
+        }
         let mut provider_attempt = 0;
         loop {
             provider_attempt += 1;
@@ -517,7 +533,8 @@ impl Model {
             diagnostics.response_headers_ms = Some(diagnostics.started.elapsed().as_millis());
             let status = response.status();
             diagnostics.http_status = Some(status.as_u16());
-            let can_fallback = matches!(status.as_u16(), 400 | 422) && payload.get("response_format").is_some();
+            let can_fallback = matches!(status.as_u16(), 400 | 422)
+                && (payload.get("response_format").is_some() || payload.get("reasoning_effort").is_some());
             if !status.is_success() && !can_fallback {
                 diagnostics.status = "http_error";
                 return Err(ApiError::unavailable(format!(
@@ -546,10 +563,18 @@ impl Model {
             }
             if !status.is_success() {
                 let body = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                if body.contains("response_format") || body.contains("json_schema") {
+                if payload.get("response_format").is_some()
+                    && (body.contains("response_format") || body.contains("json_schema"))
+                {
                     self.format_refused.lock().await.insert(name.to_owned());
                     use_prompt_schema(&mut payload);
                     diagnostics.status = "format_refused";
+                    continue;
+                }
+                // A provider or model without reasoning controls: retry without the field.
+                if body.contains("reasoning") && payload.as_object_mut().unwrap().remove("reasoning_effort").is_some() {
+                    self.reasoning_refused.lock().await.insert(name.to_owned());
+                    diagnostics.status = "reasoning_refused";
                     continue;
                 }
                 diagnostics.status = "http_error";

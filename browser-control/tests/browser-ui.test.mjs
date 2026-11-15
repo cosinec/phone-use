@@ -260,6 +260,24 @@ test("running task accepts a goal update and shows the remaining plan", async (t
   assert.equal(await page.locator("#task-goal-update").inputValue(), "");
 });
 
+test("a failed task offers Continue, which starts a resuming task with the same model and auto-confirm", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: "task", instruction: "打开设置并搜索蓝牙", model: "fixture/other", autoConfirm: true, state: "failed",
+      error: "连续 6 步操作后屏幕都没有变化", confirmation: null, steps: [],
+    };
+  });
+  await page.getByRole("button", { name: "继续任务", exact: true }).click();
+  await page.waitForFunction(() => fixture.calls.some((c) => c.url?.endsWith("/tasks") && c.method === "POST"));
+  const body = await page.evaluate(() => fixture.calls.filter((c) => c.url?.endsWith("/tasks")).at(-1).body);
+  assert.match(body.instruction, /继续完成上一个任务：打开设置并搜索蓝牙/);
+  assert.match(body.instruction, /上次结束原因：连续 6 步操作后屏幕都没有变化/);
+  assert.equal(body.model, "fixture/other");
+  assert.equal(body.autoConfirm, true);
+});
+
 test("model selection, confirmation details and Stop remain independent of held confirm request", async (t) => {
   const page = await pageFor(t);
   await connect(page);
