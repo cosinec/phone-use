@@ -1269,3 +1269,93 @@ contract('default image planning sends a screenshot without starting OCR', async
   assert.equal(content.filter(part => part.type === 'image_url').length, 1);
   assert.equal(JSON.parse(content[0].text).observation.ocr, undefined);
 });
+
+contract('a model plan runs predictable actions from one observation and one model call', async t => {
+  const plan = { type: 'plan', actions: [
+    { tool: 'iphone_tap', args: { x: 20, y: 50 }, reason: 'Focus the fixture field' },
+    { tool: 'iphone_type_text', args: { text: 'fixture', submit: false }, reason: 'Enter the fixture text' },
+    { tool: 'iphone_press_button', args: { button: 'home' }, reason: 'Return home' },
+  ] };
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1 ? plan : { type: 'done', message: 'Plan verified' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.deepEqual(state.task.steps.map(step => [step.tool, step.state, step.planned]), [
+    ['iphone_tap', 'succeeded', false], ['iphone_type_text', 'succeeded', true], ['iphone_press_button', 'succeeded', true],
+  ]);
+  assert.equal(fixture.requests.length, 2);
+  assert.deepEqual(state.task.plan, []);
+  const history = JSON.parse(fixture.requests[1].messages[1].content[0].text).recentHistory;
+  assert.deepEqual(history.map(entry => entry.tool), ['iphone_tap', 'iphone_type_text', 'iphone_press_button']);
+});
+
+contract('a model plan stops before a later coordinate action and re-observes', async t => {
+  const plan = { type: 'plan', actions: [
+    { tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Open the fixture item' },
+    { tool: 'iphone_tap', args: { x: 6, y: 8 }, reason: 'Stale coordinate fixture tap' },
+  ] };
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1 ? plan : { type: 'done', message: 'Re-observed' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.deepEqual(state.task.steps.map(step => step.args), [{ x: 5, y: 7 }]);
+  assert.equal(fixture.requests.length, 2);
+  assert.equal((await nativeCounts(fixture)).taps, 1);
+});
+
+contract('a goal update during planning re-plans from the same screen for the new goal', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const fixture = await modelReplyTask(t, async call => {
+    if (call === 1) {
+      await gate;
+      return modelCompletion(JSON.stringify({ type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Old goal tap' }));
+    }
+    return modelCompletion(JSON.stringify({ type: 'done', message: 'New goal verified' }));
+  });
+  await until(() => fixture.requests.length === 1);
+  const url = `${fixture.route}/tasks/${fixture.task.id}/instruction`;
+  for (const invalid of [{}, { instruction: '' }, { instruction: 'x'.repeat(4001) }, { instruction: 'ok', extra: true }]) {
+    assert.equal((await fixture.app.api(url, fixture.session.token, invalid)).status, 400, JSON.stringify(invalid).slice(0, 40));
+  }
+  assert.equal((await fixture.app.api(`${fixture.route}/tasks/missing/instruction`, fixture.session.token, { instruction: 'x' })).status, 404);
+  const updated = await fixture.app.api(url, fixture.session.token, { instruction: 'New fixture goal' });
+  assert.equal(updated.status, 200, await updated.clone().text());
+  assert.equal((await updated.json()).instruction, 'New fixture goal');
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.message, 'New goal verified');
+  assert.equal(state.task.steps.length, 0);
+  assert.equal(state.task.instructionUpdates.length, 1);
+  assert.equal(state.task.instructionUpdates[0].previous, 'Inspect the fixture safely');
+  assert.equal(fixture.requests.length, 2);
+  const instruction = JSON.parse(fixture.requests[1].messages[1].content[0].text).instruction;
+  assert.match(instruction, /CURRENT GOAL[^\n]*New fixture goal/);
+  assert.match(instruction, /Inspect the fixture safely/);
+  const counts = await nativeCounts(fixture);
+  assert.equal(counts.taps, 0);
+  assert.equal(counts.counts.screenshot, 1, 'the second plan reuses the first observation');
+  assert.equal((await fixture.app.api(url, fixture.session.token, { instruction: 'Too late' })).status, 409);
+});
+
+contract('a goal update voids an action awaiting confirmation without sending it', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call === 1
+    ? { type: 'action', tool: 'iphone_tap', args: { x: 5, y: 7 }, reason: 'Fixture tap needing confirmation', requiresConfirmation: true }
+    : { type: 'done', message: 'Confirmation voided' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return state.task?.state === 'awaiting_confirmation'; });
+  const actionId = state.task.confirmation.actionId;
+  const updated = await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/instruction`, fixture.session.token, { instruction: 'Do not tap' });
+  assert.equal(updated.status, 200, await updated.clone().text());
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.deepEqual(state.task.steps.map(step => step.state), ['cancelled']);
+  assert.equal(state.task.confirmation, null);
+  const stale = await fixture.app.api(`${fixture.route}/tasks/${fixture.task.id}/confirm`, fixture.session.token, { actionId, approved: true });
+  assert.equal(stale.status, 409);
+  assert.equal((await nativeCounts(fixture)).taps, 0);
+  const history = JSON.parse(fixture.requests[1].messages[1].content[0].text).recentHistory;
+  assert.equal(history[0].state, 'cancelled');
+});

@@ -610,7 +610,7 @@ async fn bounded_cc_body(mut response: reqwest::Response, limit: usize) -> Resul
 fn correction_message(error: &str) -> String {
     format!("Your previous reply failed validation: {error}. {CORRECTION_INSTRUCTIONS}")
 }
-const CORRECTION_INSTRUCTIONS: &str = "Return exactly one complete JSON object using the response schema and nothing after it. If your previous reply contained several objects, return only the first action you intended. Keep the tool and arguments you intended when they were valid; otherwise choose the actual tool and arguments from the original tool catalog. An action has type \"action\", a string tool name from the catalog, object args, a string reason and a boolean requiresConfirmation. For completion or inability to proceed, use type \"done\" with a string message. Preserve the original task, safety and confirmation requirements. Do not include markdown or extra text.";
+const CORRECTION_INSTRUCTIONS: &str = "Return exactly one complete JSON object using the response schema and nothing after it. If your previous reply contained several separate objects, return only the first action you intended, or combine at most 4 predictable actions into one plan object. Keep the tool and arguments you intended when they were valid; otherwise choose the actual tool and arguments from the original tool catalog. An action has type \"action\", a string tool name from the catalog, object args, a string reason and a boolean requiresConfirmation. A plan has type \"plan\" and an actions array of 2 to 4 such actions without type fields. For completion or inability to proceed, use type \"done\" with a string message. Preserve the original task, safety and confirmation requirements. Do not include markdown or extra text.";
 
 fn decode_logged_reply(choice: &Value, attempt: u8, observation_id: &str) -> Result<Value> {
     let mut decoded = DecodeDiagnostics::default();
@@ -629,6 +629,7 @@ fn decode_logged_reply(choice: &Value, attempt: u8, observation_id: &str) -> Res
 fn protocol_decode_category(result: &Result<Value>) -> &'static str {
     match result {
         Ok(action) if action["type"] == "done" => "done",
+        Ok(action) if action["type"] == "plan" => "plan",
         Ok(_) => "action",
         Err(error) if error.message.contains("response was truncated") => "truncated",
         Err(error) if error.message.contains("message.content") => "content_shape",
@@ -838,8 +839,44 @@ fn decode_reply_with(choice: &Value, diagnostics: &mut DecodeDiagnostics) -> Res
     Err(first_error.unwrap_or_else(|| invalid_reply("invalid JSON: empty reply")))
 }
 
+/// Most actions one model reply may plan. The gateway runs them without new
+/// observations, so it may stop earlier (see `tasks::plan_prefix`).
+pub const MAX_PLAN_ACTIONS: usize = 4;
+
 pub fn validate_reply(mut value: Value) -> Result<Value> {
     let obj = value.as_object().ok_or_else(|| invalid_reply("expected a JSON object"))?;
+    if obj.get("type").and_then(Value::as_str) == Some("plan") {
+        if obj.keys().any(|k| !["type", "actions"].contains(&k.as_str())) {
+            return Err(invalid_reply("plan only accepts type and actions fields"));
+        }
+        let actions = value["actions"]
+            .as_array()
+            .filter(|actions| !actions.is_empty())
+            .ok_or_else(|| invalid_reply("plan actions must be a nonempty array"))?;
+        if actions.len() > MAX_PLAN_ACTIONS {
+            return Err(invalid_reply(&format!("plan accepts at most {MAX_PLAN_ACTIONS} actions")));
+        }
+        let mut validated = Vec::with_capacity(actions.len());
+        for (index, action) in actions.iter().enumerate() {
+            let mut action = action.clone();
+            if let Some(fields) = action.as_object_mut() {
+                fields.entry("type").or_insert_with(|| json!("action"));
+            }
+            // Plans never nest and never contain completion replies.
+            if action["type"] != "action" {
+                return Err(invalid_reply(&format!("plan action {} must be an action", index + 1)));
+            }
+            let action = validate_reply(action).map_err(|error| {
+                let detail = error.message.strip_prefix("Invalid model reply: ").unwrap_or(&error.message).to_owned();
+                invalid_reply(&format!("plan action {}: {detail}", index + 1))
+            })?;
+            validated.push(action);
+        }
+        if validated.len() == 1 {
+            return Ok(validated.remove(0));
+        }
+        return Ok(json!({"type":"plan","actions":validated}));
+    }
     if obj.get("type").and_then(Value::as_str) == Some("done") {
         if obj.keys().any(|k| !["type", "message"].contains(&k.as_str())) {
             return Err(invalid_reply("done only accepts type and message fields"));

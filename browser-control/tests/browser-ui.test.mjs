@@ -232,6 +232,32 @@ test("recovering task shows the waiting message, uncertain step and usable Stop 
   assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith("/stop")).length), 1);
 });
 
+test("running task accepts a goal update and shows the remaining plan", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: "task", instruction: "打开设置", state: "executing", confirmation: null, timings: {},
+      plan: [{ tool: "iphone_type_text", reason: "输入" }, { tool: "iphone_wait_for", reason: "等待" }],
+      steps: [
+        { id: "step", tool: "iphone_tap", reason: "点搜索框", state: "succeeded", planned: false },
+        { id: "step-2", tool: "iphone_press_button", reason: "回到主屏幕", state: "executing", planned: true },
+      ],
+    };
+  });
+  await page.getByText("已规划、待执行：输入文字 → 等待界面", { exact: true }).waitFor();
+  assert.match(await page.locator(".step-list li").nth(1).textContent(), /连续执行/);
+  assert.doesNotMatch(await page.locator(".step-list li").nth(0).textContent(), /连续执行/);
+  await page.locator("#task-goal-update").fill("改为打开时钟");
+  await page.getByRole("button", { name: "更新目标", exact: true }).click();
+  await page.waitForFunction(() =>
+    fixture.calls.some((c) => c.url?.endsWith("/tasks/task/instruction") && c.body?.instruction === "改为打开时钟"),
+  );
+  await page.getByText("第 2 步后更新了目标，原目标：打开设置", { exact: true }).waitFor();
+  assert.equal(await page.locator(".current-instruction").textContent(), "改为打开时钟");
+  assert.equal(await page.locator("#task-goal-update").inputValue(), "");
+});
+
 test("model selection, confirmation details and Stop remain independent of held confirm request", async (t) => {
   const page = await pageFor(t);
   await connect(page);

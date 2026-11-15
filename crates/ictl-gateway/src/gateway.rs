@@ -1246,6 +1246,15 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             }
             Ok(reply(200, s.tasks.stop(task).await?))
         }
+        (Method::POST, ["tasks", task, "instruction"]) => {
+            let input = body(request).await?;
+            if input.as_object().unwrap().keys().any(|k| !["instruction"].contains(&k.as_str()))
+                || !input["instruction"].is_string()
+            {
+                return Err(ApiError::new(400, "Invalid instruction update"));
+            }
+            Ok(reply(200, s.tasks.steer(task, input["instruction"].as_str().unwrap()).await?))
+        }
         (Method::POST, ["tasks", task, "confirm"]) => {
             let input = body(request).await?;
             if input.as_object().unwrap().keys().any(|k| !["actionId", "approved"].contains(&k.as_str()))

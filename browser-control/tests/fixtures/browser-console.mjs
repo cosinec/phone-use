@@ -155,6 +155,18 @@ const fetchImpl = async (url, options = {}) => {
     };
     return reply(fixture.state.task);
   }
+  if (url.endsWith("/instruction")) {
+    const task = fixture.state.task;
+    fixture.state.task = {
+      ...task,
+      instruction: body.instruction,
+      instructionUpdates: [
+        ...(task.instructionUpdates || []),
+        { instruction: body.instruction, previous: task.instruction, afterStep: task.steps.length },
+      ],
+    };
+    return reply(fixture.state.task);
+  }
   if (url.endsWith("/confirm")) {
     if (fixture.holdConfirm)
       await new Promise((resolve) => (releaseConfirm = resolve));

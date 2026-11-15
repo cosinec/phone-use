@@ -156,6 +156,13 @@ impl Ui {
         let task = session["task"].clone();
         let _ = call(&self.actions.get_value(), "stop", &[json(session["id"].clone()), json(task["id"].clone())]);
     }
+    pub fn steer(self, instruction: String) {
+        let task = self.task();
+        if task.is_null() || !self.running() {
+            return;
+        }
+        self.run(move |client| client.steer_task(string(&task, "id"), instruction));
+    }
     pub fn confirm(self, approved: bool) {
         let task = self.task();
         if task["confirmation"].is_null() {

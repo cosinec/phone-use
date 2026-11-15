@@ -6,6 +6,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -23,6 +24,18 @@ const MAX_OCR_ELEMENT_MISSES: u32 = 2;
 /// arguments, Back on iOS) never reach the device. Report them to the model
 /// and re-plan, at most this many times per task.
 const MAX_REJECTED_ACTIONS: u32 = 2;
+/// A timed-out iphone_wait_for is read-only, so it is reported back to the
+/// model instead of halting, at most this many times per task.
+const MAX_WAIT_MISSES: u32 = 3;
+/// Goal updates accepted while one task runs.
+const MAX_INSTRUCTION_UPDATES: usize = 20;
+/// Earlier goals repeated to the model after the user changes the goal.
+const EARLIER_GOALS: usize = 3;
+/// Coordinates come from the observation the model saw; only a plan's first action may use them.
+const COORDINATE_TOOLS: [&str; 3] = ["iphone_tap", "iphone_swipe", "iphone_long_press"];
+/// Read-only results become the next observation, so they end a plan.
+const QUERY_TOOLS: [&str; 5] =
+    ["iphone_screenshot", "iphone_list_elements", "iphone_status", "iphone_list_apps", "iphone_list_devices"];
 
 struct TaskStage<'a> {
     session_id: &'a str,
@@ -63,6 +76,9 @@ struct Task {
     cancel: CancellationToken,
     confirmation: Option<oneshot::Sender<()>>,
     lease: Option<crate::control::TaskLease>,
+    /// Armed only while a goal update may safely abandon the current phase:
+    /// model planning, a confirmation wait or a read-only iphone_wait_for.
+    interrupt: Option<CancellationToken>,
 }
 pub struct TaskManager {
     task: Mutex<Option<Task>>,
@@ -95,9 +111,7 @@ impl TaskManager {
         model: Model,
         images: Vec<crate::attachments::ReferenceImage>,
     ) -> Result<Value> {
-        if instruction.trim().is_empty() || instruction.chars().count() > 4000 || instruction.contains('\0') {
-            return Err(ApiError::new(400, "Invalid task instruction"));
-        }
+        let instruction = valid_instruction(instruction)?;
         let mut guard = self.task.lock().await;
         if guard.as_ref().is_some_and(|t| !terminal(&t.snapshot["state"])) {
             return Err(ApiError::new(409, "Session already has an active task"));
@@ -109,9 +123,10 @@ impl TaskManager {
         let id = uuid::Uuid::new_v4().to_string();
         let cancel = session.cancel.child_token();
         let snapshot = json!({
-            "id": id, "instruction": instruction.trim(), "model": model.name, "state": "observing", "steps": [],
+            "id": id, "instruction": instruction, "model": model.name, "state": "observing", "steps": [],
             "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
-            "observationId":null,"attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100
+            "observationId":null,"attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100,
+            "instructionUpdates":[],"plan":[],"discardedPlanActions":0
         });
         *guard = Some(Task {
             session_id: session.id.clone(),
@@ -120,6 +135,7 @@ impl TaskManager {
             cancel: cancel.clone(),
             confirmation: None,
             lease: Some(lease.clone()),
+            interrupt: None,
         });
         drop(guard);
         tokio::spawn(async move {
@@ -167,7 +183,9 @@ impl TaskManager {
         task.snapshot["error"] = json!(error);
         task.snapshot["finishedAt"] = json!(now());
         task.snapshot["confirmation"] = Value::Null;
+        task.snapshot["plan"] = json!([]);
         task.confirmation = None;
+        task.interrupt = None;
         task.cancel.cancel();
         if let Some(lease) = task.lease.take() {
             lease.cancel();
@@ -216,6 +234,55 @@ impl TaskManager {
             self.finish(id, "stopped", Some("Action confirmation declined.".into()), None).await;
             Ok(self.snapshot().await)
         }
+    }
+    /// Replaces the goal of a running task. Already sent actions are kept; the
+    /// next plan uses the new goal, and phases that sent nothing to the phone
+    /// (planning, a pending confirmation, a read-only wait) are abandoned now.
+    pub async fn steer(&self, id: &str, instruction: &str) -> Result<Value> {
+        let instruction = valid_instruction(instruction)?;
+        let mut guard = self.task.lock().await;
+        let task =
+            guard.as_mut().filter(|t| t.snapshot["id"] == id).ok_or_else(|| ApiError::new(404, "Task not found"))?;
+        if terminal(&task.snapshot["state"]) || task.cancel.is_cancelled() {
+            return Err(ApiError::new(409, "Task is not running"));
+        }
+        if instruction_updates(&task.snapshot) >= MAX_INSTRUCTION_UPDATES {
+            return Err(ApiError::new(429, "本次任务的目标更新次数已达上限，请停止后重新开始。"));
+        }
+        let previous = task.snapshot["instruction"].clone();
+        let after_step = task.snapshot["steps"].as_array().map_or(0, Vec::len);
+        task.snapshot["instruction"] = json!(instruction);
+        task.snapshot["instructionUpdates"].as_array_mut().unwrap().push(json!({
+            "at": now(), "instruction": instruction, "previous": previous, "afterStep": after_step
+        }));
+        if let Some(interrupt) = task.interrupt.take() {
+            interrupt.cancel();
+        }
+        Ok(task.snapshot.clone())
+    }
+    /// Arms a goal-update interrupt for a phase that has sent nothing to the phone.
+    /// A goal update that arrived after `seen_updates` was read, but before
+    /// arming, interrupts at once instead of being missed.
+    async fn arm_interrupt(
+        &self,
+        id: &str,
+        cancel: &CancellationToken,
+        seen_updates: usize,
+    ) -> Result<CancellationToken> {
+        let interrupt = cancel.child_token();
+        let armed = interrupt.clone();
+        self.update(id, move |t| {
+            if instruction_updates(&t.snapshot) == seen_updates {
+                t.interrupt = Some(armed);
+            } else {
+                armed.cancel();
+            }
+        })
+        .await?;
+        Ok(interrupt)
+    }
+    async fn disarm_interrupt(&self, id: &str) {
+        let _ = self.update(id, |t| t.interrupt = None).await;
     }
     async fn update(&self, id: &str, operation: impl FnOnce(&mut Task)) -> Result<Value> {
         let mut guard = self.task.lock().await;
@@ -328,109 +395,151 @@ async fn run(
     let mut focus_recoveries = 0;
     let mut element_misses = 0;
     let mut rejected_actions = 0;
+    let mut wait_misses = 0;
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
+    // Remaining actions of a model plan, dispatched without re-observing.
+    let mut queue: VecDeque<Value> = VecDeque::new();
+    let mut plan_observation_id = String::new();
+    let mut seen_updates = 0;
     loop {
-        let observation_id = uuid::Uuid::new_v4().to_string();
-        let snapshot = s
-            .tasks
-            .update(id, |task| {
-                task.snapshot["state"] = json!("observing");
-                task.snapshot["observationId"] = json!(observation_id);
-            })
-            .await?;
-        let observing = Instant::now();
-        let observation_stage = TaskStage::start(&s.id, id, &observation_id, "observe");
-        let direct =
-            if images.is_empty() && history.is_empty() && snapshot["steps"].as_array().is_some_and(Vec::is_empty) {
+        let snapshot = s.tasks.update(id, |_| {}).await?;
+        if instruction_updates(&snapshot) != seen_updates {
+            // The user changed the goal: actions planned for the old goal are void.
+            seen_updates = instruction_updates(&snapshot);
+            discard_plan(&s, id, &mut queue).await?;
+        }
+        let (action, observation_id, mut timings) = if let Some(action) = queue.pop_front() {
+            let remaining = plan_view(&queue);
+            s.tasks.update(id, move |t| t.snapshot["plan"] = remaining).await?;
+            (action, plan_observation_id.clone(), json!({"planned":true}))
+        } else {
+            let observation_id = uuid::Uuid::new_v4().to_string();
+            s.tasks
+                .update(id, |task| {
+                    task.snapshot["state"] = json!("observing");
+                    task.snapshot["observationId"] = json!(observation_id);
+                })
+                .await?;
+            let observing = Instant::now();
+            let observation_stage = TaskStage::start(&s.id, id, &observation_id, "observe");
+            let direct = if images.is_empty()
+                && history.is_empty()
+                && snapshot["steps"].as_array().is_some_and(Vec::is_empty)
+            {
                 direct_command_for(snapshot["instruction"].as_str().unwrap_or(""), s.device.platform)
             } else {
                 None
             };
-        let observation_result = async {
-            if direct.is_some() {
-                Ok(json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"}))
-            } else if let Some(observation) = next_observation.take() {
-                Ok(observation)
-            } else {
-                match s.task_screen(cancel.clone(), lease, model.wants_elements()).await {
-                    Ok(observation) => Ok(observation),
-                    Err(error)
-                        if s.device.platform == crate::identity::Platform::Ios
-                            && recoverable_observation_error(&error.message) =>
-                    {
-                        recoveries += 1;
-                        recover_observation(&s, id, recoveries, cancel.clone(), lease, model.wants_elements()).await
+            let observation_result = async {
+                if direct.is_some() {
+                    Ok(json!({"deviceId":s.device.serial_number,"caption":"Explicit user command"}))
+                } else if let Some(observation) = next_observation.take() {
+                    Ok(observation)
+                } else {
+                    match s.task_screen(cancel.clone(), lease, model.wants_elements()).await {
+                        Ok(observation) => Ok(observation),
+                        Err(error)
+                            if s.device.platform == crate::identity::Platform::Ios
+                                && recoverable_observation_error(&error.message) =>
+                        {
+                            recoveries += 1;
+                            recover_observation(&s, id, recoveries, cancel.clone(), lease, model.wants_elements())
+                                .await
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
             }
-        }
-        .await;
-        observation_stage.finish(if observation_result.is_ok() { "ok" } else { "error" });
-        let mut observation = observation_result?;
-        observation["observationId"] = json!(observation_id);
-        let query_only = observation["queryOnly"] == true;
-        if observation["deviceId"] != s.device.serial_number {
-            return Err(ApiError::new(409, "Observation device identity mismatch"));
-        }
-        let mut timings =
-            json!({"observationMs":observing.elapsed().as_millis() as u64,"capture":observation["timings"]});
-        s.tasks
-            .update(id, |t| {
-                t.snapshot["state"] = json!("thinking");
-                t.snapshot["timings"] = timings.clone();
-            })
-            .await?;
-        let steps = snapshot["steps"].as_array().unwrap();
-        compact_history(&mut history);
-        while history.len() > 8 || history.iter().map(|v| v.to_string().len()).sum::<usize>() > HISTORY_CHARS {
-            history.remove(0);
-        }
-        let thinking = Instant::now();
-        let model_stage = TaskStage::start(&s.id, id, &observation_id, "model");
-        let action_result = if let Some(direct) = direct {
-            timings["direct"] = json!(true);
-            Ok(direct)
-        } else {
-            model
-                .generate(
-                    snapshot["instruction"].as_str().unwrap(),
-                    observation,
-                    history.clone(),
-                    &images,
-                    cancel.clone(),
-                )
-                .await
-                .and_then(validate_reply)
-        };
-        model_stage.finish(if action_result.is_ok() { "ok" } else { "error" });
-        let action = action_result?;
-        timings["modelMs"] = json!(thinking.elapsed().as_millis() as u64);
-        s.tasks.update(id, |t| t.snapshot["timings"] = timings.clone()).await?;
-        if cancel.is_cancelled() {
-            return Err(ApiError::new(409, "Task cancelled"));
-        }
-        if action["type"] == "done" {
-            if input_pending {
-                return Err(ApiError::unavailable("Text input is still pending; task halted"));
+            .await;
+            observation_stage.finish(if observation_result.is_ok() { "ok" } else { "error" });
+            let mut observation = observation_result?;
+            observation["observationId"] = json!(observation_id);
+            let query_only = observation["queryOnly"] == true;
+            if observation["deviceId"] != s.device.serial_number {
+                return Err(ApiError::new(409, "Observation device identity mismatch"));
             }
-            return Ok(action["message"].as_str().unwrap().to_owned());
-        }
-        if steps.len() >= 100 {
+            let mut timings =
+                json!({"observationMs":observing.elapsed().as_millis() as u64,"capture":observation["timings"]});
+            let snapshot = s
+                .tasks
+                .update(id, |t| {
+                    t.snapshot["state"] = json!("thinking");
+                    t.snapshot["timings"] = timings.clone();
+                })
+                .await?;
+            compact_history(&mut history);
+            while history.len() > 8 || history.iter().map(|v| v.to_string().len()).sum::<usize>() > HISTORY_CHARS {
+                history.remove(0);
+            }
+            let thinking = Instant::now();
+            let model_stage = TaskStage::start(&s.id, id, &observation_id, "model");
+            // Kept to re-plan from the same screen when the goal changes during planning.
+            let reusable = direct.is_none().then(|| observation.clone());
+            let action_result = if let Some(direct) = direct {
+                timings["direct"] = json!(true);
+                Ok(direct)
+            } else {
+                let interrupt = s.tasks.arm_interrupt(id, &cancel, seen_updates).await?;
+                let result = model
+                    .generate(&model_instruction(&snapshot), observation, history.clone(), &images, interrupt)
+                    .await
+                    .and_then(validate_reply);
+                s.tasks.disarm_interrupt(id).await;
+                result
+            };
+            model_stage.finish(if action_result.is_ok() { "ok" } else { "error" });
+            if cancel.is_cancelled() {
+                return Err(ApiError::new(409, "Task cancelled"));
+            }
+            if instruction_updates(&s.tasks.update(id, |_| {}).await?) != seen_updates {
+                // Nothing was dispatched for the old goal: plan again for the new one.
+                next_observation = reusable;
+                continue;
+            }
+            let action = action_result?;
+            timings["modelMs"] = json!(thinking.elapsed().as_millis() as u64);
+            s.tasks.update(id, |t| t.snapshot["timings"] = timings.clone()).await?;
+            if action["type"] == "done" {
+                if input_pending {
+                    return Err(ApiError::unavailable("Text input is still pending; task halted"));
+                }
+                return Ok(action["message"].as_str().unwrap().to_owned());
+            }
+            let action = if action["type"] == "plan" {
+                let mut actions = plan_prefix(action["actions"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+                if actions.is_empty() {
+                    return Err(ApiError::unavailable("Invalid model reply: empty plan"));
+                }
+                let first = actions.remove(0);
+                queue.extend(actions);
+                plan_observation_id = observation_id.clone();
+                timings["plannedActions"] = json!(queue.len() + 1);
+                let remaining = plan_view(&queue);
+                s.tasks.update(id, move |t| t.snapshot["plan"] = remaining).await?;
+                first
+            } else {
+                action
+            };
+            // A text-only query result is sufficient for app lookup/completion, but
+            // never authorizes invented screen coordinates. Re-observe and re-plan first.
+            if query_only && matches!(action["tool"].as_str(), Some("iphone_tap" | "iphone_swipe" | "iphone_long_press"))
+            {
+                discard_plan(&s, id, &mut queue).await?;
+                continue;
+            }
+            (action, observation_id, timings)
+        };
+        if snapshot["steps"].as_array().map_or(0, Vec::len) >= 100 {
             return Err(ApiError::new(409, "任务已达到 100 步上限"));
-        }
-        // A text-only query result is sufficient for app lookup/completion, but
-        // never authorizes invented screen coordinates. Re-observe and re-plan first.
-        if query_only && matches!(action["tool"].as_str(), Some("iphone_tap" | "iphone_swipe" | "iphone_long_press")) {
-            continue;
         }
         let request = match command_request(action["tool"].as_str().unwrap(), &action["args"]) {
             Ok(request) => request,
             Err(error) if error.status == 400 && rejected_actions < MAX_REJECTED_ACTIONS => {
                 rejected_actions += 1;
                 history.push(rejected_history(&action, &error));
+                discard_plan(&s, id, &mut queue).await?;
                 continue;
             }
             Err(error) => return Err(error),
@@ -438,6 +547,7 @@ async fn run(
         if typing_blocked && request["op"] == "type_text" {
             // Nothing is sent: return the action to the model to tap the field first,
             // within the same re-plan budget as other gateway rejections.
+            discard_plan(&s, id, &mut queue).await?;
             if rejected_actions < MAX_REJECTED_ACTIONS {
                 rejected_actions += 1;
                 history.push(rejected_history(&action, &ApiError::new(409, FOCUS_FIRST)));
@@ -448,7 +558,8 @@ async fn run(
         let step_id = uuid::Uuid::new_v4().to_string();
         let step = json!({
             "id": step_id, "tool": action["tool"], "args": action["args"], "reason": action["reason"],
-            "state": "pending", "startedAt": now(), "finishedAt": null, "result": null
+            "state": "pending", "startedAt": now(), "finishedAt": null, "result": null,
+            "planned": timings["planned"] == true
         });
         let needs_confirmation = confirmation_required(&action, &request);
         let (sender, receiver) = oneshot::channel();
@@ -467,7 +578,33 @@ async fn run(
             })
             .await?;
         if needs_confirmation {
-            tokio::select! {biased;_=cancel.cancelled()=>return Err(ApiError::new(409,"Task cancelled")),r=receiver=>r.map_err(|_|ApiError::new(409,"Task cancelled"))?}
+            let interrupt = s.tasks.arm_interrupt(id, &cancel, seen_updates).await?;
+            let confirmed = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ApiError::new(409, "Task cancelled")),
+                r = receiver => {
+                    r.map_err(|_| ApiError::new(409, "Task cancelled"))?;
+                    true
+                }
+                _ = interrupt.cancelled() => false,
+            };
+            s.tasks.disarm_interrupt(id).await;
+            if !confirmed {
+                // The goal changed before the user confirmed: this action was never sent.
+                s.tasks
+                    .update(id, |t| {
+                        t.confirmation = None;
+                        t.snapshot["confirmation"] = Value::Null;
+                        t.snapshot["state"] = json!("thinking");
+                        let step = t.snapshot["steps"].as_array_mut().unwrap().last_mut().unwrap();
+                        step["state"] = json!("cancelled");
+                        step["finishedAt"] = json!(now());
+                    })
+                    .await?;
+                history.push(not_dispatched_history(&action, GOAL_CHANGED_BEFORE_CONFIRMATION));
+                discard_plan(&s, id, &mut queue).await?;
+                continue;
+            }
         }
         s.tasks
             .update(id, |t| {
@@ -481,12 +618,33 @@ async fn run(
         });
         let executing = Instant::now();
         let action_stage = TaskStage::start(&s.id, id, &observation_id, "action");
-        let action_result = s.run_task_command(command, cancel.clone(), lease).await;
+        // A wait only reads the screen, so a goal update may abandon it safely.
+        let interruptible = action["tool"] == "iphone_wait_for";
+        let action_cancel = if interruptible { s.tasks.arm_interrupt(id, &cancel, seen_updates).await? } else { cancel.clone() };
+        let action_result = s.run_task_command(command, action_cancel.clone(), lease).await;
+        if interruptible {
+            s.tasks.disarm_interrupt(id).await;
+        }
         action_stage.finish(if action_result.as_ref().is_ok_and(|result| result["kind"] != "error") {
             "ok"
         } else {
             "error"
         });
+        timings["actionMs"] = json!(executing.elapsed().as_millis() as u64);
+        if interruptible && action_cancel.is_cancelled() && !cancel.is_cancelled() {
+            history.push(not_dispatched_history(&action, WAIT_INTERRUPTED));
+            s.tasks
+                .update(id, |t| {
+                    t.snapshot["timings"] = timings.clone();
+                    let step = t.snapshot["steps"].as_array_mut().unwrap().last_mut().unwrap();
+                    step["timings"] = timings;
+                    step["finishedAt"] = json!(now());
+                    step["state"] = json!("cancelled");
+                })
+                .await?;
+            discard_plan(&s, id, &mut queue).await?;
+            continue;
+        }
         let mut rejected = false;
         let result = match action_result {
             Ok(result) => result,
@@ -502,7 +660,6 @@ async fn run(
             }
             Err(error) => return Err(error),
         };
-        timings["actionMs"] = json!(executing.elapsed().as_millis() as u64);
         let missed = if result.get("outcome").is_some() {
             result["outcome"]["tapped_nothing"] == true
         } else {
@@ -552,8 +709,17 @@ async fn run(
                 step["state"] = json!(state);
             })
             .await?;
+        // The rest of a plan assumed this action succeeded and needed no review.
+        if state != "succeeded" || needs_confirmation || next_observation.is_some() {
+            discard_plan(&s, id, &mut queue).await?;
+        }
         if rejected {
             // Nothing reached the device; observe again and let the model re-plan.
+            continue;
+        }
+        if failed && !recoverable && action["tool"] == "iphone_wait_for" && wait_misses < MAX_WAIT_MISSES {
+            // A wait that timed out only read the screen; let the model look again.
+            wait_misses += 1;
             continue;
         }
         if failed {
@@ -607,6 +773,90 @@ async fn run(
             input_pending = false;
         }
     }
+}
+
+/// Number of goal updates the user has made to this task.
+fn instruction_updates(snapshot: &Value) -> usize {
+    snapshot["instructionUpdates"].as_array().map_or(0, Vec::len)
+}
+
+/// The goal sent to the model. After the user changes the goal mid-task, the
+/// model also sees the most recent earlier goals so it can build on (or undo)
+/// steps already taken for them without pursuing them further.
+fn model_instruction(snapshot: &Value) -> String {
+    let current = snapshot["instruction"].as_str().unwrap_or("");
+    let earlier: Vec<&str> = snapshot["instructionUpdates"]
+        .as_array()
+        .map(|updates| updates.iter().filter_map(|update| update["previous"].as_str()).collect())
+        .unwrap_or_default();
+    if earlier.is_empty() {
+        return current.to_owned();
+    }
+    let mut text = format!(
+        "CURRENT GOAL (the user changed the goal while this task was running; it replaces every earlier goal): {current}\nEarlier goals, oldest first, for context only:"
+    );
+    for goal in &earlier[earlier.len().saturating_sub(EARLIER_GOALS)..] {
+        text.push_str("\n- ");
+        text.push_str(&goal.chars().take(1000).collect::<String>());
+    }
+    text.push_str("\nSteps in recentHistory may have served an earlier goal. Build on them when they help the current goal, undo them only when the current goal requires it, and never repeat completed steps.");
+    text
+}
+
+/// Keeps the longest prefix of a model plan that may run without re-observing.
+/// The first action is always kept; it has the same checks as a single action.
+fn plan_prefix(actions: &[Value]) -> Vec<Value> {
+    let mut kept: Vec<Value> = Vec::new();
+    for action in actions.iter().take(crate::model::MAX_PLAN_ACTIONS) {
+        if let Some(previous) = kept.last() {
+            let tool = action["tool"].as_str().unwrap_or("");
+            let previous_tool = previous["tool"].as_str().unwrap_or("");
+            if COORDINATE_TOOLS.contains(&tool)
+                || QUERY_TOOLS.contains(&previous_tool)
+                || previous["requiresConfirmation"] == true
+                || (tool == "iphone_type_text" && !["iphone_tap", "iphone_tap_element"].contains(&previous_tool))
+            {
+                break;
+            }
+        }
+        kept.push(action.clone());
+    }
+    kept
+}
+
+fn plan_view(queue: &VecDeque<Value>) -> Value {
+    json!(queue.iter().map(|action| json!({"tool":action["tool"],"reason":action["reason"]})).collect::<Vec<_>>())
+}
+
+/// Drops the planned actions that were not dispatched; nothing reached the phone.
+async fn discard_plan(s: &Session, id: &str, queue: &mut VecDeque<Value>) -> Result<()> {
+    if queue.is_empty() {
+        return Ok(());
+    }
+    let discarded = queue.len() as u64;
+    queue.clear();
+    s.tasks
+        .update(id, move |t| {
+            let total = t.snapshot["discardedPlanActions"].as_u64().unwrap_or(0) + discarded;
+            t.snapshot["discardedPlanActions"] = json!(total);
+            t.snapshot["plan"] = json!([]);
+        })
+        .await?;
+    Ok(())
+}
+
+const GOAL_CHANGED_BEFORE_CONFIRMATION: &str =
+    "Not sent to the device: the user changed the goal before confirming this action.";
+const WAIT_INTERRUPTED: &str = "Interrupted by a goal update; this read-only wait changed nothing on the device.";
+fn not_dispatched_history(action: &Value, message: &str) -> Value {
+    json!({"tool":action["tool"],"args":action["args"],"reason":action["reason"],"state":"cancelled",
+        "result":{"kind":"text","text":message}})
+}
+fn valid_instruction(instruction: &str) -> Result<&str> {
+    if instruction.trim().is_empty() || instruction.chars().count() > 4000 || instruction.contains('\0') {
+        return Err(ApiError::new(400, "Invalid task instruction"));
+    }
+    Ok(instruction.trim())
 }
 fn direct_command_for(instruction: &str, platform: crate::identity::Platform) -> Option<Value> {
     let mut action = direct_command(instruction)?;
@@ -779,5 +1029,73 @@ mod tests {
         let result = inference_result(&json!({"kind":"text","text":"中".repeat(7000)}));
         assert_eq!(result["text"].as_str().unwrap().chars().count(), 6000);
         assert_eq!(result["truncated"], true);
+    }
+    #[test]
+    fn plans_keep_only_actions_that_need_no_fresh_observation() {
+        let a = |tool: &str| json!({"type":"action","tool":tool,"args":{},"reason":"fixture","requiresConfirmation":false});
+        let tools = |plan: Vec<Value>| {
+            plan_prefix(&plan).iter().map(|v| v["tool"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            tools(vec![a("iphone_tap"), a("iphone_type_text"), a("iphone_wait_for"), a("iphone_press_button")]),
+            ["iphone_tap", "iphone_type_text", "iphone_wait_for", "iphone_press_button"]
+        );
+        // Later coordinates would come from a stale observation.
+        assert_eq!(tools(vec![a("iphone_tap"), a("iphone_swipe")]), ["iphone_tap"]);
+        // Typing must directly follow the tap that focuses its field.
+        assert_eq!(tools(vec![a("iphone_launch_app"), a("iphone_type_text")]), ["iphone_launch_app"]);
+        // A read-only result becomes the next observation.
+        assert_eq!(tools(vec![a("iphone_screenshot"), a("iphone_press_button")]), ["iphone_screenshot"]);
+        let mut sensitive = a("iphone_tap_element");
+        sensitive["requiresConfirmation"] = json!(true);
+        assert_eq!(tools(vec![sensitive, a("iphone_press_button")]), ["iphone_tap_element"]);
+        assert_eq!(tools(vec![a("iphone_press_button"); 6]).len(), crate::model::MAX_PLAN_ACTIONS);
+        assert!(plan_prefix(&[]).is_empty());
+    }
+
+    #[test]
+    fn validated_plans_normalize_actions_and_reject_unsafe_shapes() {
+        let plan = validate_reply(json!({"type":"plan","actions":[
+            {"tool":"iphone_tap","args":{"x":1,"y":2},"reason":"Focus"},
+            {"tool":"iphone_type_text","args":{"text":"hi","submit":false},"reason":"Type"}
+        ]}))
+        .unwrap();
+        assert_eq!(plan["type"], "plan");
+        assert_eq!(plan["actions"][0]["type"], "action");
+        assert_eq!(plan["actions"][1]["requiresConfirmation"], false);
+        let single = validate_reply(json!({"type":"plan","actions":[
+            {"tool":"iphone_press_button","args":{"button":"home"},"reason":"Home"}
+        ]}))
+        .unwrap();
+        assert_eq!(single["type"], "action");
+        let five = Value::Array(vec![json!({"tool":"iphone_status","args":{},"reason":"Status"}); 5]);
+        for (reply, detail) in [
+            (json!({"type":"plan","actions":[]}), "nonempty"),
+            (json!({"type":"plan","actions":[{"tool":"iphone_status","args":{},"reason":"r"}],"reason":"x"}), "only accepts"),
+            (json!({"type":"plan","actions":[{"type":"done","message":"ok"}]}), "must be an action"),
+            (json!({"type":"plan","actions":[{"type":"plan","actions":[]}]}), "must be an action"),
+            (json!({"type":"plan","actions":[{"tool":"iphone_tap","args":{"x":"bad","y":1},"reason":"r"}]}), "plan action 1: args:"),
+            (json!({"type":"plan","actions":five}), "at most"),
+        ] {
+            let error = validate_reply(reply).unwrap_err();
+            assert!(error.message.contains(detail), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn goal_updates_reach_the_model_with_bounded_earlier_goals() {
+        let mut snapshot = json!({"instruction":"Open Clock","instructionUpdates":[]});
+        assert_eq!(model_instruction(&snapshot), "Open Clock");
+        snapshot["instructionUpdates"] =
+            json!((1..=5).map(|i| json!({"previous":format!("goal {i}")})).collect::<Vec<_>>());
+        let text = model_instruction(&snapshot);
+        assert!(text.starts_with("CURRENT GOAL"), "{text}");
+        assert!(text.contains("Open Clock"));
+        assert!(!text.contains("goal 2") && text.contains("goal 3") && text.contains("goal 5"), "{text}");
+        assert_eq!(instruction_updates(&snapshot), 5);
+        assert!(valid_instruction(" ").is_err());
+        assert!(valid_instruction(&"x".repeat(4001)).is_err());
+        assert!(valid_instruction("a\0").is_err());
+        assert_eq!(valid_instruction("  New goal ").unwrap(), "New goal");
     }
 }

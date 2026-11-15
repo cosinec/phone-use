@@ -352,6 +352,14 @@ impl BrowserClient {
             obj(&[("actionId", action_id.into()), ("approved", approved.into())]),
         )
     }
+    #[wasm_bindgen(js_name=steerTask)]
+    pub fn steer_task(&self, id: String, instruction: String) -> Promise {
+        self.session_promise(
+            &format!("/tasks/{}/instruction", js_sys::encode_uri_component(&id)),
+            "POST",
+            obj(&[("instruction", instruction.into())]),
+        )
+    }
     #[wasm_bindgen(js_name=stopTask)]
     pub fn stop_task(&self, id: String) -> Promise {
         let attempt = self.inner.borrow().attempt.clone();

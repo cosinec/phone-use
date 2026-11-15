@@ -54,6 +54,7 @@ fn step_label(state: &str) -> String {
 #[component]
 pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
     let instruction = RwSignal::new(String::new());
+    let goal = RwSignal::new(String::new());
     let images = super::attachments::TaskImages::new(ui);
     let model = RwSignal::new(String::new());
     let models = move || {
@@ -300,6 +301,65 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         </span>
                     </div>
                     <p class="current-instruction">{move || string(&ui.task(), "instruction")}</p>
+                    <Show when=move || {
+                        ui.task()["instructionUpdates"].as_array().is_some_and(|updates| !updates.is_empty())
+                    }>
+                        <ul class="field-hint" aria-label="目标修改记录">
+                            {move || {
+                                ui.task()["instructionUpdates"]
+                                    .as_array()
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|update| {
+                                        view! {
+                                            <li>
+                                                {format!(
+                                                    "第 {} 步后更新了目标，原目标：{}",
+                                                    update["afterStep"].as_u64().unwrap_or(0),
+                                                    string(&update, "previous"),
+                                                )}
+                                            </li>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </ul>
+                    </Show>
+                    <Show when=move || ui.running()>
+                        <form
+                            class="goal-update"
+                            on:submit=move |e| {
+                                e.prevent_default();
+                                let text = goal.get_untracked();
+                                if text.trim().is_empty() || ui.busy.get_untracked() {
+                                    return;
+                                }
+                                goal.set(String::new());
+                                ui.steer(text);
+                            }
+                        >
+                            <label class="sr-only" for="task-goal-update">
+                                "更新任务目标"
+                            </label>
+                            <div class="text-control">
+                                <input
+                                    id="task-goal-update"
+                                    maxlength="4000"
+                                    placeholder="执行中想调整？输入新的目标，已执行的步骤会保留"
+                                    prop:value=move || goal.get()
+                                    on:input=move |e| goal.set(event_target_value(&e))
+                                />
+                                <button
+                                    class="button secondary small"
+                                    type="submit"
+                                    disabled=move || ui.busy.get() || goal.get().trim().is_empty()
+                                >
+                                    "更新目标"
+                                </button>
+                            </div>
+                        </form>
+                    </Show>
                     <Show when=move || !string(&ui.task(), "model").is_empty()>
                         <p class="field-hint">
                             {move || {
@@ -310,6 +370,24 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                     <Show when=move || !ui.task()["timings"].is_null()>
                         <p class="card-description" aria-label="最近一轮耗时">
                             {move || timing_text(&ui.task()["timings"])}
+                        </p>
+                    </Show>
+                    <Show when=move || ui.task()["plan"].as_array().is_some_and(|plan| !plan.is_empty())>
+                        <p class="field-hint" aria-label="已规划的后续步骤">
+                            {move || {
+                                format!(
+                                    "已规划、待执行：{}",
+                                    ui.task()["plan"]
+                                        .as_array()
+                                        .map(|plan| {
+                                            plan.iter()
+                                                .map(|action| tool_label(action["tool"].as_str().unwrap_or_default()))
+                                                .collect::<Vec<_>>()
+                                                .join(" → ")
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            }}
                         </p>
                     </Show>
                     <ol class="step-list">
@@ -325,7 +403,10 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                                         <li>
                                             <span class="step-number">{i + 1}</span>
                                             <div>
-                                                <strong>{tool_label(&string(&step, "tool"))}</strong>
+                                                <strong>
+                                                    {tool_label(&string(&step, "tool"))}
+                                                    {(step["planned"] == true).then_some(" · 连续执行")}
+                                                </strong>
                                                 <p>{string(&step, "reason")}</p>
                                                 {
                                                     let timing = timing_text(&step["timings"]);
