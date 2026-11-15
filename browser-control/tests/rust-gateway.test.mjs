@@ -1359,3 +1359,36 @@ contract('a goal update voids an action awaiting confirmation without sending it
   const history = JSON.parse(fixture.requests[1].messages[1].content[0].text).recentHistory;
   assert.equal(history[0].state, 'cancelled');
 });
+
+contract('a done reply asking for confirmation is re-planned once instead of ending the task', async t => {
+  const replies = [
+    { type: 'done', message: '切换账号会更改账户设置。请确认是否继续退出当前账号？' },
+    { type: 'done', message: 'Fixture verified after re-plan' },
+  ];
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(replies[Math.min(call, replies.length) - 1])));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+  assert.equal(state.task.message, 'Fixture verified after re-plan');
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(state.task.steps.length, 0);
+  const history = JSON.parse(fixture.requests[1].messages[1].content[0].text).recentHistory;
+  assert.equal(history.at(-1).state, 'rejected');
+  assert.match(history.at(-1).result.message, /requiresConfirmation:true/);
+  assert.equal((await nativeCounts(fixture)).counts.screenshot, 1, 'the re-plan reuses the same observation');
+});
+
+contract('live preview is refused while a task owns the screen', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const fixture = await modelReplyTask(t, async () => { await gate; return modelCompletion(JSON.stringify({ type: 'done', message: 'Fixture done' })); });
+  await until(() => fixture.requests.length === 1);
+  const refused = await fixture.app.api(fixture.route + '/preview/stream', fixture.session.token);
+  assert.equal(refused.status, 409, await refused.clone().text());
+  assert.match((await refused.json()).error, /实时画面已暂停/);
+  release();
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
+});

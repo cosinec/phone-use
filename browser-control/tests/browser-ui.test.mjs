@@ -43,7 +43,9 @@ before(async () => {
           server.middlewares.use((req, res, next) => {
             if (req.url?.endsWith('/preview/mjpeg/browser-fixture') && streamFixtureBytes) {
               res.writeHead(200, { 'Content-Type': 'multipart/x-mixed-replace; boundary=fixture', 'Cache-Control': 'no-store' });
-              const write = () => res.write(Buffer.concat([Buffer.from(`--fixture\r\nContent-Type: image/jpeg\r\nContent-Length: ${streamFixtureBytes.length}\r\n\r\n`), streamFixtureBytes, Buffer.from('\r\n')]));
+              // Keep this response's frame: a finished test clears streamFixtureBytes while the timer may still fire.
+              const frame = streamFixtureBytes;
+              const write = () => res.write(Buffer.concat([Buffer.from(`--fixture\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`), frame, Buffer.from('\r\n')]));
               write(); const timer = setInterval(write, 100);
               res.on('close', () => clearInterval(timer));
               return;

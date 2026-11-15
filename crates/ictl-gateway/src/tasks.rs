@@ -16,10 +16,13 @@ use tokio_util::sync::CancellationToken;
 const RECOVERY_WAIT: Duration = Duration::from_secs(120);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECOVERIES: u32 = 2;
-/// OCR text often differs from accessibility labels, so in OCR mode a missed
-/// element tap (nothing was tapped, no side effect) is reported back to the
-/// model instead of halting, at most this many times per task.
-const MAX_OCR_ELEMENT_MISSES: u32 = 2;
+/// A missed element tap (nothing was tapped, no side effect) is reported back
+/// to the model instead of halting, at most this many times per task. Labels
+/// often differ from visible or OCR text in every observation mode.
+const MAX_ELEMENT_MISSES: u32 = 2;
+/// A done reply that asks the user for confirmation would end the task with no
+/// way to answer; it is returned to the model once to re-plan as a confirmable action.
+const MAX_DONE_QUESTIONS: u32 = 1;
 /// Actions the gateway rejects before dispatch (unknown tool, invalid
 /// arguments, Back on iOS) never reach the device. Report them to the model
 /// and re-plan, at most this many times per task.
@@ -396,6 +399,7 @@ async fn run(
     let mut element_misses = 0;
     let mut rejected_actions = 0;
     let mut wait_misses = 0;
+    let mut done_questions = 0;
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
@@ -505,7 +509,16 @@ async fn run(
                 if input_pending {
                     return Err(ApiError::unavailable("Text input is still pending; task halted"));
                 }
-                return Ok(action["message"].as_str().unwrap().to_owned());
+                let message = action["message"].as_str().unwrap();
+                if done_questions < MAX_DONE_QUESTIONS && asks_for_confirmation(message) {
+                    // Nothing was dispatched: re-plan from the same screen as a confirmable action.
+                    done_questions += 1;
+                    history.push(json!({"tool":"done","args":{"message":message},"state":"rejected",
+                        "result":{"kind":"error","message":DONE_IS_NOT_CONFIRMATION}}));
+                    next_observation = reusable;
+                    continue;
+                }
+                return Ok(message.to_owned());
             }
             let action = if action["type"] == "plan" {
                 let mut actions = plan_prefix(action["actions"].as_array().map(Vec::as_slice).unwrap_or(&[]));
@@ -761,7 +774,7 @@ async fn run(
         }
         if missed {
             element_misses += 1;
-            if !continue_after_element_miss(model.observation_mode(), element_misses) {
+            if !continue_after_element_miss(element_misses) {
                 return Err(ApiError::new(409, "Element tap missed; task halted"));
             }
         }
@@ -892,8 +905,18 @@ fn rejected_history(action: &Value, error: &ApiError) -> Value {
         "result":{"kind":"error","message":rejected_message(error)}})
 }
 
-fn continue_after_element_miss(mode: crate::model::ObservationMode, misses: u32) -> bool {
-    mode == crate::model::ObservationMode::Ocr && misses <= MAX_OCR_ELEMENT_MISSES
+fn continue_after_element_miss(misses: u32) -> bool {
+    misses <= MAX_ELEMENT_MISSES
+}
+
+const DONE_IS_NOT_CONFIRMATION: &str = "Not finished: your done message asked the user for confirmation, but done ends the task and the user cannot answer it. Return the next action itself with requiresConfirmation:true so the user can approve it in the interface, or continue the task if no confirmation is needed.";
+/// Whether a done message asks the user to confirm or choose instead of reporting a result.
+fn asks_for_confirmation(message: &str) -> bool {
+    regex::Regex::new(
+        r"(?i)请确认|是否(继续|要|需要|确认|同意)|要不要|需要你(的)?确认|确认(后|一下)?(我|再)?(继续|执行)|\bconfirm\b|\bproceed\?|\bcontinue\?|would you like|shall i|should i",
+    )
+    .unwrap()
+    .is_match(message)
 }
 
 /// Total history sent to the model. Input tokens drive time to first token, so
@@ -993,13 +1016,25 @@ mod tests {
     }
 
     #[test]
-    fn only_ocr_mode_continues_after_a_bounded_number_of_element_misses() {
-        use crate::model::ObservationMode::{Hybrid, Image, Ocr};
-        assert!(continue_after_element_miss(Ocr, 1));
-        assert!(continue_after_element_miss(Ocr, MAX_OCR_ELEMENT_MISSES));
-        assert!(!continue_after_element_miss(Ocr, MAX_OCR_ELEMENT_MISSES + 1));
-        assert!(!continue_after_element_miss(Image, 1));
-        assert!(!continue_after_element_miss(Hybrid, 1));
+    fn tasks_continue_after_a_bounded_number_of_element_misses() {
+        assert!(continue_after_element_miss(1));
+        assert!(continue_after_element_miss(MAX_ELEMENT_MISSES));
+        assert!(!continue_after_element_miss(MAX_ELEMENT_MISSES + 1));
+    }
+
+    #[test]
+    fn done_messages_that_ask_for_confirmation_are_recognized() {
+        for message in [
+            "切换 App Store 账号会更改账户设置。请确认是否继续退出当前账号并登录你提供的账号。",
+            "是否继续删除这条消息？",
+            "Should I proceed? Please confirm the purchase.",
+            "Would you like me to send it?",
+        ] {
+            assert!(asks_for_confirmation(message), "{message}");
+        }
+        for message in ["已打开设置，系统版本为 iOS 26.3.1。", "Alarm list shows 3 alarms.", "无法继续：未找到登录入口。"] {
+            assert!(!asks_for_confirmation(message), "{message}");
+        }
     }
 
     #[test]
