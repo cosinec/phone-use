@@ -1330,7 +1330,9 @@ contract('a goal update during planning re-plans from the same screen for the ne
   assert.equal(state.task.steps.length, 0);
   assert.equal(state.task.instructionUpdates.length, 1);
   assert.equal(state.task.instructionUpdates[0].previous, 'Inspect the fixture safely');
-  assert.equal(fixture.requests.length, 2);
+  // The first done after a goal update is returned once so the model plans for the new goal.
+  assert.equal(fixture.requests.length, 3);
+  assert.equal(JSON.parse(fixture.requests[2].messages[1].content[0].text).recentHistory.at(-1).state, 'rejected');
   const instruction = JSON.parse(fixture.requests[1].messages[1].content[0].text).instruction;
   assert.match(instruction, /CURRENT GOAL[^\n]*New fixture goal/);
   assert.match(instruction, /Inspect the fixture safely/);

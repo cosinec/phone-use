@@ -318,8 +318,17 @@ impl BrowserClient {
         self.session_promise("/setup/input", "POST", obj(&[("line", line.into())]))
     }
     #[wasm_bindgen(js_name=startTask)]
-    pub fn start_task(&self, instruction: String, model: Option<String>, attachments: JsValue) -> Promise {
+    pub fn start_task(
+        &self,
+        instruction: String,
+        model: Option<String>,
+        attachments: JsValue,
+        auto_confirm: Option<bool>,
+    ) -> Promise {
         let data = obj(&[("instruction", instruction.into())]);
+        if auto_confirm == Some(true) {
+            set(&data, "autoConfirm", &JsValue::TRUE);
+        }
         if let Some(model) = model.filter(|m| !m.is_empty()) {
             set(&data, "model", &model.into());
         }

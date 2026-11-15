@@ -55,6 +55,7 @@ fn step_label(state: &str) -> String {
 pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
     let instruction = RwSignal::new(String::new());
     let goal = RwSignal::new(String::new());
+    let auto_confirm = RwSignal::new(false);
     let images = super::attachments::TaskImages::new(ui);
     let model = RwSignal::new(String::new());
     let models = move || {
@@ -109,8 +110,9 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                 }
                 let text = instruction.get_untracked();
                 let model = selected();
+                let auto = auto_confirm.get_untracked();
                 ui.run(move |client| {
-                    client.start_task(text, if model.is_empty() { None } else { Some(model) }, images.ids())
+                    client.start_task(text, if model.is_empty() { None } else { Some(model) }, images.ids(), Some(auto))
                 });
             }>
                 <div class="model-picker">
@@ -181,6 +183,15 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                     rows="4"
                 />
                 <super::attachments::ImageInputs ui=ui images=images />
+                <label class="auto-confirm">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || auto_confirm.get()
+                        disabled=move || ui.running()
+                        on:change=move |e| auto_confirm.set(event_target_checked(&e))
+                    />
+                    "本次任务自动确认（付款、购买仍会询问）"
+                </label>
                 <div class="task-input-footer">
                     <span>
                         {move || format!("{}/4000", instruction.get().encode_utf16().count())}
@@ -301,6 +312,9 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         </span>
                     </div>
                     <p class="current-instruction">{move || string(&ui.task(), "instruction")}</p>
+                    <Show when=move || ui.task()["autoConfirm"] == true>
+                        <p class="field-hint">"已开启自动确认：除付款、购买外不再询问"</p>
+                    </Show>
                     <Show when=move || {
                         ui.task()["instructionUpdates"].as_array().is_some_and(|updates| !updates.is_empty())
                     }>

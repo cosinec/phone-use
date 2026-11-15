@@ -113,6 +113,7 @@ impl TaskManager {
         instruction: &str,
         model: Model,
         images: Vec<crate::attachments::ReferenceImage>,
+        auto_confirm: bool,
     ) -> Result<Value> {
         let instruction = valid_instruction(instruction)?;
         let mut guard = self.task.lock().await;
@@ -129,7 +130,7 @@ impl TaskManager {
             "id": id, "instruction": instruction, "model": model.name, "state": "observing", "steps": [],
             "confirmation": null, "startedAt": now(), "finishedAt": null, "message": null, "error": null, "timings": {},
             "observationId":null,"attachments":images.iter().map(|i| &i.name).collect::<Vec<_>>(), "maxSteps":100,
-            "instructionUpdates":[],"plan":[],"discardedPlanActions":0
+            "instructionUpdates":[],"plan":[],"discardedPlanActions":0,"autoConfirm":auto_confirm
         });
         *guard = Some(Task {
             session_id: session.id.clone(),
@@ -297,23 +298,33 @@ impl TaskManager {
         Ok(task.snapshot.clone())
     }
 }
-fn confirmation_required(action: &Value, request: &Value) -> bool {
+/// Whether an action must wait for the user. With `auto_confirm` the user
+/// pre-approved the task, and only payments and purchases still stop.
+fn confirmation_required(action: &Value, request: &Value, auto_confirm: bool) -> bool {
     let op = request["op"].as_str().unwrap_or("");
+    let described =
+        format!("{} {}", action["reason"].as_str().unwrap_or(""), action["args"]["text"].as_str().unwrap_or(""));
+    let payment = regex::Regex::new(
+        r"(?i)\b(pay|payment|purchase|buy|checkout|subscribe)\b|支付|付款|购买|下单|转账|订阅|充值",
+    )
+    .unwrap();
+    if auto_confirm {
+        return payment.is_match(&described);
+    }
     let sensitive =
         regex::Regex::new(r"(?i)\b(send|submit|pay|purchase|delete|erase|remove)\b|发送|提交|支付|购买|删除|清空|转账")
             .unwrap();
+    // Submitting a search needs no approval; sending, posting or replying does.
+    let outgoing = regex::Regex::new(r"(?i)\b(post|publish|reply|comment)\b|发布|评论|回复|留言").unwrap();
     action["requiresConfirmation"] == true
         || op == "terminate_app"
-        || (op == "type_text" && request["submit"] == true)
+        || (op == "type_text"
+            && request["submit"] == true
+            && (sensitive.is_match(&described) || outgoing.is_match(&described)))
         || (op == "open_url"
             && reqwest::Url::parse(request["url"].as_str().unwrap_or(""))
                 .is_ok_and(|u| !["http", "https"].contains(&u.scheme())))
-        || (["tap", "tap_element", "long_press"].contains(&op)
-            && sensitive.is_match(&format!(
-                "{} {}",
-                action["reason"].as_str().unwrap_or(""),
-                action["args"]["text"].as_str().unwrap_or("")
-            )))
+        || (["tap", "tap_element", "long_press"].contains(&op) && sensitive.is_match(&described))
 }
 
 async fn recover_observation(
@@ -400,6 +411,8 @@ async fn run(
     let mut rejected_actions = 0;
     let mut wait_misses = 0;
     let mut done_questions = 0;
+    // Set when the goal changes; cleared once an action is dispatched for the new goal.
+    let mut steered = false;
     let mut typing_blocked = false;
     let mut input_pending = false;
     let mut recoveries = 0;
@@ -412,6 +425,7 @@ async fn run(
         if instruction_updates(&snapshot) != seen_updates {
             // The user changed the goal: actions planned for the old goal are void.
             seen_updates = instruction_updates(&snapshot);
+            steered = true;
             discard_plan(&s, id, &mut queue).await?;
         }
         let (action, observation_id, mut timings) = if let Some(action) = queue.pop_front() {
@@ -518,6 +532,14 @@ async fn run(
                     next_observation = reusable;
                     continue;
                 }
+                if steered && !stops_task(snapshot["instruction"].as_str().unwrap_or("")) {
+                    // Models read a replaced goal as a refusal and stop; re-plan once per update.
+                    steered = false;
+                    history.push(json!({"tool":"done","args":{"message":message},"state":"rejected",
+                        "result":{"kind":"error","message":DONE_AFTER_GOAL_UPDATE}}));
+                    next_observation = reusable;
+                    continue;
+                }
                 return Ok(message.to_owned());
             }
             let action = if action["type"] == "plan" {
@@ -574,7 +596,7 @@ async fn run(
             "state": "pending", "startedAt": now(), "finishedAt": null, "result": null,
             "planned": timings["planned"] == true
         });
-        let needs_confirmation = confirmation_required(&action, &request);
+        let needs_confirmation = confirmation_required(&action, &request, snapshot["autoConfirm"] == true);
         let (sender, receiver) = oneshot::channel();
         s.tasks
             .update(id, |task| {
@@ -635,6 +657,7 @@ async fn run(
         let interruptible = action["tool"] == "iphone_wait_for";
         let action_cancel = if interruptible { s.tasks.arm_interrupt(id, &cancel, seen_updates).await? } else { cancel.clone() };
         let action_result = s.run_task_command(command, action_cancel.clone(), lease).await;
+        steered = false;
         if interruptible {
             s.tasks.disarm_interrupt(id).await;
         }
@@ -858,8 +881,14 @@ async fn discard_plan(s: &Session, id: &str, queue: &mut VecDeque<Value>) -> Res
     Ok(())
 }
 
-const GOAL_CHANGED_BEFORE_CONFIRMATION: &str =
-    "Not sent to the device: the user changed the goal before confirming this action.";
+const GOAL_CHANGED_BEFORE_CONFIRMATION: &str = "Not sent to the device and not refused: the user updated the goal while this action awaited confirmation. Continue with the CURRENT GOAL in the instruction.";
+const DONE_AFTER_GOAL_UPDATE: &str = "Not finished: the user just updated the goal (CURRENT GOAL in the instruction). Earlier actions were replaced, not refused. Plan the next action for the current goal; reply done only if the current goal is already achieved, and say how.";
+/// Whether an updated goal tells the task to stop rather than to do something else.
+fn stops_task(instruction: &str) -> bool {
+    regex::Regex::new(r"(?i)停止|别做了|不用了|不要做了|取消任务|算了|结束任务|\bstop\b|\bcancel\b|never ?mind")
+        .unwrap()
+        .is_match(instruction)
+}
 const WAIT_INTERRUPTED: &str = "Interrupted by a goal update; this read-only wait changed nothing on the device.";
 fn not_dispatched_history(action: &Value, message: &str) -> Value {
     json!({"tool":action["tool"],"args":action["args"],"reason":action["reason"],"state":"cancelled",
@@ -1020,6 +1049,34 @@ mod tests {
         assert!(continue_after_element_miss(1));
         assert!(continue_after_element_miss(MAX_ELEMENT_MISSES));
         assert!(!continue_after_element_miss(MAX_ELEMENT_MISSES + 1));
+    }
+
+    #[test]
+    fn confirmation_is_limited_to_outgoing_or_destructive_actions_and_auto_confirm_keeps_payments() {
+        let action = |tool: &str, args: Value, reason: &str| json!({"tool":tool,"args":args,"reason":reason});
+        let needs = |action: &Value, auto: bool| {
+            let request = command_request(action["tool"].as_str().unwrap(), &action["args"]).unwrap();
+            confirmation_required(action, &request, auto)
+        };
+        let search = action("iphone_type_text", json!({"text":"天气","submit":true}), "搜索天气");
+        let message = action("iphone_type_text", json!({"text":"你好","submit":true}), "发送消息");
+        let delete = action("iphone_tap", json!({"x":1,"y":2}), "点击删除");
+        let pay = action("iphone_tap", json!({"x":1,"y":2}), "点击立即支付");
+        let open = action("iphone_tap", json!({"x":1,"y":2}), "打开设置");
+        assert!(!needs(&search, false));
+        assert!(needs(&message, false));
+        assert!(needs(&delete, false));
+        assert!(!needs(&open, false));
+        assert!(!needs(&message, true) && !needs(&delete, true));
+        assert!(needs(&pay, true) && needs(&pay, false));
+    }
+
+    #[test]
+    fn only_goal_updates_that_say_stop_may_finish_without_a_replan() {
+        assert!(stops_task("算了，不用了"));
+        assert!(stops_task("Stop here"));
+        assert!(!stops_task("改为打开时钟"));
+        assert!(!stops_task("Open the Settings app instead"));
     }
 
     #[test]

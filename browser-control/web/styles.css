@@ -70,3 +70,4 @@
   font-size:15px;
   line-height:1}
 .goal-update{margin:0 0 13px}
+.auto-confirm{display:flex;align-items:center;gap:7px;font-size:11px;color:#7c8583;margin:10px 0}.auto-confirm input{width:auto;margin:0}

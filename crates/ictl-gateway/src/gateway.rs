@@ -1234,14 +1234,19 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
                 format!("http://{}", request.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1"))
             });
             let input = body(request).await?;
-            if input.as_object().unwrap().keys().any(|k| !["instruction", "model", "attachments"].contains(&k.as_str()))
+            if input
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| !["instruction", "model", "attachments", "autoConfirm"].contains(&k.as_str()))
+                || input.get("autoConfirm").is_some_and(|v| !v.is_boolean())
             {
                 return Err(ApiError::new(400, "Invalid task request"));
             }
             let model = g.model.select(input.get("model")).await?;
             let images = s.attachments.references(input.get("attachments"), &base, &s.id).await?;
             s.ready().await?;
-            Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model, images).await?))
+            Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model, images, input["autoConfirm"] == true).await?))
         }
         (Method::POST, ["tasks", task, "stop"]) => {
             if !body(request).await?.as_object().unwrap().is_empty() {
