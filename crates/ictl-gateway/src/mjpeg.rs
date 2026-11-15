@@ -253,7 +253,8 @@ mod tests {
     async fn explicit_stop_cancels_the_producer_and_ends_an_open_http_response() {
         let cancel = CancellationToken::new();
         let (sender, receiver) = watch::channel(None);
-        let preview = Preview { producer: Mutex::new(Some(Producer { sender, cancel: cancel.clone() })) };
+        let preview =
+            Preview { producer: Mutex::new(Some(Producer { sender, cancel: cancel.clone() })), ..Preview::default() };
         let response = response(receiver, CancellationToken::new());
         preview.stop().await;
         assert!(cancel.is_cancelled());
