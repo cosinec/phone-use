@@ -1377,18 +1377,3 @@ contract('a done reply asking for confirmation is re-planned once instead of end
   assert.match(history.at(-1).result.message, /requiresConfirmation:true/);
   assert.equal((await nativeCounts(fixture)).counts.screenshot, 1, 'the re-plan reuses the same observation');
 });
-
-contract('live preview is refused while a task owns the screen', async t => {
-  let release;
-  const gate = new Promise(resolve => { release = resolve; });
-  t.after(() => release());
-  const fixture = await modelReplyTask(t, async () => { await gate; return modelCompletion(JSON.stringify({ type: 'done', message: 'Fixture done' })); });
-  await until(() => fixture.requests.length === 1);
-  const refused = await fixture.app.api(fixture.route + '/preview/stream', fixture.session.token);
-  assert.equal(refused.status, 409, await refused.clone().text());
-  assert.match((await refused.json()).error, /实时画面已暂停/);
-  release();
-  let state;
-  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
-  assert.equal(state.task.state, 'completed', JSON.stringify(state.task));
-});

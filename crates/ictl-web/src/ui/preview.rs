@@ -91,14 +91,6 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
             landscape.set(image.natural_width() > image.natural_height());
         }
     });
-    // WDA's MJPEG server takes one client at a time and task screenshots need it.
-    Effect::new(move |_| {
-        if ui.running() && !untrack(|| ui.preview_url.get()).is_empty() {
-            loaded.set(false);
-            live_error.set("任务运行中，实时画面已暂停，会显示每一步的截图".into());
-            stop_live(ui);
-        }
-    });
     let disabled = move || !ui.can_control() || ui.busy.get() || (live() && !live_fresh());
     view! {
         <section class="phone-card card">
@@ -112,7 +104,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         class="button small"
                         aria-pressed=move || live().to_string()
                         title="连续画面会持续占用 USB 链路；拥塞时自动暂停并改回截图"
-                        disabled=move || !live() && (!ui.ready() || ui.running())
+                        disabled=move || !live() && !ui.ready()
                         on:click=move |_| {
                             if live() {
                                 loaded.set(false);

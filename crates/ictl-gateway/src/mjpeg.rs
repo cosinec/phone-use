@@ -85,9 +85,24 @@ pub(crate) struct Frame {
     at: Instant,
     sequence: u64,
 }
-#[derive(Default)]
 pub struct Preview {
     producer: Mutex<Option<Producer>>,
+    /// Task captures currently using WDA's single-client MJPEG server.
+    paused: watch::Sender<u32>,
+    /// Whether the producer holds a WDA MJPEG connection.
+    capturing: Arc<watch::Sender<bool>>,
+}
+impl Default for Preview {
+    fn default() -> Self {
+        Self { producer: Mutex::new(None), paused: watch::channel(0).0, capturing: Arc::new(watch::channel(false).0) }
+    }
+}
+/// Resumes the live view when the last task capture finishes.
+pub(crate) struct PauseGuard<'a>(&'a watch::Sender<u32>);
+impl Drop for PauseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
 }
 struct Producer {
     sender: watch::Sender<Option<Arc<Frame>>>,
@@ -104,6 +119,15 @@ impl Preview {
             }
             None => json!({"state":"waiting"}),
         }
+    }
+    /// Releases WDA's single-client MJPEG server for a task capture. The live view
+    /// keeps its last frame and reconnects when the returned guard is dropped.
+    pub(crate) async fn pause(&self) -> PauseGuard<'_> {
+        self.paused.send_modify(|count| *count += 1);
+        let mut capturing = self.capturing.subscribe();
+        // Bounded: a stuck relay must not stall the task; its capture then retries.
+        let _ = tokio::time::timeout(Duration::from_secs(2), capturing.wait_for(|active| !*active)).await;
+        PauseGuard(&self.paused)
     }
     pub(crate) async fn stop(&self) {
         if let Some(producer) = self.producer.lock().await.take() {
@@ -125,9 +149,19 @@ impl Preview {
         let cancel = cancel.child_token();
         let (sender, receiver) = watch::channel(None);
         *current = Some(Producer { sender: sender.clone(), cancel: cancel.clone() });
+        let mut paused = self.paused.subscribe();
+        let capturing = self.capturing.clone();
         tokio::spawn(async move {
             let mut sequence = 0;
             loop {
+                // A task capture is using the MJPEG server: wait and keep the last frame current.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = sender.closed() => break,
+                    _ = paused.wait_for(|count| *count == 0) => {}
+                }
+                capturing.send_replace(true);
                 let capture = async {
                     let mut socket =
                         tokio::time::timeout(FRAME_TIMEOUT, crate::mux::connect_port(&address, 9100)).await??;
@@ -142,11 +176,19 @@ impl Preview {
                     #[allow(unreachable_code)]
                     Ok::<(), anyhow::Error>(())
                 };
-                tokio::select! {
+                let paused_now = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => break,
-                    _ = sender.closed() => break,
-                    _ = tokio::time::timeout(Duration::from_secs(3600), capture) => {}
+                    _ = cancel.cancelled() => None,
+                    _ = sender.closed() => None,
+                    _ = paused.wait_for(|count| *count > 0) => Some(true),
+                    _ = tokio::time::timeout(Duration::from_secs(3600), capture) => Some(false),
+                };
+                // The capture future and its WDA connection are dropped by now.
+                capturing.send_replace(false);
+                match paused_now {
+                    None => break,
+                    Some(true) => continue,
+                    Some(false) => {}
                 }
                 sender.send_replace(None);
                 tokio::select! {
@@ -195,6 +237,17 @@ pub(crate) fn response(receiver: watch::Receiver<Option<Arc<Frame>>>, cancel: Ca
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn task_capture_pauses_are_counted_and_released() {
+        let preview = Preview::default();
+        {
+            let _first = preview.pause().await;
+            let _second = preview.pause().await;
+            assert_eq!(*preview.paused.borrow(), 2);
+        }
+        assert_eq!(*preview.paused.borrow(), 0);
+    }
 
     #[tokio::test]
     async fn explicit_stop_cancels_the_producer_and_ends_an_open_http_response() {

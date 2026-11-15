@@ -402,6 +402,7 @@ impl Session {
         let entered = Instant::now();
         let deadline =
             ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+        let _pause = if input["tool"] == "iphone_screenshot" { Some(self.mjpeg.pause().await) } else { None };
         self.run_command_admitted(input, cancel, entered, deadline, Some(lease)).await
     }
     fn manual_admission(&self) -> Result<crate::control::Admission> {
@@ -515,6 +516,8 @@ impl Session {
         let entered = Instant::now();
         let deadline =
             ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+        // An opt-in live view would hold WDA's single-client MJPEG server and refuse this capture.
+        let _pause = self.mjpeg.pause().await;
         self.screen_admitted(cancel, Some(lease), entered, deadline, include_elements).await
     }
     async fn screen_admitted(
@@ -992,8 +995,6 @@ async fn handle(State(gateway): State<Arc<Gateway>>, request: Request<Body>) -> 
     }
     response
 }
-/// Live preview and task screenshots share WDA's single-client MJPEG server.
-const PREVIEW_DURING_TASK: &str = "任务运行中，实时画面已暂停，会显示每一步的截图";
 async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
     let entered = Instant::now();
     let control_path = request.method() == Method::POST
@@ -1133,9 +1134,6 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             if s.device.platform != Platform::Ios {
                 return Err(ApiError::new(400, "MJPEG preview requires iPhone"));
             }
-            if s.tasks.active().await {
-                return Err(ApiError::new(409, PREVIEW_DURING_TASK));
-            }
             s.ready().await?;
             Ok(reply(200, json!({"url":format!("/api/sessions/{}/preview/mjpeg/{}", s.id, s.preview_ticket)})))
         }
@@ -1151,9 +1149,6 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         (Method::GET, ["preview", "mjpeg", _]) => {
             if !preview_access {
                 return Err(ApiError::new(401, "Authentication required"));
-            }
-            if s.tasks.active().await {
-                return Err(ApiError::new(409, PREVIEW_DURING_TASK));
             }
             s.ready().await?;
             let address = s
@@ -1246,9 +1241,6 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             let model = g.model.select(input.get("model")).await?;
             let images = s.attachments.references(input.get("attachments"), &base, &s.id).await?;
             s.ready().await?;
-            // WDA's MJPEG server takes one client at a time and task screenshots need it.
-            s.mjpeg.stop().await;
-            eprintln!("{} event=preview_stopped session={} reason=task_started", chrono::Utc::now().to_rfc3339(), s.id);
             Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model, images).await?))
         }
         (Method::POST, ["tasks", task, "stop"]) => {
