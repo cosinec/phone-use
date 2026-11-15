@@ -1000,19 +1000,16 @@ contract('MJPEG descriptor requires session credentials and preview ticket canno
   assert.ok([401, 404].includes((await app.api(url, '')).status));
 });
 
-contract('task permits one hundred actions then completion, and blocks action 101', async t => {
-  for (const doneAtLimit of [true, false]) {
-    await t.test(doneAtLimit ? 'completion after 100' : 'reject 101', async t => {
-      const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call > 100 && doneAtLimit
-        ? { type: 'done', message: '100 verified' }
-        : { type: 'action', tool: 'iphone_status', args: {}, reason: 'Read fixture status' })));
-      let state;
-      await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
-      assert.equal(state.task.steps.length, 100);
-      assert.equal(state.task.state, doneAtLimit ? 'completed' : 'failed');
-      if (!doneAtLimit) assert.match(state.task.error, /100/);
-    });
-  }
+contract('tasks have no step limit and run past one hundred actions until completion', async t => {
+  const fixture = await modelReplyTask(t, call => modelCompletion(JSON.stringify(call > 120
+    ? { type: 'done', message: '120 verified' }
+    : { type: 'action', tool: 'iphone_status', args: {}, reason: 'Read fixture status' })));
+  let state;
+  await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); }, 1500);
+  assert.equal(state.task.state, 'completed', JSON.stringify(state.task.error));
+  assert.equal(state.task.steps.length, 120);
+  assert.equal(state.task.message, '120 verified');
+  assert.equal(state.task.maxSteps, undefined);
 });
 
 contract('task attachments validate image bytes, enforce ownership and reach model as separate references', async t => {
