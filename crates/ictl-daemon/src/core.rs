@@ -216,6 +216,8 @@ pub(crate) struct Inner {
     pub ddi_failures: u32,
     pub resigning: bool,
     pub wda_misses: Misses,
+    /// Consecutive `/wda/locked` timeouts; WDA is restarted when they pile up
+    pub wda_lock_timeouts: u32,
     pub backoff: Backoff,
     pub mux: MuxWatch,
     pub usbmuxd: Option<tokio::process::Child>,
@@ -334,6 +336,7 @@ impl Daemon {
             ddi_failures: 0,
             resigning: false,
             wda_misses: Misses::default(),
+            wda_lock_timeouts: 0,
             backoff: Backoff::default(),
             mux: MuxWatch::default(),
             usbmuxd: None,
@@ -482,6 +485,7 @@ impl Daemon {
         g.unlocked_at = None;
         drop_tunnel(g).await;
         g.wda_misses.reset();
+        g.wda_lock_timeouts = 0;
     }
 
     pub(crate) async fn ensure_tunnel<'a>(

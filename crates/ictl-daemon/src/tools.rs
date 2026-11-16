@@ -6,6 +6,7 @@ use base64::Engine;
 use ictl_device::{AppInfo, Button, DeviceError, HidSession, Rotation, ScreenSize, apps, hid::ascii_to_usage};
 use ictl_unlock::UnlockError;
 use ictl_wda::client::SPRINGBOARD;
+use ictl_wda::diagnostics::StopReason;
 use ictl_wda::elements::{self, TapPoint, Tree};
 use ictl_wda::http::DeviceTransport;
 use ictl_wda::timing::StepTimer;
@@ -16,6 +17,9 @@ use crate::core::{Daemon, Inner, drop_tunnel, hid_supported, wda_down};
 use crate::imaging::{self, fmt_g};
 use crate::notify::Event;
 use crate::protocol::{ALERT_BLOCKING, Response, TAP_MISSED};
+
+/// Consecutive `/wda/locked` timeouts (10 s each) after which WDA is restarted
+const WDA_LOCK_TIMEOUT_RESTART: u32 = 2;
 
 async fn capture_with_fallback<F, Fut>(
     policy: CapturePolicy,
@@ -89,6 +93,18 @@ impl Daemon {
         let outcome = ictl_unlock::ensure_unlocked(wda, &cfg).await;
         checking.finish(outcome.is_ok());
         g.unlocked_at = outcome.is_ok().then(Instant::now);
+        // A WDA that keeps timing out on the lock query is stuck (seen after the phone slept through a long
+        // confirmation wait). Health probes cannot run while requests hold the device lock, so restart it here.
+        if matches!(outcome, Err(UnlockError::Wda(WdaError::Timeout(_)))) {
+            g.wda_lock_timeouts += 1;
+            if g.wda_lock_timeouts >= WDA_LOCK_TIMEOUT_RESTART {
+                tracing::warn!(event = "wda_restart", reason = "consecutive lock query timeouts", runner_alive = true);
+                self.log.log("WDA 连续查询锁屏超时，重启 WDA");
+                self.drop_session(g, StopReason::HealthRestart).await;
+            }
+        } else {
+            g.wda_lock_timeouts = 0;
+        }
         match outcome {
             Ok(_) => Ok(()),
             Err(e @ (UnlockError::WrongPasscode | UnlockError::Uncertain(_))) => {
