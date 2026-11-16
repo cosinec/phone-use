@@ -412,6 +412,7 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for value in ('sandbox_mode="read-only"', 'approval_policy="never"', "--json", "--skip-git-repo-check"):
             self.assertIn(value, args)
         self.assertNotIn("-m", args, "default keeps the CLI's own model")
+        self.assertIn('model_reasoning_effort="low"', args)
         self.assertTrue(reply["prompt"].startswith(PLAN["system"]))
         self.assertTrue(reply["prompt"].endswith("screen"))
         self.assertEqual(len(reply["images"]), 1)
@@ -438,6 +439,19 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second["reply"]["prompt"].startswith(PLAN["system"]))
         self.assertEqual(self.bridge.threads["s1"], second["reply"]["thread"])
         self.assertIn("-m", second["reply"]["args"])
+
+    async def test_default_model_and_reasoning_effort_are_configurable(self):
+        self.bridge.default_model = "gpt-6-luna"
+        self.bridge.reasoning_effort = "minimal"
+        _, result = await self.plan()
+        args = result["reply"]["args"]
+        self.assertEqual(args[args.index("-m") + 1], "gpt-6-luna")
+        self.assertIn('model_reasoning_effort="minimal"', args)
+        self.bridge.reasoning_effort = ""
+        _, result = await self.plan(model="gpt-6-sol", session="s9")
+        args = result["reply"]["args"]
+        self.assertEqual(args[args.index("-m") + 1], "gpt-6-sol")
+        self.assertFalse(any("model_reasoning_effort" in a for a in args))
 
     async def test_prose_replies_and_sanitized_failures(self):
         status, result = await self.plan(model="prose")

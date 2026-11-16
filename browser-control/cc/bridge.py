@@ -400,14 +400,21 @@ class Bridge:
 class CodexBridge(Bridge):
     """Plans each step with the host Codex agent, resuming one thread per gateway session."""
 
-    def __init__(self, codex_bin, work_dir, timeout=TIMEOUT):
+    def __init__(self, codex_bin, work_dir, timeout=TIMEOUT, default_model=None, reasoning_effort="low"):
         super().__init__(codex_bin, work_dir, timeout)
         self.threads = {}  # session -> Codex thread id, oldest first
         self.locks = {}
+        # Phone steps need quick replies: a small model with low reasoning planned a step in about 3 s,
+        # the CLI's own gpt-6-sol with medium reasoning took 8-25 s.
+        self.default_model = default_model
+        self.reasoning_effort = reasoning_effort
 
     def command(self, model, thread, images):
         options = ["--skip-git-repo-check", "--json",
                    "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        if self.reasoning_effort:
+            options += ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
+        model = self.default_model if model == "default" and self.default_model else model
         if model != "default":
             options += ["-m", model]
         for image in images:
@@ -556,7 +563,11 @@ async def serve(args):
     if work_dir.is_symlink() or not work_dir.is_dir() or any(work_dir.iterdir()):
         raise ValueError("Work directory must be a dedicated empty directory")
     prepare_socket(args.socket)
-    bridge = CodexBridge(args.codex_bin, work_dir) if args.codex_bin else Bridge(args.claude_bin, work_dir)
+    if args.codex_bin:
+        bridge = CodexBridge(args.codex_bin, work_dir, default_model=args.codex_model,
+                             reasoning_effort=args.reasoning_effort)
+    else:
+        bridge = Bridge(args.claude_bin, work_dir)
     # Bind synchronously so no client can connect before permissions are restricted.
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     identity = None
@@ -618,9 +629,15 @@ def main():
     parser.add_argument("--socket", required=True, help="Absolute Unix socket in an existing runtime directory")
     parser.add_argument("--claude-bin", default="claude")
     parser.add_argument("--codex-bin", help="Plan with this Codex CLI instead of Claude Code")
+    parser.add_argument("--codex-model", help="Codex model used when the gateway asks for `default`")
+    parser.add_argument("--reasoning-effort", default="low",
+                        help="Codex model_reasoning_effort for planning steps, or empty to keep the CLI's own")
     parser.add_argument("--work-dir", help="Dedicated empty absolute working directory (required unless --check)")
     parser.add_argument("--check", action="store_true", help="Check an already running bridge and exit")
     args = parser.parse_args()
+    for value in (args.codex_model, args.reasoning_effort):
+        if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", value):
+            parser.error("Invalid --codex-model or --reasoning-effort")
     if not args.check and not args.work_dir:
         parser.error("--work-dir is required unless --check is used")
     try:
