@@ -323,5 +323,130 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await proc.communicate()
 
 
+FAKE_CODEX = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+images = [args[i + 1] for i, a in enumerate(args) if a == '-i']
+resumed = 'resume' in args
+thread = args[args.index('resume') + 1] if resumed else 'thread-' + str(len(os.listdir('.')))
+model = args[args.index('-m') + 1] if '-m' in args else 'default'
+if model == 'flaky' and resumed:
+    sys.exit(1)
+if model == 'failure':
+    sys.stderr.write('SECRET AUTH PAYLOAD')
+    sys.exit(1)
+if not resumed:
+    print(json.dumps({'type': 'thread.started', 'thread_id': thread}))
+reply = {'args': args, 'prompt': prompt, 'thread': thread, 'images': [[p, os.path.exists(p)] for p in images]}
+text = json.dumps(reply)
+if model == 'prose':
+    text = 'Here is the action:\\n```json\\n' + text + '\\n```'
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': text}}))
+print(json.dumps({'type': 'turn.completed'}))
+"""
+
+
+class CodexParsingTests(unittest.TestCase):
+    def test_codex_events_yield_thread_and_reply(self):
+        output = "\n".join(json.dumps(e) for e in [
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": 'Done: {"type":"done","message":"ok"} thanks'}},
+        ])
+        self.assertEqual(bridge.parse_codex(output), ("t1", {"reply": {"type": "done", "message": "ok"}}))
+
+    def test_codex_failures_are_rejected(self):
+        for output in ["", json.dumps({"type": "turn.failed"}),
+                       json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "no json"}})]:
+            with self.subTest(output=output), self.assertRaises(bridge.BridgeError) as error:
+                bridge.parse_codex(output)
+            self.assertEqual(error.exception.status, 502)
+
+    def test_session_validation(self):
+        self.assertIsNone(bridge.plan_session(json.dumps(PLAN).encode()))
+        self.assertEqual(bridge.plan_session(json.dumps(dict(PLAN, session="abc-1")).encode()), "abc-1")
+        for bad in ["", "a b", "x" * 129, 5]:
+            with self.subTest(bad=bad), self.assertRaises(bridge.BridgeError):
+                bridge.plan_session(json.dumps(dict(PLAN, session=bad)).encode())
+
+
+class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.executable = self.root / "fake-codex"
+        self.executable.write_text(FAKE_CODEX)
+        self.executable.chmod(0o700)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.path = self.root / "bridge.sock"
+        self.bridge = bridge.CodexBridge(str(self.executable), self.work, timeout=3)
+        self.server = await asyncio.start_unix_server(self.bridge.handle, str(self.path), limit=bridge.MAX_HEADERS)
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.server.wait_closed()
+        await self.bridge.close()
+
+    async def plan(self, session="s1", model="default", content=None):
+        plan = dict(PLAN, model=model, session=session, content=content or PLAN["content"])
+        reader, writer = await asyncio.open_unix_connection(str(self.path))
+        body = json.dumps(plan).encode()
+        writer.write(f"POST /plan HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        await writer.wait_closed()
+        header, payload = raw.split(b"\r\n\r\n", 1)
+        return int(header.split()[1]), json.loads(payload)
+
+    async def test_first_step_starts_a_read_only_thread_with_the_rules(self):
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+        status, result = await self.plan(content=[{"type": "text", "text": "screen"}, image])
+        self.assertEqual(status, 200)
+        reply = result["reply"]
+        args = reply["args"]
+        self.assertEqual(args[0], "exec")
+        self.assertNotIn("resume", args)
+        for value in ('sandbox_mode="read-only"', 'approval_policy="never"', "--json", "--skip-git-repo-check"):
+            self.assertIn(value, args)
+        self.assertNotIn("-m", args, "default keeps the CLI's own model")
+        self.assertTrue(reply["prompt"].startswith(PLAN["system"]))
+        self.assertTrue(reply["prompt"].endswith("screen"))
+        self.assertEqual(len(reply["images"]), 1)
+        self.assertTrue(reply["images"][0][1], "the image existed while Codex ran")
+        self.assertFalse(Path(reply["images"][0][0]).exists(), "request images are removed afterwards")
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    async def test_next_steps_resume_the_same_thread_per_session(self):
+        _, first = await self.plan()
+        thread = first["reply"]["thread"]
+        _, second = await self.plan()
+        args = second["reply"]["args"]
+        self.assertEqual(args[:3], ["exec", "resume", thread])
+        self.assertTrue(second["reply"]["prompt"].startswith(bridge.CODEX_FOLLOW_UP))
+        self.assertNotIn(PLAN["system"], second["reply"]["prompt"])
+        _, other = await self.plan(session="s2")
+        self.assertNotIn("resume", other["reply"]["args"])
+
+    async def test_a_lost_thread_falls_back_to_a_new_one(self):
+        _, first = await self.plan(model="flaky")
+        status, second = await self.plan(model="flaky")
+        self.assertEqual(status, 200)
+        self.assertNotIn("resume", second["reply"]["args"])
+        self.assertTrue(second["reply"]["prompt"].startswith(PLAN["system"]))
+        self.assertEqual(self.bridge.threads["s1"], second["reply"]["thread"])
+        self.assertIn("-m", second["reply"]["args"])
+
+    async def test_prose_replies_and_sanitized_failures(self):
+        status, result = await self.plan(model="prose")
+        self.assertEqual(status, 200)
+        self.assertIn("args", result["reply"])
+        status, result = await self.plan(model="failure", session="s3")
+        self.assertEqual(status, 502)
+        self.assertNotIn("SECRET", json.dumps(result))
+
+
 if __name__ == "__main__":
     unittest.main()

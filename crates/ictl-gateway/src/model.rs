@@ -54,6 +54,8 @@ pub struct Model {
     key: String,
     /// Pinned at construction and retained by task-local model selections.
     cc: bool,
+    /// Which host bridge serves `cc` requests: `cc` (Claude Code) or `codex` (Codex agent).
+    bridge: &'static str,
     cc_models: Vec<String>,
     catalog: Arc<Mutex<Catalog>>,
     format_refused: Arc<Mutex<HashSet<String>>>,
@@ -103,25 +105,39 @@ impl Model {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let get = |k: &str| env.get(k).cloned().unwrap_or_default().trim().to_owned();
         let runtime = PathBuf::from(env.get("RUNTIME_DIR").map(String::as_str).unwrap_or(".runtime"));
-        let socket_override = get("CC_SOCKET");
+        let backend = get("LLM_BACKEND");
+        let codex = backend == "codex";
+        let socket_override = get(if codex { "CODEX_SOCKET" } else { "CC_SOCKET" });
         let socket = if socket_override.is_empty() {
-            runtime.join("cc/bridge.sock")
+            runtime.join(if codex { "codex/bridge.sock" } else { "cc/bridge.sock" })
         } else {
             let path = PathBuf::from(&socket_override);
             anyhow::ensure!(
                 path.is_absolute() && !socket_override.chars().any(char::is_control),
-                "CC_SOCKET must be an absolute socket path"
+                "CC_SOCKET and CODEX_SOCKET must be absolute socket paths"
             );
             path
         };
-        let cc = match get("LLM_BACKEND").as_str() {
+        let cc = match backend.as_str() {
             "" => socket.exists(),
-            "cc" => true,
+            "cc" | "codex" => true,
             "openai" => false,
-            _ => anyhow::bail!("LLM_BACKEND must be openai or cc"),
+            _ => anyhow::bail!("LLM_BACKEND must be openai, cc or codex"),
         };
         let mut cc_models = Vec::new();
-        let (name, key, base) = if cc {
+        let (name, key, base) = if codex {
+            // `default` lets the Codex CLI use its own configured model and provider.
+            for name in env.get("CODEX_MODELS").map(String::as_str).unwrap_or("default").split(',') {
+                let name = name.trim();
+                anyhow::ensure!(valid_model_id(name), "Invalid CODEX_MODELS configuration");
+                if !cc_models.iter().any(|existing| existing == name) {
+                    cc_models.push(name.to_owned());
+                }
+            }
+            let name = env.get("CODEX_MODEL").map(|name| name.trim().to_owned()).unwrap_or_else(|| cc_models[0].clone());
+            anyhow::ensure!(valid_model_id(&name) && cc_models.contains(&name), "CODEX_MODEL must be in CODEX_MODELS");
+            (name, String::new(), String::new())
+        } else if cc {
             for name in env.get("CC_MODELS").map(String::as_str).unwrap_or("opus,sonnet,haiku").split(',') {
                 let name = name.trim();
                 anyhow::ensure!(valid_model_id(name), "Invalid CC_MODELS configuration");
@@ -165,6 +181,7 @@ impl Model {
             name: ready.then_some(name),
             key,
             cc,
+            bridge: if codex { "codex" } else { "cc" },
             cc_models,
             catalog: Arc::default(),
             format_refused: Arc::default(),
@@ -265,9 +282,9 @@ impl Model {
                 Ok::<_, ApiError>(value["ok"] == true)
             };
             let ready = matches!(tokio::time::timeout(Duration::from_secs(2), health).await, Ok(Ok(true)));
-            let mut config = json!({"backend":"cc","aiReady":ready,"model":self.name,"models":self.cc_models});
+            let mut config = json!({"backend":self.bridge,"aiReady":ready,"model":self.name,"models":self.cc_models});
             if !ready {
-                config["aiError"] = json!("CC bridge is unavailable");
+                config["aiError"] = json!(if self.bridge == "codex" { "Codex bridge is unavailable" } else { "CC bridge is unavailable" });
             }
             return config;
         }
@@ -348,7 +365,8 @@ impl Model {
             let response = self
                 .client
                 .post(endpoint)
-                .json(&json!({"model":self.name,"system":system,"content":content}))
+                // The Codex bridge keeps one agent thread per session, so the agent's own memory spans steps and tasks.
+                .json(&json!({"model":self.name,"system":system,"content":content,"session":observation["bridgeSession"]}))
                 .send()
                 .await
                 .map_err(|_| ApiError::unavailable("CC bridge request failed"))?;

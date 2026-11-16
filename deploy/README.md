@@ -74,14 +74,6 @@ The CLI must support print mode, stream-json input/output and the tool/settings 
 
 `deploy/phone-use-cc-bridge.service` is an optional systemd template with this VPS's paths. Review its user, executable and environment file before explicitly installing it. CI does not install services, modify server-owned Compose/environment files, or grant host access. Install and start the host service before the first CC-enabled gateway deployment if using automatic socket detection. Service installation requires administrator approval/access. Removing the socket while leaving an old OpenAI configuration enabled can select OpenAI at the next startup; pin `LLM_BACKEND=cc` in the server environment when CC is required permanently.
 
-## Validation
+### Codex agent planner
 
-```bash
-python3 -m unittest discover -s deploy/tests -v
-actionlint
-bash -n deploy/smoke-image.sh
-```
-
-Tests cover successful deployment, preservation of configuration/environment, exact revision checks, input rejection, concurrent config changes, failed-health rollback and rollback failure. HTTP smoke checks establish server availability and basic authentication; physical iPhone, WDA and model behavior require separate verification.
-
-Initial setup intentionally does not create a release branch or change the running application. Merge these configuration changes before creating your first release branch; when releasing from an existing feature branch, merge or cherry-pick the CI changes there as well.
+`LLM_BACKEND=codex` plans with the host Codex agent instead of a model endpoint. The same `bridge.py` runs with `--codex-bin`: every step is a `codex exec` turn in a read-only sandbox (`approval_policy="never"`), and the bridge keeps one Codex thread per gateway session, resuming it for later steps and tasks of the same phone connection. The agent's own conversation memory therefore spans the connection; a lost thread falls back to a new one with the full rules. Screenshots are written to a per-request directory under the work directory and removed afterwards. Codex uses its own `~/.codex/config.toml` model and provider; `CODEX_MODELS` (default `default`, meaning the CLI's configured model) and `CODEX_MODEL` select `-m`. The host socket is `/srv/containers/iphone-control/codex/bridge.sock` (container: `/app/.runtime/codex/bridge.sock`, override with `CODEX_SOCKET`). `deploy/phone-use-codex-bridge.service` is the matching systemd template. Unlike CC, the Codex backend is never selected automatically: set `LLM_BACKEND=codex` and restart the gateway.

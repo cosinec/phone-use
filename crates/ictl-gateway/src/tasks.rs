@@ -510,6 +510,8 @@ async fn run(
             observation_stage.finish(if observation_result.is_ok() { "ok" } else { "error" });
             let mut observation = observation_result?;
             observation["observationId"] = json!(observation_id);
+            // A Codex bridge keeps one agent thread per connection; other backends ignore this.
+            observation["bridgeSession"] = json!(s.id);
             if let Some(screen) = ScreenFingerprint::of(&observation).await {
                 if awaiting_effect
                     && let Some(changed) = last_screen.as_ref().and_then(|before| before.changed(&screen))

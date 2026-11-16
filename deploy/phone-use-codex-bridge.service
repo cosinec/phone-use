@@ -1,0 +1,23 @@
+# Optional host service. Review and install explicitly; CI never installs it.
+# Run as the account whose Codex CLI is already configured (~/.codex/config.toml).
+[Unit]
+Description=Phone Use Codex agent planner bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liuyang
+Group=liuyang
+WorkingDirectory=/home/liuyang/apps/phone-use-codex-bridge
+EnvironmentFile=-/home/liuyang/.config/phone-use-codex-bridge.env
+ExecStart=/usr/bin/python3 -I /home/liuyang/apps/phone-use-codex-bridge/bridge.py --socket /srv/containers/iphone-control/codex/bridge.sock --work-dir /srv/containers/iphone-control/codex/work --codex-bin /home/liuyang/.local/bin/codex
+Restart=on-failure
+RestartSec=5
+UMask=0077
+TimeoutStopSec=15
+KillMode=control-group
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

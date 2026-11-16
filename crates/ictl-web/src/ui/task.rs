@@ -179,6 +179,8 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                         {move || {
                             if ui.ai.get().is_null() {
                                 "正在检查 AI 配置".into()
+                            } else if ui.ai.get()["aiReady"] == true && ui.ai.get()["backend"] == "codex" {
+                                format!("Codex agent · {}", selected())
                             } else if ui.ai.get()["aiReady"] == true && ui.ai.get()["backend"] == "cc" {
                                 format!("Claude Code · {}", selected())
                             } else if ui.ai.get()["aiReady"] == true {
@@ -190,6 +192,8 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                                         selected()
                                     },
                                 )
+                            } else if ui.ai.get()["backend"] == "codex" {
+                                "Codex agent 暂不可用".into()
                             } else if ui.ai.get()["backend"] == "cc" {
                                 "Claude Code 暂不可用".into()
                             } else {
@@ -200,7 +204,9 @@ pub(super) fn TaskPanel(ui: Ui) -> impl IntoView {
                     <Show when=move || ui.ai.get()["aiReady"] != true>
                     <p>
                         {move || {
-                            if ui.ai.get()["backend"] == "cc" {
+                            if ui.ai.get()["backend"] == "codex" {
+                                "请检查服务器上的 Codex 桥接服务。设备就绪后仍可手动控制。"
+                            } else if ui.ai.get()["backend"] == "cc" {
                                 "请检查服务器上的 Claude Code 桥接服务。设备就绪后仍可手动控制。"
                             } else {
                                 "请让服务器管理员配置模型。设备就绪后仍可手动控制。"

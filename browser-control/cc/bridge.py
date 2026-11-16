@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Local, bounded HTTP-to-Claude bridge over an explicitly selected Unix socket."""
+"""Local, bounded HTTP-to-planner bridge over an explicitly selected Unix socket.
+
+The planner is the host Claude Code CLI by default, or the host Codex agent with
+--codex-bin. Codex keeps one agent thread per gateway session, so the agent's
+own conversation memory carries across the steps and tasks of a connection."""
 
 import argparse
 import asyncio
@@ -10,15 +14,23 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import stat
 import sys
+import tempfile
 
 MAX_REQUEST = 16 * 1024 * 1024
 MAX_OUTPUT = 1024 * 1024
 MAX_HEADERS = 16 * 1024
 TIMEOUT = 90
+# Gateway session ids name Codex threads; at most this many are remembered.
+SESSION_PATTERN = r"[A-Za-z0-9._:-]{1,128}"
+MAX_THREADS = 64
+CODEX_FOLLOW_UP = ("Next step of the same phone task. Follow the rules from the first message of this "
+                   "conversation and reply with exactly one JSON object and nothing else.")
+IMAGE_SUFFIX = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
 # A pre-started CLI waits on stdin for the next step of the same task. Unused
 # ones are reclaimed after this long (a task step normally follows in seconds).
 WARM_IDLE = 300
@@ -89,6 +101,67 @@ def parse_result(output):
         return {"reply": reply}
     except (ValueError, KeyError, TypeError, UnicodeError, StopIteration):
         raise BridgeError(502, "Invalid Claude response") from None
+
+
+def plan_session(body):
+    """The optional gateway session id of a plan request (validated)."""
+    try:
+        plan = json.loads(body)
+    except (ValueError, UnicodeError):
+        return None
+    session = plan.get("session") if isinstance(plan, dict) else None
+    if session is None:
+        return None
+    if not isinstance(session, str) or not re.fullmatch(SESSION_PATTERN, session):
+        raise BridgeError(400, "Invalid session")
+    return session
+
+
+def json_reply(text):
+    """The first JSON object of an agent message, tolerating fences and surrounding prose."""
+    text = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
+    if fenced:
+        text = fenced[1]
+    try:
+        reply = json.loads(text)
+    except ValueError:
+        start = text.find("{")
+        if start < 0:
+            raise ValueError from None
+        reply, _ = json.JSONDecoder().raw_decode(text[start:])
+    if not isinstance(reply, dict):
+        raise ValueError
+    return reply
+
+
+def parse_codex(output):
+    """Thread id and reply from `codex exec --json` events."""
+    thread, text = None, None
+    try:
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type")
+            if kind == "thread.started" and isinstance(event.get("thread_id"), str):
+                thread = event["thread_id"]
+            elif kind == "item.completed":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                    text = item["text"]
+            elif kind in ("turn.failed", "error"):
+                raise ValueError
+        if text is None:
+            raise ValueError
+        return thread, {"reply": json_reply(text)}
+    except (ValueError, UnicodeError):
+        raise BridgeError(502, "Invalid Codex response") from None
 
 
 async def read_request(reader):
@@ -324,6 +397,132 @@ class Bridge:
             self.handlers.discard(task)
 
 
+class CodexBridge(Bridge):
+    """Plans each step with the host Codex agent, resuming one thread per gateway session."""
+
+    def __init__(self, codex_bin, work_dir, timeout=TIMEOUT):
+        super().__init__(codex_bin, work_dir, timeout)
+        self.threads = {}  # session -> Codex thread id, oldest first
+        self.locks = {}
+
+    def command(self, model, thread, images):
+        options = ["--skip-git-repo-check", "--json",
+                   "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        if model != "default":
+            options += ["-m", model]
+        for image in images:
+            options += ["-i", image]
+        # No prompt argument: Codex reads the prompt from stdin.
+        if thread:
+            return [self.claude_bin, "exec", "resume", thread, *options]
+        return [self.claude_bin, "exec", *options]
+
+    async def run(self, command, prompt, reader):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command, cwd=self.work_dir, start_new_session=True,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+        except (OSError, ValueError):
+            raise BridgeError(502, "Could not start Codex") from None
+        tasks = []
+        try:
+            used = 0
+
+            async def drain(stream, retain):
+                nonlocal used
+                chunks = []
+                while True:
+                    chunk = await stream.read(65536)
+                    if not chunk:
+                        break
+                    used += len(chunk)
+                    if used > MAX_OUTPUT:
+                        raise BridgeError(502, "Codex output exceeded limit")
+                    if retain:
+                        chunks.append(chunk)
+                return b"".join(chunks)
+
+            async def exchange():
+                proc.stdin.write(prompt.encode())
+                try:
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    proc.stdin.close()
+                stdout, _ = await asyncio.gather(drain(proc.stdout, True), drain(proc.stderr, False))
+                await proc.wait()
+                if proc.returncode != 0:
+                    raise BridgeError(502, "Codex execution failed")
+                return parse_codex(stdout.decode("utf-8", "replace"))
+
+            work = asyncio.create_task(exchange())
+            disconnected = asyncio.create_task(reader.read(1))
+            tasks = [work, disconnected]
+            done, _ = await asyncio.wait(tasks, timeout=self.timeout, return_when=asyncio.FIRST_COMPLETED)
+            if disconnected in done:
+                raise BridgeError(499, "Client disconnected")
+            if work not in done:
+                raise BridgeError(504, "Codex request timed out")
+            return work.result()
+        finally:
+            await self.kill(proc)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    def remember(self, session, thread):
+        self.threads.pop(session, None)
+        self.threads[session] = thread
+        while len(self.threads) > MAX_THREADS:
+            oldest = next(iter(self.threads))
+            del self.threads[oldest]
+            self.locks.pop(oldest, None)
+
+    async def plan(self, body, reader):
+        model, system, blocks = translate_plan(body)
+        session = plan_session(body)
+        if self.active >= 4:
+            raise BridgeError(503, "Bridge is busy")
+        self.active += 1
+        images_dir = tempfile.mkdtemp(prefix=".request-", dir=self.work_dir)
+        try:
+            texts, images = [], []
+            for index, block in enumerate(blocks):
+                if block["type"] == "text":
+                    texts.append(block["text"])
+                    continue
+                source = block["source"]
+                path = os.path.join(images_dir, f"{index}.{IMAGE_SUFFIX[source['media_type']]}")
+                with open(path, "wb") as image:
+                    image.write(base64.b64decode(source["data"]))
+                images.append(path)
+            text = "\n\n".join(texts)
+            lock = self.locks.setdefault(session, asyncio.Lock()) if session else asyncio.Lock()
+            async with lock:
+                thread = self.threads.get(session) if session else None
+                if thread:
+                    try:
+                        _, result = await self.run(self.command(model, thread, images),
+                                                   f"{CODEX_FOLLOW_UP}\n\n{text}", reader)
+                        self.remember(session, thread)
+                        return result
+                    except BridgeError as exc:
+                        if exc.status != 502:
+                            raise
+                        # The thread may be gone: start a fresh one with the full rules.
+                        self.threads.pop(session, None)
+                started, result = await self.run(self.command(model, None, images), f"{system}\n\n{text}", reader)
+                if session and started:
+                    self.remember(session, started)
+                return result
+        finally:
+            shutil.rmtree(images_dir, ignore_errors=True)
+            self.active -= 1
+
+
 def prepare_socket(path):
     path = Path(path)
     if not path.is_absolute() or not path.parent.is_dir():
@@ -357,7 +556,7 @@ async def serve(args):
     if work_dir.is_symlink() or not work_dir.is_dir() or any(work_dir.iterdir()):
         raise ValueError("Work directory must be a dedicated empty directory")
     prepare_socket(args.socket)
-    bridge = Bridge(args.claude_bin, work_dir)
+    bridge = CodexBridge(args.codex_bin, work_dir) if args.codex_bin else Bridge(args.claude_bin, work_dir)
     # Bind synchronously so no client can connect before permissions are restricted.
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     identity = None
@@ -418,6 +617,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", required=True, help="Absolute Unix socket in an existing runtime directory")
     parser.add_argument("--claude-bin", default="claude")
+    parser.add_argument("--codex-bin", help="Plan with this Codex CLI instead of Claude Code")
     parser.add_argument("--work-dir", help="Dedicated empty absolute working directory (required unless --check)")
     parser.add_argument("--check", action="store_true", help="Check an already running bridge and exit")
     args = parser.parse_args()
