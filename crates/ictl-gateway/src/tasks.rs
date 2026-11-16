@@ -33,10 +33,15 @@ const MAX_REJECTED_ACTIONS: u32 = 2;
 const MAX_WAIT_MISSES: u32 = 3;
 /// Consecutive successful actions that left the screen unchanged before the
 /// model is warned, and before the task stops instead of repeating itself.
+/// Games reject invalid moves without any change, so the stop limit leaves room to try others.
 const WARN_NO_EFFECT: u32 = 3;
-const MAX_NO_EFFECT: u32 = 6;
-/// Average-hash bits (of 256) two observations may differ by and still be the same screen.
-const SAME_SCREEN_BITS: u32 = 6;
+const MAX_NO_EFFECT: u32 = 8;
+/// Screens are compared as 32x32 grayscale thumbnails: a pixel differing by more than
+/// `PIXEL_DELTA` counts as changed, and more than `CHANGED_PIXELS` (about 1%) is a new screen.
+/// A 16x16 average hash missed real moves in a match-3 game, whose busy board looks alike when coarse.
+const THUMBNAIL_SIDE: u32 = 32;
+const PIXEL_DELTA: u8 = 24;
+const CHANGED_PIXELS: usize = 10;
 /// Latest history entries sent with full detail; older steps are summarized in a step log.
 const DETAILED_HISTORY: usize = 8;
 /// Most earlier steps repeated to the model in the step log.
@@ -889,9 +894,9 @@ async fn run(
 
 const NO_EFFECT_WARNING: &str = "Warning from the gateway: the last actions did not change the screen (screenChanged:false). Do not repeat them unchanged. Try a different target, iphone_tap_element with an exact label from iphone_list_elements, a swipe or scroll, dismissing a dialog or keyboard, or reply done explaining what blocks the task.";
 
-/// A coarse screen identity: an average hash of the screenshot and a hash of the UI element text.
+/// A screen identity: a grayscale thumbnail of the screenshot and a hash of the UI element text.
 struct ScreenFingerprint {
-    image: Option<[u64; 4]>,
+    image: Option<Vec<u8>>,
     elements: Option<u64>,
 }
 impl ScreenFingerprint {
@@ -899,7 +904,7 @@ impl ScreenFingerprint {
         let image = match observation["imageBase64"].as_str() {
             Some(data) => {
                 let data = data.to_owned();
-                tokio::task::spawn_blocking(move || average_hash(&data)).await.ok().flatten()
+                tokio::task::spawn_blocking(move || thumbnail(&data)).await.ok().flatten()
             }
             None => None,
         };
@@ -913,10 +918,9 @@ impl ScreenFingerprint {
     }
     /// Whether the screen changed; unknown when the two observations share no evidence.
     fn changed(&self, after: &Self) -> Option<bool> {
-        let same_image = self
-            .image
-            .zip(after.image)
-            .map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>() <= SAME_SCREEN_BITS);
+        let same_image = self.image.as_ref().zip(after.image.as_ref()).map(|(a, b)| {
+            a.iter().zip(b).filter(|(x, y)| x.abs_diff(**y) > PIXEL_DELTA).count() <= CHANGED_PIXELS
+        });
         let same_elements = self.elements.zip(after.elements).map(|(a, b)| a == b);
         // Unchanged only when every available signal agrees: a scrolled list keeps a
         // similar thumbnail but shows different elements.
@@ -927,21 +931,12 @@ impl ScreenFingerprint {
         }
     }
 }
-/// 16x16 grayscale average hash of a base64 screenshot.
-fn average_hash(data: &str) -> Option<[u64; 4]> {
+/// Grayscale thumbnail of a base64 screenshot, `THUMBNAIL_SIDE` pixels square.
+fn thumbnail(data: &str) -> Option<Vec<u8>> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
-    let pixels = image::load_from_memory(&bytes).ok()?.thumbnail_exact(16, 16).to_luma8().into_raw();
-    if pixels.len() != 256 {
-        return None;
-    }
-    let mean = pixels.iter().map(|&p| u32::from(p)).sum::<u32>() / 256;
-    let mut bits = [0u64; 4];
-    for (index, &pixel) in pixels.iter().enumerate() {
-        if u32::from(pixel) > mean {
-            bits[index / 64] |= 1u64 << (index % 64);
-        }
-    }
-    Some(bits)
+    let image = image::load_from_memory(&bytes).ok()?;
+    let pixels = image.thumbnail_exact(THUMBNAIL_SIDE, THUMBNAIL_SIDE).to_luma8().into_raw();
+    (pixels.len() == (THUMBNAIL_SIDE * THUMBNAIL_SIDE) as usize).then_some(pixels)
 }
 
 /// One line of the task step log sent to the model.
@@ -1271,13 +1266,32 @@ mod tests {
         assert!(needs(&pay, true) && needs(&pay, false));
     }
 
-    fn png(shade: u8) -> String {
-        let image = image::RgbImage::from_fn(32, 64, |x, _| {
-            if x < 16 { image::Rgb([shade, shade, shade]) } else { image::Rgb([255 - shade, 0, 0]) }
-        });
+    fn encode(image: &image::RgbImage) -> String {
         let mut bytes = std::io::Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
         base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+    }
+
+    fn png(shade: u8) -> String {
+        encode(&image::RgbImage::from_fn(32, 64, |x, _| {
+            if x < 16 { image::Rgb([shade, shade, shade]) } else { image::Rgb([255 - shade, 0, 0]) }
+        }))
+    }
+
+    /// A 64x64 board with a white square of `side` pixels at the top left.
+    fn board(side: u32) -> String {
+        encode(&image::RgbImage::from_fn(64, 64, |x, y| {
+            if x < side && y < side { image::Rgb([255, 255, 255]) } else { image::Rgb([40, 90, 160]) }
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_single_cleared_tile_counts_as_a_change_but_noise_does_not() {
+        let fingerprint = |image: String| async move { ScreenFingerprint::of(&json!({"imageBase64":image})).await.unwrap() };
+        let before = fingerprint(board(0)).await;
+        assert_eq!(before.changed(&fingerprint(board(0)).await), Some(false));
+        assert_eq!(before.changed(&fingerprint(board(16)).await), Some(true), "one tile of a 4x4 board");
+        assert_eq!(before.changed(&fingerprint(board(2)).await), Some(false), "a tiny difference is noise");
     }
 
     #[tokio::test]

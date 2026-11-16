@@ -1386,7 +1386,7 @@ contract('repeated actions that leave the screen unchanged are warned about and 
   await until(async () => { state = await fixture.snapshot(); return ['completed', 'failed'].includes(state.task?.state); });
   assert.equal(state.task.state, 'failed', JSON.stringify(state.task));
   assert.match(state.task.error, /屏幕都没有变化/);
-  assert.equal(state.task.steps.length, 6);
+  assert.equal(state.task.steps.length, 8);
   const warned = fixture.requests.map(r => JSON.parse(r.messages[1].content[0].text).recentHistory)
     .find(history => history.some(entry => entry.state === 'warning'));
   assert.ok(warned, 'the model was warned before the task stopped');
