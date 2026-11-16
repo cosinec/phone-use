@@ -132,6 +132,7 @@ pub(super) fn ImageInputs(ui: Ui, images: TaskImages) -> impl IntoView {
     view! {
         <div class="task-images">
             <label class="image-picker">
+                <Icon name="image" />
                 "添加图片"
                 <input type="file" accept="image/jpeg,image/png" multiple
                     aria-label="添加任务图片"
@@ -153,7 +154,7 @@ pub(super) fn ImageInputs(ui: Ui, images: TaskImages) -> impl IntoView {
                             <img src=image.preview alt=image.name.clone() />
                             <figcaption>{image.name}</figcaption>
                             <button type="button" aria-label="移除图片" disabled=move || images.uploading.get() || ui.running()
-                                on:click=move |_| images.remove(ui, id.clone())>"×"</button>
+                                on:click=move |_| images.remove(ui, id.clone())><Icon name="close" /></button>
                         </figure>
                     }
                 }).collect_view()}

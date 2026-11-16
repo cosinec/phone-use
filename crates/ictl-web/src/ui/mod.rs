@@ -1,10 +1,13 @@
 mod attachments;
 mod connection;
+mod icons;
 mod preview;
+mod progress;
 mod setup;
 mod task;
 
 use crate::{BrowserClient, actions::create_task_actions, js::*, polling::start_session_polling};
+use icons::Icon;
 use js_sys::Promise;
 use leptos::prelude::*;
 use serde_json::{Value, json as value};
@@ -342,76 +345,41 @@ fn App(options: JsValue) -> impl IntoView {
     let _ = call(&global(), "addEventListener", &["pagehide".into(), close]);
     view! {
         <div class="app-shell">
-            <aside class="sidebar">
-                <a class="brand" href="/" aria-label="iPhone Control 首页">
-                    <span class="brand-mark">"i"</span>
-                    <div>"iPhone Control"<span>"设备工作台"</span></div>
-                </a>
-                <div class="workspace-link">
-                    <span>"▦"</span>
-                    " 控制台 "
-                    <span class="nav-count">"01"</span>
+            <a class="skip-link" href="#workspace">"跳到工作台"</a>
+            <header class="topbar">
+                <div class="topbar-brand">
+                    <a class="brand" href="/" aria-label="iPhone Control 首页">
+                        <span class="brand-mark"><Icon name="phone" /></span>
+                        "iPhone Control"
+                    </a>
+                    <span class="brand-separator" aria-hidden="true" />
+                    <h1>"设备工作台"</h1>
                 </div>
-                <connection::ConnectionPanel ui />
-                <div class="sidebar-guide">
-                    <div class="section-label">"开始之前"</div>
-                    <ol>
-                        <li>"用 USB 连接手机"</li>
-                        <li>"解锁手机，允许浏览器访问"</li>
-                        <li>"按向导完成信任与授权"</li>
-                    </ol>
-                    <p>
-                        "Safari 与 Firefox 暂不支持。"<br />
-                        "模型在服务器运行。Android 调试密钥保存在浏览器。"
-                    </p>
-                </div>
-                <div class="sidebar-footer">
-                    <span class="tiny-dot" />
-                    " Browser ↔ Cloud ↔ Phone"
-                </div>
-            </aside>
-            <main class="workspace">
-                <header class="topbar">
-                    <span>
-                        "工作空间 "<span class="breadcrumb-separator">"/"</span>" "
-                        <strong>"设备控制台"</strong>
+                <div class="topbar-actions">
+                    <span class="server-summary">
+                        {move || if ui.base.get().is_empty() { "当前网站服务器" } else { "自定义服务器" }}
                     </span>
-                    <span class="environment-badge">
-                        {move || {
-                            if ui.base.get().is_empty() {
-                                "当前网站服务器"
-                            } else {
-                                "自定义服务器"
-                            }
-                        }}
-                    </span>
-                </header>
-                <div class="workspace-content">
-                    <div class="page-heading">
-                        <div>
-                            <div class="eyebrow">"YOUR DEVICE, YOUR WORKFLOW"</div>
-                            <h1>"让手机帮你做事"<span class="heading-dot">"."</span></h1>
-                            <p>"接上设备，描述任务。每一步都看得见。"</p>
-                        </div>
-                        <div
-                            class=move || {
-                                format!(
-                                    "connection-status {}",
-                                    if ui.ready() { "ready" } else { "" },
-                                )
-                            }
-                            role="status"
-                        >
-                            <span class="tiny-dot" />
+                    <button class="connection-switch"
+                        aria-label=move || if ui.occupied() { "连接设置" } else { "连接设备" }
+                        on:click=move |_| connection::open_connection_settings()>
+                        <span class=move || format!("connection-status {}", if ui.ready() { "ready" } else { "" }) role="status">
+                            <span class="tiny-dot" aria-hidden="true" />
                             {move || ui.status()}
-                        </div>
-                    </div>
+                        </span>
+                        <span class="connection-switch-label">{move || if ui.occupied() { "设备设置" } else { "连接设备" }}</span>
+                        <Icon name="settings" />
+                    </button>
+                </div>
+            </header>
+            <connection::ConnectionDialog ui />
+            <main class="workspace" id="workspace" tabindex="-1">
+                <div class="workspace-content">
                     <Show when=move || {
                         !string(&ui.state.get(), "error").is_empty() || !ui.error.get().is_empty()
                             || !ui.config_error.get().is_empty()
                     }>
                         <div class="error-banner" role="alert">
-                            <span>"!"</span>
+                            <Icon name="info" />
                             <div>
                                 <strong>
                                     {move || {
@@ -447,39 +415,31 @@ fn App(options: JsValue) -> impl IntoView {
                                     ui.config_error.set(String::new());
                                 }
                             >
-                                "×"
+                                <Icon name="close" />
                             </button>
                         </div>
                     </Show>
                     <div class="console-grid">
                         <div class="workflow-column">
+                            <progress::TaskProgress ui />
                             <task::TaskPanel ui />
-                            <Show when=move || {
-                                !ui.session().is_null() && !ui.android()
-                                    && (!ui.ready()
-                                        || !string(&ui.session()["setup"], "transcript").is_empty())
-                            }>
-                                <setup::SetupPanel ui />
-                            </Show>
-                            <div class="workflow-note">
-                                <span>"◈"</span>
-                                <p>
-                                    {move || {
-                                        if ui.running() {
-                                            "AI 任务执行期间，手动操作已暂停。可随时停止后续步骤。"
-                                        } else {
-                                            "手机画面与操作来自当前连接的真实设备。未连接时不会展示示例画面。"
-                                        }
-                                    }}
-                                </p>
-                            </div>
                         </div>
                         <preview::PhonePreview ui />
                     </div>
+                    <Show when=move || {
+                        !ui.session().is_null() && !ui.android()
+                            && (!ui.ready() || !string(&ui.session()["setup"], "transcript").is_empty())
+                    }>
+                        <div class="setup-area"><setup::SetupPanel ui /></div>
+                    </Show>
                     <footer class="workspace-footer">
-                        <span>
-                            "iPhone Control "<span class="footer-separator">"·"</span>
-                            " WebUSB 工作台"
+                        <span class="workflow-note">
+                            <Icon name="shield" />
+                            {move || if ui.running() {
+                                "任务执行中，手动操作已暂停。你可以随时停止。"
+                            } else {
+                                "每一步都来自真实设备。连接后即可开始。"
+                            }}
                         </span>
                         <span>"关闭页面将断开设备连接"</span>
                     </footer>

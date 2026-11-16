@@ -93,15 +93,15 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     });
     let disabled = move || !ui.can_control() || ui.busy.get() || (live() && !live_fresh());
     view! {
-        <section class="phone-card card">
+        <section class="phone-card card" aria-labelledby="preview-heading">
             <div class="card-header">
                 <div>
                     <span class="section-label">"设备屏幕"</span>
-                    <h2>{move || if live() { "实时画面" } else { "设备截图" }}</h2>
+                    <h2 id="preview-heading">{move || if live() { "实时画面" } else { "设备截图" }}</h2>
                 </div>
                 <Show when=move || !ui.android()>
                     <button
-                        class="button small"
+                        class="button secondary small live-toggle"
                         aria-pressed=move || live().to_string()
                         title="连续画面会持续占用 USB 链路；拥塞时自动暂停并改回截图"
                         disabled=move || !live() && !ui.ready()
@@ -124,7 +124,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                     disabled=disabled
                     on:click=move |_| ui.refresh_screen()
                 >
-                    "↻"
+                    <Icon name="refresh" />
                 </button>
             </div>
             <div class="phone-stage">
@@ -140,10 +140,18 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                         fallback=move || {
                             view! {
                                 <div class="empty-phone">
-                                    <div class="empty-usb">"⌁"</div>
+                                    <div class="empty-usb"><Icon name="plug" /></div>
                                     <strong>{move || ui.status()}</strong>
                                     <p>
-                                        "不会自动采集屏幕。"<br />"需要时点击刷新屏幕"
+                                        {move || if ui.ready() {
+                                            if ui.android() {
+                                                "点击刷新屏幕查看设备。"
+                                            } else {
+                                                "点击刷新屏幕查看设备，或开启实时画面。"
+                                            }
+                                        } else {
+                                            "连接并准备好设备后，即可查看和操作屏幕。"
+                                        }}
                                     </p>
                                     <span class="empty-phone-line" />
                                 </div>
@@ -265,7 +273,11 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                 </code>
             </div>
             <p class="screen-hint">
-                "点击刷新获取截图，或打开实时画面。任务运行时自动显示每一步的画面。点按、滑动可控制手机。"
+                {move || if ui.android() {
+                    "点击刷新获取截图。任务运行时自动显示每一步的画面。点按、滑动可控制手机。"
+                } else {
+                    "点击刷新获取截图，或打开实时画面。任务运行时自动显示每一步的画面。点按、滑动可控制手机。"
+                }}
             </p>
             <Show when=move || !live_error.get().is_empty()>
                 <p class="field-hint">{move || live_error.get()}</p>
@@ -279,15 +291,15 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                             ui.manual("iphone_press_button".into(), value!({"button":"back"}))
                         }
                     >
-                        <span>"↩"</span>
+                        <Icon name="back" />
                         "返回"
                     </button>
                 </Show>
                 {[
-                    ("home", "⌂", "主屏幕"),
-                    ("lock", "▣", "锁屏"),
-                    ("volume_down", "−", "音量减"),
-                    ("volume_up", "＋", "音量加"),
+                    ("home", "home", "主屏幕"),
+                    ("lock", "lock", "锁屏"),
+                    ("volume_down", "minus", "音量减"),
+                    ("volume_up", "plus", "音量加"),
                 ]
                     .into_iter()
                     .map(move |(button, icon, label)| {
@@ -302,7 +314,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                     )
                                 }
                             >
-                                <span>{icon}</span>
+                                <Icon name=icon />
                                 {label}
                             </button>
                         }

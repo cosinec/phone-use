@@ -13,11 +13,11 @@ pub(super) fn SetupPanel(ui: Ui) -> impl IntoView {
         }
     });
     view! {
-        <section class="setup-card card">
+        <section class="setup-card card" aria-labelledby="setup-heading">
             <div class="card-header">
                 <div>
                     <span class="section-label">"设备准备"</span>
-                    <h2>"授权与安装向导"</h2>
+                    <h2 id="setup-heading">"授权与安装向导"</h2>
                 </div>
                 <span class=move || {
                     format!("badge {}", if running() { "pending" } else { "" })

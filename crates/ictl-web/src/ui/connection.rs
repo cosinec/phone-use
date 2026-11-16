@@ -1,4 +1,38 @@
 use super::*;
+
+pub(super) fn open_connection_settings() {
+    if let Some(dialog) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("connection-dialog"))
+    {
+        let _ = call(&dialog.into(), "showModal", &[]);
+    }
+}
+
+#[component]
+pub(super) fn ConnectionDialog(ui: Ui) -> impl IntoView {
+    view! {
+        <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-dialog-title">
+            <div class="dialog-header">
+                <div>
+                    <span class="section-label">"USB 设备"</span>
+                    <h2 id="connection-dialog-title">"连接设备"</h2>
+                </div>
+                <form method="dialog">
+                    <button class="icon-button" aria-label="关闭连接设置" type="submit">
+                        <Icon name="close" />
+                    </button>
+                </form>
+            </div>
+            <ConnectionPanel ui />
+            <p class="dialog-note">
+                <Icon name="shield" />
+                "保持手机解锁，按提示完成信任与授权。关闭此设置窗口不会断开设备。"
+            </p>
+        </dialog>
+    }
+}
+
 #[component]
 pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
     let platform = RwSignal::new("ios".to_string());
@@ -16,8 +50,8 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
         }
     };
     view! {
-        <section class="connection-panel">
-            <div class="section-label">"连接设备"</div>
+        <section class="connection-panel" aria-labelledby="connection-heading">
+            <h3 class="sr-only" id="connection-heading">"连接参数"</h3>
             <label class="field-label" for="device-platform">
                 "手机系统"
             </label>
@@ -40,7 +74,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                 }}
             </p>
             <div class="connection-device">
-                <div class="device-icon">"▯"</div>
+                <div class="device-icon"><Icon name="phone" /></div>
                 <div>
                     <strong>
                         {move || {
@@ -124,7 +158,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                                 ui.connect(value, platform.get_untracked());
                             }
                         >
-                            <span>"＋"</span>
+                            <Icon name="plug" />
                             " "
                             {move || {
                                 if ui.state.get()["cleanupPending"] == true {

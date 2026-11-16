@@ -96,10 +96,20 @@ async function pageFor(t, fixture = true) {
       route.fulfill({ json: { aiReady: false, model: null, models: [] } }),
     );
   await page.goto(fixture ? base + "/__test__/console.html" : builtBase + "/");
-  await page.getByRole("heading", { name: "让手机帮你做事." }).waitFor();
+  await page.getByRole("heading", { name: "设备工作台", exact: true }).waitFor();
   return page;
 }
+async function openConnection(page) {
+  if (!await page.locator("#server-token").isVisible()) {
+    await page.getByRole("button", { name: /^(连接设备|连接设置)$/ }).click();
+  }
+  await page.locator("#server-token").waitFor();
+}
+async function closeConnection(page) {
+  await page.getByRole("button", { name: "关闭连接设置", exact: true }).click();
+}
 async function connect(page, platform = "ios", capture = true) {
+  await openConnection(page);
   await page.locator("#device-platform").selectOption(platform);
   await page.locator("#server-token").fill("explicit-fixture-controller");
   await page
@@ -114,6 +124,7 @@ async function connect(page, platform = "ios", capture = true) {
       .querySelector(".connection-status")
       .textContent.includes("可以控制"),
   );
+  await closeConnection(page);
   if (capture && platform === "ios") {
     await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
     await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth > 0);
@@ -154,6 +165,126 @@ test("production bootstrap loads Rust WASM UI with honest empty phone and access
   assert.equal(await page.locator("#device-platform option").count(), 2);
 });
 
+test("composer and execution history are distinct named regions with a keyboard skip link", async (t) => {
+  const page = await pageFor(t);
+  const composer = page.getByRole("region", { name: "告诉手机，你想做什么", exact: true });
+  const history = page.getByRole("region", { name: "执行记录", exact: true });
+  assert.equal(await composer.count(), 1);
+  assert.equal(await history.count(), 1);
+  assert.equal(await composer.getByLabel("任务描述", { exact: true }).count(), 1);
+  assert.equal(await composer.getByRole("region", { name: "执行记录", exact: true }).count(), 0);
+  await history.getByText("等待第一个任务", { exact: true }).waitFor();
+  await page.keyboard.press("Tab");
+  const skip = page.getByRole("link", { name: "跳到工作台", exact: true });
+  assert.equal(await skip.evaluate(node => node === document.activeElement), true);
+  await page.keyboard.press("Enter");
+  assert.equal(await page.locator("main").evaluate(node => node === document.activeElement), true);
+});
+
+test("connection settings open on demand, contain keyboard focus, and close back to their trigger", async (t) => {
+  const page = await pageFor(t);
+  assert.equal(await page.locator("#server-token").isVisible(), false);
+  const trigger = page.getByRole("button", { name: "连接设备", exact: true });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "连接设备", exact: true });
+  await dialog.waitFor();
+  assert.equal(await dialog.evaluate(node => node.contains(document.activeElement)), true);
+  await page.locator("#device-platform").selectOption("android");
+  await page.keyboard.press("Escape");
+  assert.equal(await page.locator("#server-token").isVisible(), false);
+  assert.equal(await trigger.evaluate(node => node === document.activeElement), true);
+  await trigger.click();
+  assert.equal(await page.locator("#device-platform").inputValue(), "android");
+  await page.getByRole("button", { name: "关闭连接设置", exact: true }).click();
+  assert.equal(await trigger.evaluate(node => node === document.activeElement), true);
+});
+
+test("desktop agent workspace shows execution above a composer reachable in the first viewport", async (t) => {
+  const page = await pageFor(t);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const history = await page.getByRole("region", { name: "执行记录", exact: true }).boundingBox();
+  const composer = await page.getByRole("region", { name: "告诉手机，你想做什么", exact: true }).boundingBox();
+  assert.ok(history.y < composer.y, "execution should precede the docked task input");
+  assert.ok(composer.y + composer.height <= 900, "task input should fit the first desktop viewport");
+});
+
+test("a full composer cannot cover Stop when attachments, options and enlarged text fill the workspace", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  const png = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement("canvas"); canvas.width = 16; canvas.height = 16;
+    return canvas.toDataURL("image/png").split(",")[1];
+  }), "base64");
+  await page.getByLabel("添加任务图片").setInputFiles(Array.from({ length: 6 }, (_, i) => ({
+    name: `reference-${i}.png`, mimeType: "image/png", buffer: png,
+  })));
+  await page.waitForFunction(() => document.querySelectorAll(".image-thumbnails img").length === 6);
+  await page.locator(".task-options summary").click();
+  await page.locator("#task-instruction").fill("查看设备");
+  await page.locator("#task-instruction").evaluate(node => node.style.height = "260px");
+  await page.waitForFunction(() => !document.querySelector(".task-input-footer button").disabled);
+  await page.locator(".task-composer").evaluate(form => form.requestSubmit());
+  await page.getByText("这一步需要你的确认", { exact: true }).waitFor();
+  for (const state of [
+    { width: 932, height: 430, font: "14px" },
+    { width: 1440, height: 900, font: "28px" },
+  ]) {
+    await page.setViewportSize({ width: state.width, height: state.height });
+    await page.evaluate(font => { document.documentElement.style.fontSize = font; window.scrollTo(0, 0); }, state.font);
+    const stop = page.getByRole("button", { name: "停止任务", exact: true });
+    assert.equal(await stop.evaluate(node => {
+      const r = node.getBoundingClientRect();
+      return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)?.closest("button") === node;
+    }), true, "Stop must remain visible and receive pointer events");
+  }
+  await page.getByRole("button", { name: "停止任务", exact: true }).click();
+  await page.getByText("任务已停止", { exact: false }).waitFor();
+});
+
+test("empty device guidance is not clipped by a phone frame at enlarged text sizes", async (t) => {
+  const page = await pageFor(t);
+  await page.evaluate(() => document.documentElement.style.fontSize = "28px");
+  for (const viewport of [{ width: 932, height: 430 }, { width: 1440, height: 900 }]) {
+    await page.setViewportSize(viewport);
+    assert.equal(await page.locator(".empty-phone").evaluate(node => {
+      const text = node.getBoundingClientRect();
+      const frame = node.closest(".phone-frame").getBoundingClientRect();
+      return text.top >= frame.top && text.bottom <= frame.bottom;
+    }), true, "empty-state text must fit its container");
+  }
+});
+
+test("mobile workspace keeps controls reachable and long confirmation content inside the viewport", async (t) => {
+  const page = await pageFor(t);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await connect(page, "android");
+  await page.locator("#task-instruction").fill("检查设备");
+  await page.getByRole("button", { name: "开始任务", exact: false }).click();
+  await page.getByText("这一步需要你的确认", { exact: true }).waitFor();
+  await page.evaluate(() => {
+    fixture.state.task.confirmation.args.text = "https://example.test/" + "long-token".repeat(60);
+    fixture.state.task.steps[0].reason = "检查目标：" + "long-token".repeat(60);
+  });
+  await page.waitForFunction(() => document.querySelector(".confirmation pre").textContent.includes("long-token"));
+  for (const viewport of [{ width: 375, height: 812 }, { width: 812, height: 375 }, { width: 932, height: 430 }]) {
+    await page.setViewportSize(viewport);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    for (const label of ["停止任务", "确认这一步", "拒绝并停止", "刷新屏幕"]) {
+      const box = await page.getByRole("button", { name: label, exact: true }).boundingBox();
+      assert.ok(box.width >= 44 && box.height >= 44, `${label} must have a comfortable touch target`);
+    }
+  }
+  await page.getByRole("button", { name: "停止任务", exact: true }).click();
+  await page.getByText("任务已停止", { exact: false }).waitFor();
+});
+
+test("Android preview guidance only advertises available controls", async (t) => {
+  const page = await pageFor(t);
+  await connect(page, "android");
+  assert.equal(await page.getByRole("button", { name: "实时画面", exact: true }).count(), 0);
+  assert.doesNotMatch(await page.locator(".phone-card").textContent(), /实时画面/);
+});
+
 test("Rust gestures preserve letterbox mapping and pointer gesture bounds", () => {
   const rect = { left: 20, top: 10, width: 200, height: 200 };
   assert.deepEqual(toPhonePoint(120, 110, rect, 100, 200), { x: 50, y: 100 });
@@ -174,9 +305,11 @@ test("Rust gestures preserve letterbox mapping and pointer gesture bounds", () =
 test("iPhone readiness gate, setup labels and prompt input retain current behavior", async (t) => {
   const page = await pageFor(t);
   await page.evaluate(() => (fixture.state.daemon.state.state = "needs_trust"));
+  await openConnection(page);
   await page.locator("#server-token").fill("explicit-fixture-controller");
   await page.getByRole("button", { name: "连接 iPhone", exact: true }).click();
   await page.getByRole("button", { name: "断开连接", exact: true }).waitFor();
+  await closeConnection(page);
   await page.getByText("WDA 准备中", { exact: true }).first().waitFor();
   assert.equal(
     await page
@@ -394,6 +527,7 @@ test("screen refresh preserves image pointer capture and text focus while manual
 test("cancelled pending pairing shows USB custody wait until the SDK settles", async (t) => {
   const page = await pageFor(t);
   await page.evaluate(() => (fixture.holdPair = true));
+  await openConnection(page);
   await page.locator("#server-token").fill("explicit-fixture-controller");
   await page.getByRole("button", { name: "连接 iPhone", exact: true }).click();
   await page.waitForFunction(() => fixture.pairStarted);
@@ -460,6 +594,7 @@ test("a manual preview from a previous session cannot replace a reconnected same
   await page.evaluate(() => (fixture.holdNextPreview = true));
   await page.getByRole("button", { name: "刷新屏幕", exact: true }).click();
   await page.waitForFunction(() => fixture.heldPreview);
+  await openConnection(page);
   await page.getByRole("button", { name: "断开连接", exact: true }).click();
   await connect(page);
   await page.locator(".phone-screen").waitFor();
@@ -483,6 +618,7 @@ test("a delayed command from a previous session cannot start a screenshot reques
   await page.evaluate(() => (fixture.holdNextCommand = true));
   await page.getByRole("button", { name: "主屏幕", exact: true }).click();
   await page.waitForFunction(() => fixture.heldCommand);
+  await openConnection(page);
   await page.getByRole("button", { name: "断开连接", exact: true }).click();
   await connect(page);
   await page.locator(".phone-screen").waitFor();
