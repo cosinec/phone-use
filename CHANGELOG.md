@@ -15,6 +15,7 @@ All notable changes to this project are documented here. The format is based on 
 ### Fixed
 
 - Scroll bars are dropped from element lists in every system language, not only Chinese and English: they are recognised by their percentage value and thin shape instead of their label. On a German iPhone, for example, lines like `Other "Vertikaler Rollbalken, 1 Seite"` no longer appear.
+- Element positions inside a WebView that sits below a navigation bar (an app's in-app browser) are no longer shifted down by the WebView's y (about 100 pt), so tapping by text hits the element instead of the row below it.
 
 ## [0.1.4] - 2026-11-07
 
